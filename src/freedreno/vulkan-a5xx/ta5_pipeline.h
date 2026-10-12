@@ -33,6 +33,7 @@
 
 #include "vk_object.h"
 #include "vk_device.h"
+#include "vk_graphics_state.h"
 
 #include "ta5_instance.h"
 #include "ta5_shader.h"
@@ -52,6 +53,9 @@ struct ta5_pipeline
    struct ta5_pipeline_layout *layout;
    struct ta5_render_pass *render_pass;
    uint32_t subpass;
+
+   /** Runtime-owned graphics state, filled from our render pass. */
+   struct vk_graphics_pipeline_state graphics_state;
 
    struct ta5_compiled_shader vertex;
    struct ta5_compiled_shader fragment;

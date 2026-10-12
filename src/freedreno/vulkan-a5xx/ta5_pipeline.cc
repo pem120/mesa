@@ -27,6 +27,7 @@
  */
 
 #include <assert.h>
+#include <stdlib.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -37,6 +38,7 @@
 #include "vk_alloc.h"
 #include "vk_device.h"
 #include "vk_shader_module.h"
+#include "vk_graphics_state.h"
 #include "vk_common_entrypoints.h"
 
 #include "ta5_instance.h"
@@ -66,10 +68,59 @@ ta5_pipeline_compile_stage(struct ta5_device *device,
    if (!words || size < 4 || size % 4 != 0)
       return VK_ERROR_INVALID_SHADER_NV;
 
-   if (!ta5_shader_compile(device, stage, words, size, out))
+   if (!ta5_shader_compile(device, stage, words, size, out)) {
+      if (getenv("TA5_TRACE_NULL"))
+         fprintf(stderr,
+                 "ta5[shader]: stage 0x%x failed to compile (%zu bytes SPIR-V)\n",
+                 stage, size);
       return VK_ERROR_INVALID_SHADER_NV;
+   }
+
+   if (getenv("TA5_TRACE_NULL"))
+      fprintf(stderr, "ta5[shader]: stage 0x%x -> %u dwords of microcode\n",
+              stage, out->code_size);
 
    return VK_SUCCESS;
+}
+
+/**
+ * Fill the runtime's vk_render_pass_state for one subpass.
+ *
+ * The runtime's graphics-state machinery owns this structure; the driver
+ * only describes the subpass to it.  Turnip does exactly this before calling
+ * vk_graphics_pipeline_state_fill().
+ */
+static void
+ta5_fill_render_pass_state(struct vk_render_pass_state *rp,
+                           const struct ta5_render_pass *pass)
+{
+   rp->color_attachment_count = 0;
+   rp->depth_attachment_format = VK_FORMAT_UNDEFINED;
+   rp->stencil_attachment_format = VK_FORMAT_UNDEFINED;
+   rp->attachments = MESA_VK_RP_ATTACHMENT_INFO_INVALID;
+
+   for (uint32_t i = 0; i < pass->attachment_count; i++) {
+      const struct ta5_render_pass_attachment *att = &pass->attachments[i];
+
+      if (att->used_as_color) {
+         if (rp->color_attachment_count < MESA_VK_MAX_COLOR_ATTACHMENTS) {
+            uint8_t n = rp->color_attachment_count++;
+            rp->color_attachment_formats[n] = (VkFormat)att->format;
+            rp->color_attachment_samples[n] = (uint8_t)att->samples;
+            rp->attachments |= MESA_VK_RP_ATTACHMENT_COLOR_BIT(n);
+         }
+      } else if (att->format == VK_FORMAT_S8_UINT) {
+         rp->stencil_attachment_format = (VkFormat)att->format;
+         rp->depth_stencil_attachment_samples = (uint8_t)att->samples;
+         rp->attachments |= MESA_VK_RP_ATTACHMENT_STENCIL_BIT;
+      } else {
+         rp->depth_attachment_format = (VkFormat)att->format;
+         if (att->format == VK_FORMAT_D24_UNORM_S8_UINT)
+            rp->stencil_attachment_format = (VkFormat)att->format;
+         rp->depth_stencil_attachment_samples = (uint8_t)att->samples;
+         rp->attachments |= MESA_VK_RP_ATTACHMENT_DEPTH_BIT;
+      }
+   }
 }
 
 VKAPI_ATTR VkResult VKAPI_CALL
@@ -137,6 +188,16 @@ ta5_CreateGraphicsPipelines(VkDevice _device, VkPipelineCache pipelineCache,
          pipe->fragment = fs;
          pipe->has_fragment = true;
       }
+
+      /*
+       * Hand the runtime the subpass description it expects.  This is the
+       * step the generic implementation could not do for us.
+       */
+      struct vk_render_pass_state rp_state = {};
+      ta5_fill_render_pass_state(&rp_state, pipe->render_pass);
+      vk_graphics_pipeline_state_fill(&device->vk, &pipe->graphics_state, ci,
+                                      NULL, &rp_state, 0, NULL, NULL,
+                                      VK_SYSTEM_ALLOCATION_SCOPE_OBJECT, NULL);
 
       pipe->raster = ci->pRasterizationState;
       pipe->blend = ci->pColorBlendState;

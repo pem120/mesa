@@ -54,6 +54,7 @@
 #include "ta5_shader.h"
 #include "ta5_entrypoints.h"
 
+
 #define TA5_DBG_SHADER(fmt, ...)                                          \
    do {                                                                   \
       if (getenv("TA5_TRACE_NULL"))                                       \
@@ -168,6 +169,14 @@ ta5_shader_compile(struct ta5_device *device, VkShaderStageFlagBits stage,
     * (full) wavesize is API-visible.  Vulkan has no subGroupSize control
     * here anyway, so this is not a capability loss.
     */
+   /*
+    * Lower system values (gl_VertexIndex, gl_InstanceIndex, ...) before IR3
+    * sees them.  A vertex shader that reads gl_VertexIndex -- which is how a
+    * triangle with no vertex buffer is generated -- fails to compile without
+    * this.  Turnip does the same at tu_shader.cc:76.
+    */
+   NIR_PASS(_, nir, nir_lower_system_values);
+
    shader_options.api_wavesize = IR3_SINGLE_ONLY;
    shader_options.real_wavesize = IR3_SINGLE_ONLY;
 
