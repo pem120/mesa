@@ -359,7 +359,7 @@ ta5_get_properties(struct ta5_physical_device *pdevice,
 /* Physical device init                                                 */
 /* ------------------------------------------------------------------ */
 
-static VkResult
+VkResult
 ta5_physical_device_init(struct ta5_physical_device *device,
                          struct ta5_instance *instance, int dev_fd)
 {

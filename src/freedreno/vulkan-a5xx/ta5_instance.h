@@ -69,4 +69,11 @@ VK_DEFINE_HANDLE_CASTS(ta5_device, vk.base, VkDevice, VK_OBJECT_TYPE_DEVICE)
 extern const struct vk_instance_extension_table ta5_instance_extensions_supported;
 extern const struct vk_device_extension_table ta5_device_extensions_supported;
 
+VkResult ta5_physical_device_init(struct ta5_physical_device *device,
+                                  struct ta5_instance *instance, int dev_fd);
+
+VkResult ta5_physical_device_try_create(struct vk_instance *vk_instance,
+                                        struct _drmDevice *drm_device,
+                                        struct vk_physical_device **out);
+
 #endif /* TA5_INSTANCE_H */
