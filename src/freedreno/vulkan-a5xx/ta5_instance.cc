@@ -293,3 +293,31 @@ ta5_EnumerateInstanceVersion(uint32_t *pApiVersion)
    *pApiVersion = VK_API_VERSION_1_1;
    return VK_SUCCESS;
 }
+
+/* ------------------------------------------------------------------ */
+/* Vulkan loader ICD interface                                          */
+/* ------------------------------------------------------------------ */
+
+VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL
+ta5_GetInstanceProcAddr(VkInstance _instance, const char *pName)
+{
+   struct ta5_instance *instance = (struct ta5_instance *)_instance;
+   return vk_instance_get_proc_addr(instance ? &instance->vk : NULL,
+                                    &ta5_instance_entrypoints, pName);
+}
+
+/*
+ * vk_icdGetInstanceProcAddr is the one ICD entry point the Vulkan runtime does
+ * not provide: the other two (vk_icdNegotiateLoaderICDInterfaceVersion,
+ * vk_icdGetPhysicalDeviceProcAddr) exist there and are deliberately not
+ * redefined here.  Turnip defines this one explicitly for the same reason.
+ *
+ * The loader also asks for this second entry point to work around
+ * LD_PRELOAD issues in some applications, hence the thin wrapper.
+ */
+VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL
+__attribute__((visibility("default")))
+vk_icdGetInstanceProcAddr(VkInstance instance, const char *pName)
+{
+   return ta5_GetInstanceProcAddr(instance, pName);
+}

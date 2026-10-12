@@ -52,6 +52,8 @@ if ta5_build_id != ''
   ta5_flags += '-DTA5_BUILD_ID_OVERRIDE="' + ta5_build_id + '"'
 endif
 
+ta5_icd_sym = meson.project_source_root() / 'src/vulkan/vulkan.sym'
+
 libvulkan_freedreno_a5xx = shared_library(
   'vulkan_freedreno_a5xx',
   libta5_files,
@@ -66,13 +68,25 @@ libvulkan_freedreno_a5xx = shared_library(
     idep_vulkan_util,
     idep_vulkan_runtime,
     idep_mesautil,
+    # provides fd_dev_info_raw() and the shared per-generation device table
+    idep_libfreedreno_common,
   ],
   c_args : [no_override_init_args, ta5_flags, soong_compat_c_args],
   cpp_args : [ta5_cpp_args, ta5_flags, soong_compat_cpp_args],
   gnu_symbol_visibility : 'hidden',
-  link_args : [vulkan_icd_link_args, ld_args_bsymbolic, ld_args_gc_sections,
-               ld_args_build_id],
-  link_depends : vulkan_icd_link_depends,
+  # NOTE on link flags:
+  #  - ld_args_bsymbolic and ld_args_gc_sections are omitted; the musl cross
+  #    build links through zig/lld, which mis-parses them.
+  #  - the version script uses the "--option=file" form.  zig's -Wl, splitting
+  #    does not preserve a separate argument, so lld absorbed every following
+  #    flag as another version-script filename.
+  # The exported ICD surface is unchanged: it is pinned by the version script,
+  # and the vk_icd* entrypoints carry default visibility regardless.
+  link_args : [
+    '-Wl,--version-script=' + ta5_icd_sym,
+    ld_args_build_id,
+  ],
+  link_depends : files(ta5_icd_sym),
   install : true,
 )
 

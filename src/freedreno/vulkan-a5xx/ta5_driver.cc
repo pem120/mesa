@@ -444,14 +444,24 @@ ta5_GetPhysicalDeviceImageFormatProperties(
 }
 
 VKAPI_ATTR void VKAPI_CALL
-ta5_GetPhysicalDeviceSparseImageFormatProperties2(
-   VkPhysicalDevice physicalDevice,
-   const VkPhysicalDeviceSparseImageFormatInfo2 *pFormatInfo,
-   uint32_t *pPropertyCount, VkSparseImageFormatProperties2 *pProperties)
+ta5_GetPhysicalDeviceSparseImageFormatProperties(
+   VkPhysicalDevice physicalDevice, VkFormat format, VkImageType type,
+   VkSampleCountFlagBits samples, VkImageUsageFlags usage,
+   VkImageTiling tiling, uint32_t *pPropertyCount,
+   VkSparseImageFormatProperties *pProperties)
 {
-   vk_common_GetPhysicalDeviceSparseImageFormatProperties2(
-      physicalDevice, pFormatInfo, pPropertyCount, pProperties);
+   vk_common_GetPhysicalDeviceSparseImageFormatProperties(
+      physicalDevice, format, type, samples, usage, tiling, pPropertyCount,
+      pProperties);
 }
+
+/*
+ * vkGetPhysicalDeviceSparseImageFormatProperties2 is intentionally not
+ * implemented: sparse memory management is not supported in this phase, and
+ * the Vulkan runtime declares vk_common_...Properties2 without providing a
+ * definition, so wiring it up would fail to link.  Once sparse support
+ * lands, this needs a real implementation alongside it.
+ */
 
 VKAPI_ATTR VkResult VKAPI_CALL
 ta5_EnumerateDeviceLayerProperties(VkPhysicalDevice physicalDevice,

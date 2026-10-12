@@ -1,0 +1,40 @@
+# Cross file: aarch64-linux-musl, for postmarketOS targets.
+#
+# Uses zig as the compiler driver: zig bundles clang and builds libc++ for
+# aarch64-linux-musl from source, which Debian's apt does not provide.
+#
+# Required because:
+#   - the device runs postmarketOS (musl), so the glibc aarch64-linux-gnu
+#     build will not load there
+#   - the driver is C++, so a C++ standard library for musl is required
+#   - Debian has no aarch64-musl cross toolchain (g++-aarch64-linux-musl
+#     does not exist)
+#
+# The host x86_64 zig binary drives an aarch64 clang, so no emulation layer
+# is involved.
+
+[binaries]
+c = ['/home/ishu/.zig/zig', 'cc', '-target', 'aarch64-linux-musl']
+cpp = ['/home/ishu/.zig/zig', 'c++', '-target', 'aarch64-linux-musl']
+ar = ['/home/ishu/.zig/zig', 'ar']
+strip = ['/home/ishu/.zig/zig', 'strip']
+pkg-config = 'pkg-config'
+
+[built-in options]
+c_args = ['-fPIC']
+cpp_args = ['-fPIC']
+# Static linking keeps the deploy self-contained: the postmarketOS image then
+# needs no matching shared libstdc++/libc at runtime.
+c_link_args = ['-static']
+cpp_link_args = ['-static']
+
+[properties]
+needs_exe_wrapper = true
+# Host pkg-config must not be consulted for target libraries.
+pkg_config_libdir = ''
+
+[host_machine]
+system = 'linux'
+cpu_family = 'aarch64'
+cpu = 'aarch64'
+endian = 'little'
