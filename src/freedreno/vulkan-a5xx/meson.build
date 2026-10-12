@@ -28,6 +28,7 @@ libta5_files = files(
   'ta5_descriptor.cc',
   'ta5_shader.cc',
   'ta5_render.cc',
+  'ta5_pipeline.cc',
   'ta5_queue.cc',
   'ta5_submit.cc',
   'ta5_instance.cc',
