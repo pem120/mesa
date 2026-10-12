@@ -79,6 +79,7 @@ ta5_CreateDevice(VkPhysicalDevice physicalDevice,
 
    device->instance = pdevice->instance;
    device->physical_device = pdevice;
+   device->fd = pdevice->dev_fd;
 
    /*
     * a5xx is a single generation, so unlike Turnip there is no per-chip
@@ -98,6 +99,13 @@ ta5_CreateDevice(VkPhysicalDevice physicalDevice,
       return vk_error(&pdevice->instance->vk, result);
    }
 
+   /*
+    * Attach the DRM sync provider.  Without this, device->sync is NULL and
+    * vk_drm_syncobj_init() dereferences it -- which is every fence.  This has
+    * to happen after vk_device_init(), which memsets the device.
+    */
+   vk_device_set_drm_fd(&device->vk, device->fd);
+
    *pDevice = ta5_device_to_handle(device);
 
    TA5_TRACE("CreateDevice: success");
@@ -107,7 +115,6 @@ ta5_CreateDevice(VkPhysicalDevice physicalDevice,
 VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL
 ta5_GetDeviceProcAddr(VkDevice _device, const char *pName)
 {
-   struct ta5_device *device = (struct ta5_device *)_device;
    PFN_vkVoidFunction func;
 
    func = vk_common_GetDeviceProcAddr(_device, pName);

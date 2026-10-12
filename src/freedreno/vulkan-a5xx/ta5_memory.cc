@@ -60,7 +60,6 @@ ta5_AllocateMemory(VkDevice _device, const VkMemoryAllocateInfo *pAllocateInfo,
 {
    struct ta5_device *device = (struct ta5_device *)_device;
    struct ta5_memory *memory;
-   VkResult result;
 
    if (pAllocator == NULL)
       pAllocator = vk_default_allocator();
@@ -108,8 +107,10 @@ VKAPI_ATTR VkResult VKAPI_CALL
 ta5_MapMemory(VkDevice _device, VkDeviceMemory _memory, VkDeviceSize offset,
               VkDeviceSize size, VkMemoryMapFlags flags, void **ppData)
 {
-   struct ta5_memory *memory = ta5_memory_from_handle(_memory);
-
+   /* Allocations are host-side only in this phase, so there is nothing to
+    * hand back.  Reporting MEMAP_FAILED is correct: the memory was not
+    * created host-visible-mappable, and silently returning NULL would let
+    * the caller write through a null pointer. */
    *ppData = NULL;
    return VK_ERROR_MEMORY_MAP_FAILED;
 }
@@ -306,7 +307,7 @@ ta5_GetDeviceImageMemoryRequirements(
    VkMemoryRequirements2 *pMemoryRequirements)
 {
    /* Compute the size the way CreateImage would, without allocating. */
-   struct ta5_image tmp = {0};
+   struct ta5_image tmp = {};
    uint32_t block_size = ta5_format_block_size(pInfo->pCreateInfo->format);
    VkDeviceSize size;
 
@@ -389,7 +390,7 @@ ta5_GetDeviceImageSubresourceLayout(
    VkDevice _device, const VkDeviceImageSubresourceInfo *pInfo,
    VkSubresourceLayout2 *pLayout)
 {
-   struct ta5_image tmp = {0};
+   struct ta5_image tmp = {};
    uint32_t block_size = ta5_format_block_size(pInfo->pCreateInfo->format);
 
    tmp.row_pitch =

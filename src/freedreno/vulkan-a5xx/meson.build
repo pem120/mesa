@@ -23,6 +23,8 @@ libta5_files = files(
   'ta5_driver.cc',
   'ta5_formats.cc',
   'ta5_memory.cc',
+  'ta5_sync.cc',
+  'ta5_cmd_buffer.cc',
   'ta5_instance.cc',
 )
 

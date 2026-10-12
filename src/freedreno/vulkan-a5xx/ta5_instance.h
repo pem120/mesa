@@ -73,6 +73,9 @@ struct ta5_device
    struct ta5_instance *instance;
    struct ta5_physical_device *physical_device;
    uint32_t device_idx;
+
+   /** The DRM render node fd opened for the physical device. */
+   int fd;
 };
 VK_DEFINE_HANDLE_CASTS(ta5_device, vk.base, VkDevice, VK_OBJECT_TYPE_DEVICE)
 
