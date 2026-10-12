@@ -19,6 +19,7 @@ ta5_entrypoints = custom_target(
 
 libta5_files = files(
   'ta5_device.cc',
+  'ta5_device_create.cc',
   'ta5_driver.cc',
   'ta5_instance.cc',
 )
