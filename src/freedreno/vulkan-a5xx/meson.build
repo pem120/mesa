@@ -21,6 +21,11 @@ libta5_files = files(
   'ta5_device.c',
 )
 
+# Generated adreno register/pm4 headers (adreno_pm4.xml.h etc.) are pulled in
+# via common/fd5_hw.h.  List them as sources so ninja generates them before
+# compiling -- otherwise the include fails on a clean cross build.
+libta5_files += freedreno_xml_header_files
+
 libta5_includes = [
     inc_src,
     inc_freedreno,   # covers '.' , './registers', './registers/adreno', './common'
