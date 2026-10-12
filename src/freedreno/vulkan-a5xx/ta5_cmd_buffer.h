@@ -81,4 +81,51 @@ struct ta5_cmd_buffer
 VK_DEFINE_NONDISP_HANDLE_CASTS(ta5_cmd_buffer, base, VkCommandBuffer,
                                VK_OBJECT_TYPE_COMMAND_BUFFER)
 
+/**
+ * PM4 packet construction.
+ *
+ * A5xx command streams are a bare sequence of PM4 packets -- there is no
+ * stream header.  Emitted packets are **type 7**, not type 3:
+ *
+ *   CP_TYPE7_PKT | cnt | (parity(cnt) << 15) |
+ *                 ((opcode & 0x7f) << 16) | (parity(opcode) << 23)
+ *
+ * with CP_TYPE7_PKT == 0x70000000.  This mirrors
+ * src/freedreno/common/freedreno_pm4.h:pm4_pkt7_hdr(), which is what the
+ * working GL backend uses for this part (fd5_emit.c uses OUT_PKT7).
+ *
+ * VERIFIED against the reverse engineering of the OEM blob, whose packet base
+ * 0x70b00003 decomposes exactly as pkt7(opcode 0x30, cnt 3) -- 0x30 being
+ * CP_LOAD_STATE4, matching A5XX_VULKAN_SPEC.md section 4.3.
+ *
+ * Using type-3 here instead is silently wrong: the CP decodes the header,
+ * finds an opcode it does not implement, and faults the ring ("CP | opcode
+ * error" in dmesg, followed by a hangcheck recovery).
+ */
+#define TA5_CP_TYPE7_PKT 0x70000000u
+
+/** Odd parity of the low 8 bits of x. */
+static inline uint32_t
+ta5_pm4_odd_parity(uint32_t x)
+{
+   x ^= x >> 16;
+   x ^= x >> 8;
+   x ^= x >> 4;
+   x ^= x >> 2;
+   x ^= x >> 1;
+   return x & 1;
+}
+
+/** Build a type-7 packet header for an opcode with `count` total dwords. */
+static inline uint32_t
+ta5_pm4_pkt7(uint32_t opcode, uint32_t count)
+{
+   return TA5_CP_TYPE7_PKT | count | (ta5_pm4_odd_parity(count) << 15) |
+          ((opcode & 0x7f) << 16) |
+          (ta5_pm4_odd_parity(opcode) << 23);
+}
+
+/** CP_LOAD_STATE4 -- the state-load packet family this GPU generation uses. */
+#define TA5_CP_LOAD_STATE4 0x30
+
 #endif /* TA5_CMD_BUFFER_H */

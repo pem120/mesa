@@ -76,6 +76,15 @@ struct ta5_device
 
    /** The DRM render node fd opened for the physical device. */
    int fd;
+
+   /**
+    * Live queue objects, keyed by (family, index).
+    *
+    * vkGetDeviceQueue must return the same handle for the same family and
+    * index -- applications rely on that identity, and it is what lets
+    * vkDeviceWaitIdle find every queue the application has asked for.
+    */
+   struct list_head queues;
 };
 VK_DEFINE_HANDLE_CASTS(ta5_device, vk.base, VkDevice, VK_OBJECT_TYPE_DEVICE)
 

@@ -31,10 +31,12 @@
  */
 
 #include <stdio.h>
+#include <unistd.h>
 #include <stdlib.h>
 #include <string.h>
 
 #include "util/u_math.h"
+#include "util/list.h"
 #include "vk_util.h"
 #include "vk_object.h"
 #include "vk_alloc.h"
@@ -44,6 +46,8 @@
 
 #include "ta5_instance.h"
 #include "ta5_device.h"
+#include "ta5_queue.h"
+#include "ta5_submit.h"
 #include "ta5_entrypoints.h"
 
 #define TA5_DBG(fmt, ...)                                                  \
@@ -80,6 +84,7 @@ ta5_CreateDevice(VkPhysicalDevice physicalDevice,
    device->instance = pdevice->instance;
    device->physical_device = pdevice;
    device->fd = pdevice->dev_fd;
+   list_inithead(&device->queues);
 
    /*
     * a5xx is a single generation, so unlike Turnip there is no per-chip
@@ -132,6 +137,18 @@ ta5_DestroyDevice(VkDevice _device, const VkAllocationCallbacks *pAllocator)
    struct ta5_device *device = (struct ta5_device *)_device;
 
    TA5_TRACE("DestroyDevice: entering");
+   {
+      list_for_each_entry_safe(struct ta5_queue, queue, &device->queues,
+                               link) {
+         list_del(&queue->link);
+         if (queue->idle_fence_fd >= 0)
+            close(queue->idle_fence_fd);
+         if (queue->ring)
+            ta5_bo_unref(queue->ring);
+         free(queue);
+      }
+   }
+
    vk_device_finish(&device->vk);
    TA5_TRACE("DestroyDevice: vk_device_finish done");
 
@@ -146,25 +163,7 @@ ta5_DestroyDevice(VkDevice _device, const VkAllocationCallbacks *pAllocator)
    vk_free(pAllocator, device);
 }
 
-VKAPI_ATTR void VKAPI_CALL
-ta5_GetDeviceQueue(VkDevice _device, uint32_t queueFamilyIndex,
-                   uint32_t queueIndex, VkQueue *pQueue)
-{
-   /* Queues are created in the queue-submission phase; for now the device
-    * exposes no queues, which is valid for an incomplete driver but will be
-    * replaced before any rendering path is implemented.
-    */
-   (void)_device;
-   (void)queueFamilyIndex;
-   (void)queueIndex;
-   (void)pQueue;
-}
-
-VKAPI_ATTR void VKAPI_CALL
-ta5_GetDeviceQueue2(VkDevice _device, const VkDeviceQueueInfo2 *pQueueInfo,
-                    VkQueue *pQueue)
-{
-   (void)_device;
-   (void)pQueueInfo;
-   (void)pQueue;
-}
+/*
+ * vkGetDeviceQueue and vkQueueSubmit live in ta5_queue.cc, which owns the
+ * ring buffer and the DRM submit path.
+ */

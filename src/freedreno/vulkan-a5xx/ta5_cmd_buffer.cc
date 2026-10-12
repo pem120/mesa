@@ -206,16 +206,14 @@ ta5_BeginCommandBuffer(VkCommandBuffer _cmd,
    cmd->state = MESA_VK_COMMAND_BUFFER_STATE_RECORDING;
 
    /*
-    * Emit the stream header.  a5xx requires every command stream to start
-    * with a type-3 header carrying the total length, patched at EndCommandBuffer
-    * once the final size is known.
+    * No stream header is emitted: an a5xx command stream is a bare sequence
+    * of PM4 packets.  (An a6xx-style CP_START header here is what caused a
+    * GPU fault on the first submission -- see the kernel's "opcode error"
+    * report.)
     */
    result = ta5_cmd_buffer_alloc_cs(cmd, TA5_CS_INITIAL_WORDS);
    if (result != VK_SUCCESS)
       return result;
-
-   cmd->cs[cmd->cs_count++] = 0x00000000; /* header, patched in End */
-   cmd->cs[cmd->cs_count++] = 0x00000000; /* header length word    */
 
    return VK_SUCCESS;
 }
@@ -228,15 +226,10 @@ ta5_EndCommandBuffer(VkCommandBuffer _cmd)
    assert(cmd->state == MESA_VK_COMMAND_BUFFER_STATE_RECORDING);
 
    /*
-    * Patch the type-3 header length.  The count field is in DWORDs
-    * including the two header words themselves.
-    */
-   cmd->cs[1] = cmd->cs_count;
-
-   /*
-    * A command buffer that recorded nothing is still legal and becomes
-    * executable; submitting it is a no-op.  The submission path is what
-    * rejects a stream with no payload, not EndCommandBuffer.
+    * A command buffer that recorded nothing is legal and becomes executable.
+    * Its stream is left empty; vkQueueSubmit recognises that and signals the
+    * fence without going to the GPU.  Fabricating a packet here would put
+    * invented PM4 on the ring, which the a5xx CP faults on.
     */
    cmd->state = MESA_VK_COMMAND_BUFFER_STATE_EXECUTABLE;
    return VK_SUCCESS;
