@@ -150,7 +150,6 @@ ta5_get_gpu_info(uint32_t gpu_id, uint64_t chip_id, struct ta5_gpu_info *info)
     * version. */
    info->reg_size_vec4 = 64; /* a5xx = 64 (a6xx differs) */
    info->gmem_size = ta5_gmem_size_for_id((uint32_t)id.gpu_id);
-   info->num_gmem_pipes = 1;
 
    return true;
 }

@@ -18,7 +18,8 @@ ta5_entrypoints = custom_target(
 )
 
 libta5_files = files(
-  'ta5_device.c',
+  'ta5_device.cc',
+  'ta5_driver.cc',
 )
 
 # Generated adreno register/pm4 headers (adreno_pm4.xml.h etc.) are pulled in
