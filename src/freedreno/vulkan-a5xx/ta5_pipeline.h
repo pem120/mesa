@@ -57,6 +57,13 @@ struct ta5_pipeline
    /** Runtime-owned graphics state, filled from our render pass. */
    struct vk_graphics_pipeline_state graphics_state;
 
+   /*
+    * Backing store for graphics_state.  The runtime plants pointers into
+    * this (state->mv points at all_state.mv), so it has to outlive the
+    * vk_graphics_pipeline_state_fill() call -- a stack local would dangle.
+    */
+   struct vk_graphics_pipeline_all_state all_state;
+
    struct ta5_compiled_shader vertex;
    struct ta5_compiled_shader fragment;
 

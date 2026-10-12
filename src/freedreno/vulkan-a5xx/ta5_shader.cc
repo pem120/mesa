@@ -43,6 +43,8 @@
 
 #include "compiler/shader_enums.h"
 #include "compiler/nir/nir.h"
+#include "compiler/nir/nir_builder.h"
+#include "compiler/nir/nir_intrinsics.h"
 #include "compiler/spirv/nir_spirv.h"
 
 #include "ir3/ir3_compiler.h"
@@ -53,6 +55,7 @@
 #include "ta5_device.h"
 #include "ta5_shader.h"
 #include "ta5_entrypoints.h"
+#include "vk_nir.h"
 
 
 #define TA5_DBG_SHADER(fmt, ...)                                          \
@@ -123,6 +126,55 @@ ta5_shader_stage(VkShaderStageFlagBits stage)
    }
 }
 
+/*
+ * Assign consecutive driver locations to the interface variables.
+ *
+ * The GL backend does this per shader kind in freedreno_program.c, and the
+ * I/O lowering below only reads var->data.driver_location -- it never assigns
+ * one.  Without this, every store_output gets base = 0 and IR3's
+ * setup_output() indexes ctx->outputs[] out of bounds, tripping
+ * "failed assert: idx < ctx->noutputs" (ctx->noutputs is nir->num_outputs * 4).
+ *
+ * Assigning them densely also renumbers the Gallium-style slots that
+ * spirv_to_nir() produces (VARYING_SLOT_POS, VARYING_SLOT_VAR0, ...) into the
+ * plain 0-based locations a Vulkan interface expects.
+ */
+static void
+ta5_assign_driver_locations(nir_shader *nir)
+{
+   nir->num_inputs = 0;
+   nir->num_outputs = 0;
+
+   /* gl_Position has to stay first: IR3 relies on driver_location 0 being the
+    * position output. */
+   unsigned out_n = 0;
+   nir_foreach_shader_out_variable(var, nir) {
+      if (var->data.location == VARYING_SLOT_POS)
+         continue;
+      var->data.driver_location = ++out_n;
+   }
+   nir->num_outputs = out_n + 1;
+
+   unsigned in_n = 0;
+   nir_foreach_shader_in_variable(var, nir)
+      var->data.driver_location = in_n++;
+   nir->num_inputs = in_n;
+}
+
+/*
+ * spirv_to_nir()'s own logging is compiled out of NDEBUG builds, so failures
+ * come back as a bare NULL with nothing to explain it.  Install a callback so
+ * a rejected module says why.
+ */
+static void
+ta5_spirv_debug(void *private_data, enum nir_spirv_debug_level level,
+                 size_t spirv_offset, const char *message)
+{
+   static const char *names[] = {"error", "warning", "info"};
+   fprintf(stderr, "ta5[spirv] %s @word %zu: %s\n",
+           names[level < 3 ? level : 2], spirv_offset / 4, message);
+}
+
 bool
 ta5_shader_compile(struct ta5_device *device, VkShaderStageFlagBits stage,
                    const uint32_t *code, size_t code_size,
@@ -155,10 +207,39 @@ ta5_shader_compile(struct ta5_device *device, VkShaderStageFlagBits stage,
     * descriptor lowering to do here -- IR3's generation-gated a4xx back end
     * already targets this part's layout.
     */
-   spirv_options.create_library = true;
+   /*
+    * Not a library.  Turnip gets away with create_library = true only because
+    * its graphics path then runs tu_nir_lower_vs over a clone; the library
+    * form keeps load/store deref intrinsics that IR3's emit_intrinsic has no
+    * case for ("Unhandled intrinsic type").  Entry-point NIR is what we want.
+    */
+   spirv_options.create_library = false;
 
-   nir = spirv_to_nir(code, code_size, NULL, ta5_shader_stage(stage), "main",
-                      &spirv_options, nir_options);
+   if (getenv("TA5_TRACE_NULL")) {
+      spirv_options.debug.func = ta5_spirv_debug;
+      spirv_options.debug.private_data = device;
+   }
+
+   /*
+    * Go through the runtime's wrapper rather than calling spirv_to_nir()
+    * directly.  It does three things we were each getting wrong:
+    *
+    *  - it divides code_size by 4, because spirv_to_nir() takes a word count.
+    *    Passing bytes made the parser read four times past the end of the
+    *    module and report a bare "SPIR-V parsing FAILED".
+    *
+    *  - it runs the deref lowering (inline, copy-prop, then nir_opt_deref).
+    *    Doing it ourselves straight after nir_lower_system_values left
+    *    load_deref/store_deref in the IR, which IR3's emit_intrinsic() has no
+    *    case for -- "Unhandled intrinsic type: store_deref", followed by a
+    *    segfault inside the error path, since ir3_get_src_maybe_shared() is
+    *    handed the NULL context.
+    *
+    *  - it supplies the device's descriptor sizes and SPIR-V capabilities.
+    */
+   nir = vk_spirv_to_nir(&device->vk, code, code_size,
+                         ta5_shader_stage(stage), "main", NULL, &spirv_options,
+                         nir_options, false /* internal */, mem_ctx);
    if (!nir) {
       TA5_DBG_SHADER("spirv_to_nir failed for stage %u", stage);
       goto fail;
@@ -176,6 +257,32 @@ ta5_shader_compile(struct ta5_device *device, VkShaderStageFlagBits stage,
     * this.  Turnip does the same at tu_shader.cc:76.
     */
    NIR_PASS(_, nir, nir_lower_system_values);
+
+   /*
+    * Lower the I/O derefs that spirv_to_nir() produced into load_input /
+    * store_output intrinsics.
+    *
+    * spirv_to_nir() writes an output varying as
+    *
+    *    %1 = deref_var &v_color (shader_out vec3)
+    *        @store_deref (%1, %2) (wrmask=xyz)
+    *
+    * and IR3 cannot read that form: emit_instr() has no case for
+    * nir_instr_type_load / nir_instr_type_store, and emit_intrinsic() falls
+    * through to "Unhandled intrinsic type: store_deref" -- then segfaults
+    * while formatting the message, because ir3_get_src_maybe_shared() is
+    * handed the NULL context.  IR3 does handle load_input and store_output.
+    *
+    * ir3_finalize_nir() does not do this for us.  Its only call to
+    * ir3_nir_lower_io() (which is what runs nir_lower_io) is gated on
+    * MESA_SHADER_GEOMETRY, because the GL backend already lowered I/O before
+    * calling into IR3 at ir3_gallium.c:499.  Arriving from Vulkan, nothing has
+    * run it, so run the same pair the GL path uses.
+    */
+   if (!nir->info.io_lowered) {
+      ta5_assign_driver_locations(nir);
+      ir3_nir_lower_io(nir);
+   }
 
    shader_options.api_wavesize = IR3_SINGLE_ONLY;
    shader_options.real_wavesize = IR3_SINGLE_ONLY;

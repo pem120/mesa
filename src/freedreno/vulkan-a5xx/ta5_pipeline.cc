@@ -195,9 +195,16 @@ ta5_CreateGraphicsPipelines(VkDevice _device, VkPipelineCache pipelineCache,
        */
       struct vk_render_pass_state rp_state = {};
       ta5_fill_render_pass_state(&rp_state, pipe->render_pass);
-      vk_graphics_pipeline_state_fill(&device->vk, &pipe->graphics_state, ci,
-                                      NULL, &rp_state, 0, NULL, NULL,
-                                      VK_SYSTEM_ALLOCATION_SCOPE_OBJECT, NULL);
+
+      /*
+       * all_state must be a real object.  Passing NULL tells the runtime that
+       * it may allocate, and it then writes the result through alloc_ptr_out --
+       * which is NULL too, so it dereferences NULL (vk_graphics_state.c:1802).
+       * Turnip passes &builder->all_state for the same reason.
+       */
+      vk_graphics_pipeline_state_fill(
+         &device->vk, &pipe->graphics_state, ci, NULL, &rp_state, 0,
+         &pipe->all_state, NULL, VK_SYSTEM_ALLOCATION_SCOPE_OBJECT, NULL);
 
       pipe->raster = ci->pRasterizationState;
       pipe->blend = ci->pColorBlendState;
