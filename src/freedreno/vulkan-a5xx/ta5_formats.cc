@@ -57,6 +57,7 @@
 #include <string.h>
 
 #include "util/u_math.h"
+#include "util/format/u_format.h"
 #include "util/bitscan.h"
 #include "vk_util.h"
 #include "vk_object.h"
@@ -170,6 +171,13 @@ ta5_format_caps_get(VkFormat format)
    }
 
    return &none;
+}
+
+bool
+ta5_format_is_color(VkFormat format)
+{
+   /* Depth/stencil formats carry the 0x80000000 tag. */
+   return (format & 0x80000000u) == 0;
 }
 
 uint32_t

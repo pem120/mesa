@@ -62,4 +62,7 @@ const struct ta5_format_caps *ta5_format_caps_get(VkFormat format);
  */
 uint32_t ta5_format_block_size(VkFormat format);
 
+/** True if a format is a colour (non depth/stencil) format. */
+bool ta5_format_is_color(VkFormat format);
+
 #endif /* TA5_FORMATS_H */
