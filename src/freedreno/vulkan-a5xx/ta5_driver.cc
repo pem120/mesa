@@ -34,12 +34,15 @@
 #include <string.h>
 
 #include "util/u_math.h"
+#include "util/os_misc.h"
 #include "vk_util.h"
+#include "vk_object.h"
 #include "vk_physical_device.h"
 #include "vk_common_entrypoints.h"
 
 #include "ta5_instance.h"
 #include "ta5_device.h"
+#include "ta5_formats.h"
 
 #include "ta5_entrypoints.h"
 
@@ -393,6 +396,17 @@ ta5_physical_device_init(struct ta5_physical_device *device,
 
    /* one universal graphics/compute/transfer queue family */
    device->queue_props[0] = ta5_gfx_queue_properties;
+   device->num_queue_families = 1;
+
+   /*
+    * Single system-memory heap.  os_get_gpu_heap_size() applies the same
+    * "percentage of available RAM" policy Turnip uses; fall back to the gmem
+    * size so the reported value is never zero.
+    */
+   float heap_percent = 0.5f;
+   device->heap_size = os_get_gpu_heap_size(heap_percent, &heap_percent);
+   if (!device->heap_size)
+      device->heap_size = (uint64_t)device->gpu_info.gmem_size;
 
    return VK_SUCCESS;
 }
@@ -455,13 +469,190 @@ ta5_GetPhysicalDeviceSparseImageFormatProperties(
       pProperties);
 }
 
+/* ------------------------------------------------------------------ */
+/* Properties2 / KHR-promoted variants                                 */
+/*                                                                     */
+/* The generated dispatch table references ta5_<Name> by name.  The      */
+/* runtime does not alias its generic vk_common_ implementations to those */
+/* names, so an undefined symbol becomes a NULL function pointer that    */
+/* the loader dereferences directly.  Every core Vulkan 1.0/1.1           */
+/* physical-device query must therefore be defined here explicitly.       */
+/* This is the same pattern Turnip uses.                                 */
+/*                                                                     */
+/* IMPORTANT: do NOT also define the *KHR aliases                        */
+/* (ta5_GetPhysicalDeviceProperties2KHR and friends).  The runtime's      */
+/* compaction table maps a promoted alias onto the same dispatch slot as  */
+/* the core function, so defining both writes that slot twice and trips   */
+/* "assert(disp[disp_index] == NULL)" in                                   */
+/* vk_instance_dispatch_table_from_entrypoints.  When only the core      */
+/* symbol exists the alias slot stays NULL and is skipped, and the core   */
+/* function is used for both names.                                       */
+/* ------------------------------------------------------------------ */
+
+VKAPI_ATTR void VKAPI_CALL
+ta5_GetPhysicalDeviceProperties2(VkPhysicalDevice physicalDevice,
+                                 VkPhysicalDeviceProperties2 *pProperties)
+{
+   vk_common_GetPhysicalDeviceProperties2(physicalDevice, pProperties);
+}
+
+VKAPI_ATTR void VKAPI_CALL
+ta5_GetPhysicalDeviceFeatures2(VkPhysicalDevice physicalDevice,
+                                VkPhysicalDeviceFeatures2 *pFeatures)
+{
+   vk_common_GetPhysicalDeviceFeatures2(physicalDevice, pFeatures);
+}
+
+VKAPI_ATTR void VKAPI_CALL
+ta5_GetPhysicalDeviceFormatProperties(VkPhysicalDevice physicalDevice,
+                                       VkFormat format,
+                                       VkFormatProperties *pFormatProperties)
+{
+   vk_common_GetPhysicalDeviceFormatProperties(physicalDevice, format,
+                                               pFormatProperties);
+}
+
 /*
- * vkGetPhysicalDeviceSparseImageFormatProperties2 is intentionally not
- * implemented: sparse memory management is not supported in this phase, and
- * the Vulkan runtime declares vk_common_...Properties2 without providing a
- * definition, so wiring it up would fail to link.  Once sparse support
- * lands, this needs a real implementation alongside it.
+ * No generic implementation exists in the Vulkan runtime, so the queue
+ * families are served from the table filled in by ta5_physical_device_init.
  */
+VKAPI_ATTR void VKAPI_CALL
+ta5_GetPhysicalDeviceQueueFamilyProperties2(
+   VkPhysicalDevice _pdevice, uint32_t *pQueueFamilyPropertyCount,
+   VkQueueFamilyProperties2 *pQueueFamilyProperties)
+{
+   const struct ta5_physical_device *device =
+      (const struct ta5_physical_device *)_pdevice;
+
+   VK_OUTARRAY_MAKE_TYPED(VkQueueFamilyProperties2, out,
+                          pQueueFamilyProperties, pQueueFamilyPropertyCount);
+
+   for (uint32_t i = 0; i < device->num_queue_families; i++) {
+      vk_outarray_append_typed(VkQueueFamilyProperties2, &out, p) {
+         p->queueFamilyProperties = device->queue_props[i];
+      }
+   }
+}
+
+/*
+ * a5xx has no dedicated VRAM: all buffers and images live in system memory,
+ * so there is a single heap of host RAM.  The size is reported as the
+ * available system memory at instance-creation time.
+ */
+VKAPI_ATTR void VKAPI_CALL
+ta5_GetPhysicalDeviceMemoryProperties2(
+   VkPhysicalDevice _pdevice, VkPhysicalDeviceMemoryProperties2 *pMemoryProperties)
+{
+   const struct ta5_physical_device *device =
+      (const struct ta5_physical_device *)_pdevice;
+
+   VkPhysicalDeviceMemoryProperties *props = &pMemoryProperties->memoryProperties;
+
+   props->memoryHeapCount = 1;
+   props->memoryHeaps[0].size = device->heap_size;
+   props->memoryHeaps[0].flags = VK_MEMORY_HEAP_DEVICE_LOCAL_BIT;
+
+   /*
+    * Four memory types over that one heap.  a5xx has no cache-coherent vs
+    * uncached distinction exposed to Vulkan on this class of part, so the
+    * standard Turnip-style split (device-local vs host-visible) is reported.
+    */
+   props->memoryTypeCount = 4;
+   for (uint32_t i = 0; i < props->memoryTypeCount; i++) {
+      props->memoryTypes[i].heapIndex = 0;
+      props->memoryTypes[i].propertyFlags = 0;
+
+      if (i & 1)
+         props->memoryTypes[i].propertyFlags |= VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+      if (i & 2)
+         props->memoryTypes[i].propertyFlags |=
+            VK_MEMORY_PROPERTY_HOST_CACHED_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+   }
+
+   vk_foreach_struct(sType, ext, pMemoryProperties->pNext) {
+      switch (sType) {
+      case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT: {
+         VkPhysicalDeviceMemoryBudgetPropertiesEXT *budget =
+            (VkPhysicalDeviceMemoryBudgetPropertiesEXT *)ext;
+         budget->heapUsage[0] = 0;
+         budget->heapBudget[0] = vk_physical_device_heap_budget(
+            device->heap_size, 0.5, device->heap_size, 0);
+         break;
+      }
+      default:
+         break;
+      }
+   }
+}
+
+/*
+ * Sparse memory management is not supported.  The generic implementation
+ * reports "not sparse" for every format, which is exactly what a driver
+ * without sparse support must return -- it is not a stub.
+ */
+VKAPI_ATTR void VKAPI_CALL
+ta5_GetPhysicalDeviceSparseImageFormatProperties2(
+   VkPhysicalDevice physicalDevice,
+   const VkPhysicalDeviceSparseImageFormatInfo2 *pFormatInfo,
+   uint32_t *pPropertyCount, VkSparseImageFormatProperties2 *pProperties)
+{
+   /* No format supports sparse residency: report an empty result. */
+   *pPropertyCount = 0;
+}
+
+/*
+ * No external memory handle types are exported yet.  This entry point cannot
+ * fail, so the correct answer is "no handle type is supported" for every
+ * handle -- a zeroed VkExternalBufferProperties.
+ *
+ * The fence/semaphore variants below do have generic implementations and use
+ * them; only the buffer one is missing from the runtime.
+ */
+VKAPI_ATTR void VKAPI_CALL
+ta5_GetPhysicalDeviceExternalBufferProperties(
+   VkPhysicalDevice physicalDevice,
+   const VkPhysicalDeviceExternalBufferInfo *pExternalBufferInfo,
+   VkExternalBufferProperties *pExternalBufferProperties)
+{
+   memset(pExternalBufferProperties, 0, sizeof(*pExternalBufferProperties));
+}
+
+/*
+ * External memory/fence/semaphore handles.  Nothing is exported yet, so
+ * these all report that no handle type is supported.
+ */
+VKAPI_ATTR void VKAPI_CALL
+ta5_GetPhysicalDeviceExternalFenceProperties(
+   VkPhysicalDevice physicalDevice,
+   const VkPhysicalDeviceExternalFenceInfo *pExternalFenceInfo,
+   VkExternalFenceProperties *pExternalFenceProperties)
+{
+   vk_common_GetPhysicalDeviceExternalFenceProperties(
+      physicalDevice, pExternalFenceInfo, pExternalFenceProperties);
+}
+
+VKAPI_ATTR void VKAPI_CALL
+ta5_GetPhysicalDeviceExternalSemaphoreProperties(
+   VkPhysicalDevice physicalDevice,
+   const VkPhysicalDeviceExternalSemaphoreInfo *pExternalSemaphoreInfo,
+   VkExternalSemaphoreProperties *pExternalSemaphoreProperties)
+{
+   vk_common_GetPhysicalDeviceExternalSemaphoreProperties(
+      physicalDevice, pExternalSemaphoreInfo, pExternalSemaphoreProperties);
+}
+
+/*
+ * VK_KHR_tooling_info.  Reported so offline tooling (the shader cache,
+ * RenderDoc-style capture tools) can enumerate the driver under test.
+ */
+VKAPI_ATTR VkResult VKAPI_CALL
+ta5_GetPhysicalDeviceToolProperties(VkPhysicalDevice physicalDevice,
+                                    uint32_t *pToolCount,
+                                    VkPhysicalDeviceToolProperties *pToolProperties)
+{
+   return vk_common_GetPhysicalDeviceToolProperties(physicalDevice, pToolCount,
+                                                    pToolProperties);
+}
 
 VKAPI_ATTR VkResult VKAPI_CALL
 ta5_EnumerateDeviceLayerProperties(VkPhysicalDevice physicalDevice,

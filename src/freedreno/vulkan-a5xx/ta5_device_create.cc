@@ -31,6 +31,8 @@
  */
 
 #include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 
 #include "util/u_math.h"
 #include "vk_util.h"
@@ -47,6 +49,13 @@
 #define TA5_DBG(fmt, ...)                                                  \
    do {                                                                    \
       fprintf(stderr, "ta5: " fmt "\n", ##__VA_ARGS__);                    \
+   } while (0)
+
+/* Verbose progress tracing, enabled with TA5_TRACE_NULL=1. */
+#define TA5_TRACE(fmt, ...)                                                \
+   do {                                                                    \
+      if (getenv("TA5_TRACE_NULL"))                                        \
+         fprintf(stderr, "ta5[trace]: " fmt "\n", ##__VA_ARGS__);         \
    } while (0)
 
 VKAPI_ATTR VkResult VKAPI_CALL
@@ -75,11 +84,14 @@ ta5_CreateDevice(VkPhysicalDevice physicalDevice,
     * a5xx is a single generation, so unlike Turnip there is no per-chip
     * entrypoint table to switch on -- one table covers all a5xx parts.
     */
+   TA5_TRACE("CreateDevice: building dispatch table");
    vk_device_dispatch_table_from_entrypoints(&dispatch_table,
                                              &ta5_device_entrypoints, true);
+   TA5_TRACE("CreateDevice: calling vk_device_init");
 
    result = vk_device_init(&device->vk, &pdevice->vk, &dispatch_table,
                            pCreateInfo, pAllocator);
+   TA5_TRACE("CreateDevice: vk_device_init returned %d", result);
    if (result != VK_SUCCESS) {
       TA5_DBG("vk_device_init failed: %d", result);
       vk_free(pAllocator, device);
@@ -88,7 +100,23 @@ ta5_CreateDevice(VkPhysicalDevice physicalDevice,
 
    *pDevice = ta5_device_to_handle(device);
 
+   TA5_TRACE("CreateDevice: success");
    return VK_SUCCESS;
+}
+
+VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL
+ta5_GetDeviceProcAddr(VkDevice _device, const char *pName)
+{
+   struct ta5_device *device = (struct ta5_device *)_device;
+   PFN_vkVoidFunction func;
+
+   func = vk_common_GetDeviceProcAddr(_device, pName);
+
+   /* See the note on ta5_GetInstanceProcAddr for why this is traced. */
+   if (func == NULL && pName && getenv("TA5_TRACE_NULL"))
+      fprintf(stderr, "ta5: NULL device proc addr: %s\n", pName);
+
+   return func;
 }
 
 VKAPI_ATTR void VKAPI_CALL
@@ -96,7 +124,18 @@ ta5_DestroyDevice(VkDevice _device, const VkAllocationCallbacks *pAllocator)
 {
    struct ta5_device *device = (struct ta5_device *)_device;
 
+   TA5_TRACE("DestroyDevice: entering");
    vk_device_finish(&device->vk);
+   TA5_TRACE("DestroyDevice: vk_device_finish done");
+
+   /*
+    * The allocator passed to vkDestroyDevice may legitimately be NULL, and
+    * vk_free() dereferences whatever allocator it is handed.  Fall back to
+    * the default allocator, matching what CreateDevice stored.
+    */
+   if (pAllocator == NULL)
+      pAllocator = vk_default_allocator();
+
    vk_free(pAllocator, device);
 }
 

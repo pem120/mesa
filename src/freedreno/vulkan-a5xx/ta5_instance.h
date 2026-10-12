@@ -33,6 +33,9 @@
 
 #include "ta5_device.h"
 
+/** a5xx exposes a single universal graphics/compute/transfer queue family. */
+#define TA5_MAX_QUEUE_FAMILIES 1
+
 struct ta5_instance
 {
    struct vk_instance vk;
@@ -50,7 +53,14 @@ struct ta5_physical_device
    struct fd_dev_id dev_id;
    struct ta5_gpu_info gpu_info;
 
-   VkQueueFamilyProperties queue_props[1];
+   VkQueueFamilyProperties queue_props[TA5_MAX_QUEUE_FAMILIES];
+   uint32_t num_queue_families;
+
+   /*
+    * a5xx has no dedicated VRAM -- buffers and images are system memory, so
+    * there is a single heap sized from the host's available RAM.
+    */
+   uint64_t heap_size;
 
    char device_name[VK_MAX_PHYSICAL_DEVICE_NAME_SIZE];
 };

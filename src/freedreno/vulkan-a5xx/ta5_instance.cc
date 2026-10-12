@@ -33,6 +33,7 @@
 
 #include <fcntl.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 
@@ -294,6 +295,28 @@ ta5_EnumerateInstanceVersion(uint32_t *pApiVersion)
    return VK_SUCCESS;
 }
 
+/*
+ * vkEnumeratePhysicalDevices must be defined explicitly: the generated
+ * dispatch table references ta5_EnumeratePhysicalDevices by name, and the
+ * runtime's generic vk_common_EnumeratePhysicalDevices is not aliased to
+ * it automatically.  An undefined symbol becomes a NULL slot that the
+ * loader calls into directly.
+ */
+VKAPI_ATTR VkResult VKAPI_CALL
+ta5_EnumeratePhysicalDevices(VkInstance instance, uint32_t *pCount,
+                             VkPhysicalDevice *pDevices)
+{
+   return vk_common_EnumeratePhysicalDevices(instance, pCount, pDevices);
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL
+ta5_EnumeratePhysicalDeviceGroups(
+   VkInstance instance, uint32_t *pCount,
+   VkPhysicalDeviceGroupProperties *pGroups)
+{
+   return vk_common_EnumeratePhysicalDeviceGroups(instance, pCount, pGroups);
+}
+
 /* ------------------------------------------------------------------ */
 /* Vulkan loader ICD interface                                          */
 /* ------------------------------------------------------------------ */
@@ -302,8 +325,26 @@ VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL
 ta5_GetInstanceProcAddr(VkInstance _instance, const char *pName)
 {
    struct ta5_instance *instance = (struct ta5_instance *)_instance;
-   return vk_instance_get_proc_addr(instance ? &instance->vk : NULL,
+   PFN_vkVoidFunction func;
+
+   func = vk_instance_get_proc_addr(instance ? &instance->vk : NULL,
                                     &ta5_instance_entrypoints, pName);
+
+   /*
+    * Diagnostic: the Vulkan loader calls the driver entry point for every
+    * function it might use and calls whatever it gets back.  A NULL for a
+    * function the driver never implemented therefore shows up as a jump to
+    * address 0 with no other diagnostic, which is very hard to attribute.
+    *
+    * Set TA5_TRACE_NULL=1 to log every name that resolves to NULL.  Most of
+    * these are legitimately unavailable (extensions not implemented yet, or
+    * names only valid with a non-NULL instance); the interesting one is the
+    * last line printed before a crash.
+    */
+   if (func == NULL && pName && getenv("TA5_TRACE_NULL"))
+      fprintf(stderr, "ta5: NULL proc addr: %s\n", pName);
+
+   return func;
 }
 
 /*

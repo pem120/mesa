@@ -21,6 +21,8 @@ libta5_files = files(
   'ta5_device.cc',
   'ta5_device_create.cc',
   'ta5_driver.cc',
+  'ta5_formats.cc',
+  'ta5_memory.cc',
   'ta5_instance.cc',
 )
 
