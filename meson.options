@@ -783,6 +783,20 @@ option(
 )
 
 option(
+  'freedreno-a5xx-vulkan',
+  type : 'feature',
+  value : 'auto',
+  description : 'Build the Adreno 5xx Vulkan driver (bindful, pre-a6xx GPUs). '
+)
+
+option(
+  'ta5-build-id',
+  type : 'string',
+  value : '',
+  description : 'Override build id for the a5xx shader cache keys (hex string). '
+)
+
+option(
   'nvk-build-id',
   type : 'string',
   value : '',
