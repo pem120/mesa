@@ -67,6 +67,8 @@ struct ta5_physical_device
 VK_DEFINE_HANDLE_CASTS(ta5_physical_device, vk.base, VkPhysicalDevice,
                        VK_OBJECT_TYPE_PHYSICAL_DEVICE)
 
+struct ir3_compiler;
+
 struct ta5_device
 {
    struct vk_device vk;
@@ -85,6 +87,14 @@ struct ta5_device
     * vkDeviceWaitIdle find every queue the application has asked for.
     */
    struct list_head queues;
+
+   /**
+    * IR3 compiler, generation-gated: a5xx (gen 5) selects IR3's a4xx back
+    * end, the same one the GL backend uses.  It emits CP_LOAD_STATE4, which
+    * is the only state-load family this hardware has -- Turnip only speaks
+    * CP_LOAD_STATE6 and cannot be shared.
+    */
+   struct ir3_compiler *compiler;
 };
 VK_DEFINE_HANDLE_CASTS(ta5_device, vk.base, VkDevice, VK_OBJECT_TYPE_DEVICE)
 

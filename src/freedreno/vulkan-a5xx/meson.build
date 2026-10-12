@@ -26,6 +26,7 @@ libta5_files = files(
   'ta5_sync.cc',
   'ta5_cmd_buffer.cc',
   'ta5_descriptor.cc',
+  'ta5_shader.cc',
   'ta5_queue.cc',
   'ta5_submit.cc',
   'ta5_instance.cc',
@@ -66,7 +67,12 @@ libvulkan_freedreno_a5xx = shared_library(
   libta5_files,
   ta5_entrypoints,
   include_directories : libta5_includes,
-  link_with : ta5_link_with,
+  link_with : ta5_link_with + [
+    # IR3 shader compiler.  a5xx is generation 5, so IR3 selects its a4xx
+    # back end -- the same path the GL backend uses on this part, and it
+    # emits CP_LOAD_STATE4, the only state-load family this hardware has.
+    libfreedreno_ir3,
+  ],
   dependencies : [
     dep_m,
     dep_thread,

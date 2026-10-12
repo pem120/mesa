@@ -46,6 +46,9 @@
 
 #include "ta5_instance.h"
 #include "ta5_device.h"
+#include "ir3/ir3_compiler.h"
+#include "common/freedreno_dev_info.h"
+
 #include "ta5_queue.h"
 #include "ta5_submit.h"
 #include "ta5_entrypoints.h"
@@ -111,6 +114,41 @@ ta5_CreateDevice(VkPhysicalDevice physicalDevice,
     */
    vk_device_set_drm_fd(&device->vk, device->fd);
 
+   /*
+    * Bring up the IR3 compiler.  a5xx is generation 5, so IR3 picks its
+    * a4xx back end internally; the GL backend on this same part uses the
+    * identical path, which is why no a5xx-specific compiler work is needed.
+    */
+   {
+      struct ir3_compiler_options ir3_options = {};
+
+      /*
+       * The disk shader cache reads the build-id ELF note from the running
+       * executable to key itself.  An ICD is a shared library loaded by the
+       * Vulkan loader, so that lookup is not available the same way and
+       * ir3_disk_cache_init() dereferences a NULL note.  Turnip handles this
+       * the same way: the Vulkan runtime has its own cache infrastructure.
+       */
+      ir3_options.disable_cache = true;
+
+      const struct fd_dev_info *dev_info = fd_dev_info_raw(&pdevice->dev_id);
+
+      if (!dev_info) {
+         TA5_DBG("no fd_dev_info for gpu %u chip 0x%" PRIx64,
+                 pdevice->dev_id.gpu_id, pdevice->dev_id.chip_id);
+         vk_free(pAllocator, device);
+         return vk_error(&pdevice->instance->vk, VK_ERROR_INITIALIZATION_FAILED);
+      }
+
+      device->compiler =
+         ir3_compiler_create(NULL, &pdevice->dev_id, dev_info, &ir3_options);
+      if (!device->compiler) {
+         TA5_DBG("failed to initialise ir3 compiler");
+         vk_free(pAllocator, device);
+         return vk_error(&pdevice->instance->vk, VK_ERROR_INITIALIZATION_FAILED);
+      }
+   }
+
    *pDevice = ta5_device_to_handle(device);
 
    TA5_TRACE("CreateDevice: success");
@@ -147,6 +185,11 @@ ta5_DestroyDevice(VkDevice _device, const VkAllocationCallbacks *pAllocator)
             ta5_bo_unref(queue->ring);
          free(queue);
       }
+   }
+
+   if (device->compiler) {
+      ir3_compiler_destroy(device->compiler);
+      device->compiler = NULL;
    }
 
    vk_device_finish(&device->vk);
