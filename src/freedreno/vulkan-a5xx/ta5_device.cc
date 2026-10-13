@@ -139,15 +139,13 @@ ta5_get_gpu_info(uint32_t gpu_id, uint64_t chip_id, struct ta5_gpu_info *info)
    info->tile_max_w = dev_info->tile_max_w;
    info->tile_max_h = dev_info->tile_max_h;
    info->num_vsc_pipes = dev_info->num_vsc_pipes;
+   info->num_sp_cores = dev_info->num_sp_cores;
    info->cs_shared_mem_size = dev_info->cs_shared_mem_size;
    info->wave_granularity = dev_info->wave_granularity;
    info->threadsize_base = dev_info->threadsize_base;
    info->highest_bank_bit = dev_info->highest_bank_bit;
 
-   /* reg_size_vec4 and num_sp_cores live in the shared table too, but under
-    * names that vary; fall back to the a5xx defaults documented in
-    * freedreno_devices.py if the fields aren't present in this struct
-    * version. */
+   /* gmem_size is not in the shared table; derive it the way GL does. */
    info->reg_size_vec4 = 64; /* a5xx = 64 (a6xx differs) */
    info->gmem_size = ta5_gmem_size_for_id((uint32_t)id.gpu_id);
 

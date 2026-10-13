@@ -71,6 +71,7 @@ struct ta5_reloc
    uint64_t bo_offset;  /**< offset into that BO */
    uint32_t dst_off;    /**< byte offset of the dword to patch */
    uint32_t or_mask;    /**< value OR'd into the patched dword */
+   int32_t shift;       /**< kernel right-shifts the address by -shift */
 };
 
 struct ta5_cmd_buffer

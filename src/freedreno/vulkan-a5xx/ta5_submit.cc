@@ -342,7 +342,12 @@ ta5_submit_cmd_relocs(struct ta5_queue *queue, const uint32_t *cs,
           */
          krelocs[i].submit_offset = relocs[i].dst_off + queue->ring_offset;
          krelocs[i]._or = relocs[i].or_mask;   /* `or` is a C++ keyword */
-         krelocs[i].shift = 0;
+         /*
+          * A negative shift makes the kernel right-shift the address before
+          * storing it, which is how the high half of a 64 bit a5xx address
+          * gets into the top dword.  See ta5_cs_reloc().
+          */
+         krelocs[i].shift = relocs[i].shift;
          /* +1: bos[0] is the command stream itself. */
          krelocs[i].reloc_idx = relocs[i].bo_index + 1;
          krelocs[i].reloc_offset = relocs[i].bo_offset;

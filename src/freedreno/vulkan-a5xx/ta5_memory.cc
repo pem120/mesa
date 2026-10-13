@@ -91,7 +91,11 @@ ta5_AllocateMemory(VkDevice _device, const VkMemoryAllocateInfo *pAllocateInfo,
     * MSM_BO_CACHED_COHERENT (0x080000) is not, and passing it makes
     * DRM_IOCTL_GEM_NEW fail with EINVAL.
     */
-   memory->bo = ta5_bo_alloc(device, (uint32_t)memory->size, MSM_BO_CACHED);
+   {
+      const char *m = getenv("TA5_BO_CACHE");
+      uint32_t flags = m && m[0] == 'w' ? MSM_BO_WC : MSM_BO_CACHED;
+      memory->bo = ta5_bo_alloc(device, (uint32_t)memory->size, flags);
+   }
    if (!memory->bo) {
       vk_free(pAllocator, memory);
       return vk_error(&device->instance->vk,

@@ -32,6 +32,7 @@
  */
 
 #include <assert.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -265,9 +266,6 @@ ta5_ResetCommandBuffer(VkCommandBuffer _cmd, VkCommandBufferResetFlags flags)
 #include "ta5_memory.h"
 #include "util/format/format_utils.h"
 
-/** a506 has two shader cores (PC_POWER_CNTL / VFD_POWER_CNTL). */
-#define TA5_NUM_SP_CORES 2
-
 /** Clear colour, packed the way RB_CLEAR_COLOR_DW0..3 wants it. */
 union ta5_color
 {
@@ -309,20 +307,25 @@ ta5_cmd_buffer_grow_relocs(struct ta5_cmd_buffer *cmd, uint32_t count)
 }
 
 /**
- * Record a relocation of `bo` into the dword currently being emitted.
+ * Emit a relocated GPU address, the way freedreno's OUT_RELOC() does.
  *
- * a5xx uses reloc submit rather than vm_bind, so the kernel patches the
- * buffer's GPU address into the command stream at submit time.  The dword
- * carries any fixed bits in or_mask.
+ * a5xx (fd_dev_gen() >= 5) carries buffer addresses in 64 bit register
+ * fields, so one address is *two* stream dwords and the kernel has to patch
+ * both: the low half with shift 0, the high half with shift -32 so that it
+ * lands in bits 32..63.  Getting this wrong is silent -- the low half looks
+ * perfectly plausible, so the RB is handed a base address of
+ * (addr << 32) | <the next packet header> and quietly renders nowhere.
+ *
+ * The low dword carries any fixed bits in or_mask, exactly like OUT_RELOC().
  */
 static VkResult
-ta5_cmd_buffer_reloc(struct ta5_cmd_buffer *cmd, struct ta5_bo *bo,
-                     uint64_t bo_offset, uint32_t or_mask)
+ta5_cs_reloc(struct ta5_cmd_buffer *cmd, struct ta5_bo *bo, uint64_t bo_offset,
+             uint32_t or_mask)
 {
    uint32_t i;
    VkResult ret;
 
-   ret = ta5_cmd_buffer_grow_relocs(cmd, cmd->reloc_count + 1);
+   ret = ta5_cmd_buffer_grow_relocs(cmd, cmd->reloc_count + 2);
    if (ret != VK_SUCCESS)
       return ret;
 
@@ -344,11 +347,23 @@ ta5_cmd_buffer_reloc(struct ta5_cmd_buffer *cmd, struct ta5_bo *bo,
       cmd->reloc_bo_count++;
    }
 
+   cmd->cs[cmd->cs_count++] = or_mask;
+   cmd->cs[cmd->cs_count++] = 0;
+
+   cmd->relocs[cmd->reloc_count].bo_index = i;
+   cmd->relocs[cmd->reloc_count].bo_offset = bo_offset;
+   cmd->relocs[cmd->reloc_count].dst_off = (cmd->cs_count - 2) * 4;
+   cmd->relocs[cmd->reloc_count].or_mask = or_mask;
+   cmd->relocs[cmd->reloc_count].shift = 0;
+   cmd->reloc_count++;
+
    cmd->relocs[cmd->reloc_count].bo_index = i;
    cmd->relocs[cmd->reloc_count].bo_offset = bo_offset;
    cmd->relocs[cmd->reloc_count].dst_off = (cmd->cs_count - 1) * 4;
-   cmd->relocs[cmd->reloc_count].or_mask = or_mask;
+   cmd->relocs[cmd->reloc_count].or_mask = 0;   /* or_mask >> 32 */
+   cmd->relocs[cmd->reloc_count].shift = -32;
    cmd->reloc_count++;
+
    return VK_SUCCESS;
 }
 
@@ -368,7 +383,13 @@ ta5_pkt4(struct ta5_cmd_buffer *cmd, uint32_t reg, uint32_t cnt)
                      (ta5_pm4_odd_parity(reg) << 27));
 }
 
-/** Type-7 packet with `cnt` total dwords including the header. */
+/**
+ * Type-7 packet.
+ *
+ * `cnt` is freedreno's OUT_PKT7() count field -- total dwords in the packet
+ * minus one, i.e. the number of payload dwords.  CP_LOAD_STATE4(3) is
+ * therefore three payload dwords, not four.
+ */
 static void
 ta5_pkt7(struct ta5_cmd_buffer *cmd, uint32_t opcode, uint32_t cnt)
 {
@@ -406,11 +427,40 @@ ta5_event_write_ts(struct ta5_cmd_buffer *cmd, struct ta5_bo *bo, uint32_t evt)
 
    ta5_pkt7(cmd, CP_EVENT_WRITE, 4);
    ta5_cs_push(cmd, CP_EVENT_WRITE_0_EVENT((enum vgt_event_type)evt));
-   ta5_cs_push(cmd, 0);
-   ret = ta5_cmd_buffer_reloc(cmd, bo, 0, 0);
+   ret = ta5_cs_reloc(cmd, bo, 0, 0);
    if (ret != VK_SUCCESS)
       return ret;
-   ta5_cs_push(cmd, 0x00000000);
+   ta5_cs_push(cmd, 0x00000000);   /* CP_EVENT_WRITE_3_DATA */
+   return VK_SUCCESS;
+}
+
+/**
+ * Program SP_xS_OBJ_START, the descriptor HLSQ fetches the shader from.
+ *
+ * CP_LOAD_STATE4 only pushes the microcode into HLSQ's state block; the draw
+ * itself is driven from the *shader object* whose start address lives in this
+ * register.  fd5_emit_shader_obj() emits it immediately before
+ * fd5_emit_shader(), and GL's captured stream shows both.  Without it HLSQ
+ * has nothing to fetch and the draw completes without producing a pixel.
+ *
+ * The remaining four dwords describe the per-fiber private memory.  The
+ * shaders this driver compiles need none of it, so they are all zero, which
+ * is exactly what GL emits for them.
+ */
+static VkResult
+ta5_emit_shader_obj(struct ta5_cmd_buffer *cmd, struct ta5_pipeline *pipe,
+                    uint32_t reg, uint32_t bo_offset)
+{
+   VkResult ret;
+
+   ta5_pkt4(cmd, reg, 6);
+   ret = ta5_cs_reloc(cmd, pipe->shader_bo, bo_offset, 0);
+   if (ret != VK_SUCCESS)
+      return ret;
+   ta5_cs_push(cmd, 0x00000000);   /* SP_xS_PVT_MEM_PARAM */
+   ta5_cs_push(cmd, 0x00000000);   /* SP_xS_PVT_MEM_ADDR lo */
+   ta5_cs_push(cmd, 0x00000000);   /* SP_xS_PVT_MEM_ADDR hi */
+   ta5_cs_push(cmd, 0x00000000);   /* SP_xS_PVT_MEM_SIZE_TOTALPVTMEMSIZE */
    return VK_SUCCESS;
 }
 
@@ -419,24 +469,28 @@ ta5_event_write_ts(struct ta5_cmd_buffer *cmd, struct ta5_bo *bo, uint32_t evt)
  *
  * a5xx keeps constants inside the shader stream, so the whole variant goes
  * over as a single ST4_SHADER blob rather than separate CONSTANTS/UBO/texture
- * loads.  The dwords are emitted inline (SS4_DIRECT) rather than through a
- * BO, which fd5_emit_shader() only does under its DIRECT debug flag but is
- * exactly equivalent and saves a scratch allocation.
+ * loads.  SS4_INDIRECT is how GL does it too: the microcode stays in a BO and
+ * the packet carries its address, rather than inlining the dwords.
  */
 static VkResult
 ta5_emit_shader(struct ta5_cmd_buffer *cmd, struct ta5_pipeline *pipe,
                 const struct ta5_compiled_shader *shader,
-                enum a4xx_state_block state_block, uint32_t bo_offset)
+                enum a4xx_state_block state_block, uint32_t obj_reg,
+                uint32_t bo_offset)
 {
    VkResult ret;
+
+   ret = ta5_emit_shader_obj(cmd, pipe, obj_reg, bo_offset);
+   if (ret != VK_SUCCESS)
+      return ret;
 
    ta5_pkt7(cmd, CP_LOAD_STATE4, 3);
    ta5_cs_push(cmd, CP_LOAD_STATE4_0_DST_OFF(0) |
                      CP_LOAD_STATE4_0_STATE_SRC(SS4_INDIRECT) |
                      CP_LOAD_STATE4_0_STATE_BLOCK(state_block) |
                      CP_LOAD_STATE4_0_NUM_UNIT(shader->instrlen));
-   ta5_cs_push(cmd, CP_LOAD_STATE4_1_STATE_TYPE(ST4_SHADER));
-   ret = ta5_cmd_buffer_reloc(cmd, pipe->shader_bo, bo_offset, 0);
+   ret = ta5_cs_reloc(cmd, pipe->shader_bo, bo_offset,
+                      CP_LOAD_STATE4_1_STATE_TYPE(ST4_SHADER));
    if (ret != VK_SUCCESS)
       return ret;
    return VK_SUCCESS;
@@ -477,6 +531,8 @@ ta5_set_render_mode(struct ta5_cmd_buffer *cmd)
    ta5_cs_push(cmd, 0x00000000);
    ta5_cs_push(cmd, 0x00000000);
 }
+
+static void ta5_emit_draw_state(struct ta5_cmd_buffer *cmd);
 
 /**
  * a5xx state restore.
@@ -587,6 +643,26 @@ ta5_emit_restore(struct ta5_cmd_buffer *cmd)
    ta5_cs_push(cmd, CP_SET_DRAW_STATE__1_ADDR_LO(0));
    ta5_cs_push(cmd, CP_SET_DRAW_STATE__2_ADDR_HI(0));
 }
+/** Single-sample setup, from fd5_gmem.c:emit_msaa(). */
+static void
+ta5_emit_msaa(struct ta5_cmd_buffer *cmd)
+{
+   ta5_pkt4(cmd, REG_A5XX_TPL1_TP_RAS_MSAA_CNTL, 2);
+   ta5_cs_push(cmd, A5XX_TPL1_TP_RAS_MSAA_CNTL_SAMPLES(MSAA_ONE));
+   ta5_cs_push(cmd, A5XX_TPL1_TP_DEST_MSAA_CNTL_SAMPLES(MSAA_ONE) |
+                     A5XX_TPL1_TP_DEST_MSAA_CNTL_MSAA_DISABLE);
+
+   ta5_pkt4(cmd, REG_A5XX_RB_RAS_MSAA_CNTL, 2);
+   ta5_cs_push(cmd, A5XX_RB_RAS_MSAA_CNTL_SAMPLES(MSAA_ONE));
+   ta5_cs_push(cmd, A5XX_RB_DEST_MSAA_CNTL_SAMPLES(MSAA_ONE) |
+                     A5XX_RB_DEST_MSAA_CNTL_MSAA_DISABLE);
+
+   ta5_pkt4(cmd, REG_A5XX_GRAS_SC_RAS_MSAA_CNTL, 2);
+   ta5_cs_push(cmd, A5XX_GRAS_SC_RAS_MSAA_CNTL_SAMPLES(MSAA_ONE));
+   ta5_cs_push(cmd, A5XX_GRAS_SC_DEST_MSAA_CNTL_SAMPLES(MSAA_ONE) |
+                     A5XX_GRAS_SC_DEST_MSAA_CNTL_MSAA_DISABLE);
+}
+
 /**
  * Begin a render pass rendering straight to sysmem (a5xx "bypass" mode).
  *
@@ -620,16 +696,23 @@ ta5_emit_sysmem_prep(struct ta5_cmd_buffer *cmd,
    if (getenv("TA5_SKIP_PREP"))
       return VK_SUCCESS;
 
+   /* fd5_emit_lrz_flush() */
+   ta5_pkt4(cmd, REG_A5XX_GRAS_LRZ_CNTL, 1);
+   ta5_cs_push(cmd, A5XX_GRAS_LRZ_CNTL_ENABLE);
+   ta5_event_write(cmd, LRZ_FLUSH_INVALIDATE);
+
    ta5_pkt7(cmd, CP_SKIP_IB2_ENABLE_GLOBAL, 1);
    ta5_cs_push(cmd, 0);
 
    ta5_event_write(cmd, PC_CCU_INVALIDATE_COLOR);
 
+   uint32_t num_sp = cmd->device->physical_device->gpu_info.num_sp_cores;
+
    ta5_pkt4(cmd, REG_A5XX_PC_POWER_CNTL, 1);
-   ta5_cs_push(cmd, TA5_NUM_SP_CORES - 1);
+   ta5_cs_push(cmd, num_sp - 1);
 
    ta5_pkt4(cmd, REG_A5XX_VFD_POWER_CNTL, 1);
-   ta5_cs_push(cmd, TA5_NUM_SP_CORES - 1);
+   ta5_cs_push(cmd, num_sp - 1);
 
    /*
     * No wait-for-idle here.  GL calls fd_wfi() at this point, but that is
@@ -672,15 +755,14 @@ ta5_emit_sysmem_prep(struct ta5_cmd_buffer *cmd,
    ta5_pkt7(cmd, CP_SET_VISIBILITY_OVERRIDE, 1);
    ta5_cs_push(cmd, 0x1);
 
-   /* Color attachment 0. */
+   /* Color attachment 0.  BASE_LO/BASE_HI is a 64 bit reloc. */
    ta5_pkt4(cmd, REG_A5XX_RB_MRT_BUF_INFO(0), 5);
    ta5_cs_push(cmd, A5XX_RB_MRT_BUF_INFO_COLOR_FORMAT(RB5_R8G8B8A8_UNORM) |
                      A5XX_RB_MRT_BUF_INFO_COLOR_TILE_MODE(TILE5_LINEAR) |
                      A5XX_RB_MRT_BUF_INFO_COLOR_SWAP(WZYX));
    ta5_cs_push(cmd, A5XX_RB_MRT_PITCH(stride));
    ta5_cs_push(cmd, A5XX_RB_MRT_ARRAY_PITCH(stride * h));
-   ta5_cs_push(cmd, 0);
-   ret = ta5_cmd_buffer_reloc(cmd, bo, img->offset, 0);
+   ret = ta5_cs_reloc(cmd, bo, img->offset, 0);
    if (ret != VK_SUCCESS)
       return ret;
 
@@ -692,6 +774,14 @@ ta5_emit_sysmem_prep(struct ta5_cmd_buffer *cmd,
    ta5_cs_push(cmd, 0);
    ta5_cs_push(cmd, 0);
    ta5_cs_push(cmd, 0);
+
+   /*
+    * Enable RT0 before the clear.  The component mask tells the RB which
+    * colour targets are live; with it still zero from the state restore the
+    * CCU has nowhere to write and the clear is silently dropped.
+    */
+   ta5_emit_msaa(cmd);
+   ta5_emit_draw_state(cmd);
 
    return VK_SUCCESS;
 }
@@ -752,12 +842,63 @@ ta5_emit_draw_state(struct ta5_cmd_buffer *cmd)
    ta5_pkt4(cmd, REG_A5XX_RB_MRT_BLEND_CONTROL(0), 1);
    ta5_cs_push(cmd, 0x00000000);
 
-   /* No textures bound in either stage. */
+   /* No textures bound in any stage. */
    ta5_pkt4(cmd, REG_A5XX_TPL1_VS_TEX_COUNT, 1);
    ta5_cs_push(cmd, 0x00000000);
 
    ta5_pkt4(cmd, REG_A5XX_TPL1_FS_TEX_COUNT, 1);
    ta5_cs_push(cmd, 0x00000000);
+
+   ta5_pkt4(cmd, REG_A5XX_TPL1_CS_TEX_COUNT, 1);
+   ta5_cs_push(cmd, 0x00000000);
+
+   /* No depth or stencil attachment, so all of these stay cleared. */
+   ta5_pkt4(cmd, REG_A5XX_RB_DEPTH_CNTL, 1);
+   ta5_cs_push(cmd, 0x00000000);
+
+   ta5_pkt4(cmd, REG_A5XX_RB_DEPTH_PLANE_CNTL, 1);
+   ta5_cs_push(cmd, 0x00000000);
+
+   ta5_pkt4(cmd, REG_A5XX_GRAS_SU_DEPTH_PLANE_CNTL, 1);
+   ta5_cs_push(cmd, 0x00000000);
+
+   ta5_pkt4(cmd, REG_A5XX_RB_STENCILREFMASK, 2);
+   ta5_cs_push(cmd, 0x00000000);
+   ta5_cs_push(cmd, 0x00000000);
+
+   /* Rasteriser: filled triangles, width 1, no polygon offset. */
+   ta5_pkt4(cmd, REG_A5XX_GRAS_SU_CNTL, 1);
+   ta5_cs_push(cmd, A5XX_GRAS_SU_CNTL_LINEHALFWIDTH(0.5f));
+
+   ta5_pkt4(cmd, REG_A5XX_GRAS_SU_POINT_MINMAX, 2);
+   ta5_cs_push(cmd, A5XX_GRAS_SU_POINT_MINMAX_MIN(1.0f) |
+                     A5XX_GRAS_SU_POINT_MINMAX_MAX(1.0f));
+   ta5_cs_push(cmd, A5XX_GRAS_SU_POINT_SIZE(1.0f));
+
+   ta5_pkt4(cmd, REG_A5XX_GRAS_SU_POLY_OFFSET_SCALE, 3);
+   ta5_cs_push(cmd, 0x00000000);
+   ta5_cs_push(cmd, 0x00000000);
+   ta5_cs_push(cmd, 0x00000000);
+
+   /* Both POLYMODE_*_PTYPE fields are 0 for filled triangles, and
+    * POLYMODE_ENABLE stays clear; the field type has no generated enum. */
+   ta5_pkt4(cmd, REG_A5XX_PC_RASTER_CNTL, 1);
+   ta5_cs_push(cmd, 0x00000000);
+
+   /* Depth range: Vulkan's default is 0..1 with clip_halfz off, which makes
+    * the clamped range -1..1. */
+   ta5_pkt4(cmd, REG_A5XX_GRAS_CL_VIEWPORT_ZCLAMP_NEAR_0, 2);
+   ta5_cs_push(cmd, A5XX_GRAS_CL_VIEWPORT_ZCLAMP_NEAR_0(-1.0f));
+   ta5_cs_push(cmd, A5XX_GRAS_CL_VIEWPORT_ZCLAMP_FAR_0(1.0f));
+
+   ta5_pkt4(cmd, REG_A5XX_RB_VIEWPORT_ZCLAMP_NEAR, 2);
+   ta5_cs_push(cmd, A5XX_RB_VIEWPORT_ZCLAMP_NEAR(-1.0f));
+   ta5_cs_push(cmd, A5XX_RB_VIEWPORT_ZCLAMP_FAR(1.0f));
+
+   /* Blend colour, even with blending disabled. */
+   ta5_pkt4(cmd, REG_A5XX_RB_BLEND_RED, 8);
+   for (int i = 0; i < 8; i++)
+      ta5_cs_push(cmd, 0x00000000);
 }
 
 /** Clear every colour attachment. */
@@ -942,6 +1083,62 @@ ta5_CmdEndRenderPass(VkCommandBuffer _cmd)
    ta5_emit_sysmem_fini(cmd);
    ta5_wfi(cmd);
 
+   /*
+    * Truncate to the first N dwords, for finding which packet stops the CP.
+    * Relocations past the cut go with it -- leaving one in would make the
+    * kernel patch outside the submitted range and reject the submit.
+    */
+   const char *maxw = getenv("TA5_MAX_DWORDS");
+   if (maxw) {
+      uint32_t want = (uint32_t)atoi(maxw);
+      uint32_t n = 0, i = 0;
+
+      /*
+       * Snap to a packet boundary.  Cutting mid-packet leaves the count field
+       * describing more dwords than actually follow, which faults the CP on
+       * its own and makes every prefix look broken -- which is exactly what
+       * happened the first time this was tried.
+       */
+      while (i < cmd->cs_count && n < want) {
+         uint32_t hdr = cmd->cs[i];
+         uint32_t total;
+
+         if ((hdr & 0xc0000000) == 0xc0000000) {
+            /* type 3 */
+            total = ((hdr >> 16) & 0x3ff) + 2;
+         } else if (((hdr >> 30) & 3) == 1 && ((hdr >> 28) & 3) == 3) {
+            /* type 7: count field is 15 bits */
+            total = 1 + (hdr & 0x7fff);
+         } else if (((hdr >> 30) & 3) == 1) {
+            /* type 4: count field is 7 bits */
+            total = 1 + (hdr & 0x7f);
+         } else {
+            total = 1;
+         }
+
+         if (n + total > want)
+            break;
+         n += total;
+         i += total;
+      }
+
+      while (cmd->reloc_count && cmd->relocs[cmd->reloc_count - 1].dst_off >= n * 4)
+         cmd->reloc_count--;
+      if (n < cmd->cs_count)
+         cmd->cs_count = n;
+   }
+
+   {
+      const char *dump = getenv("TA5_CS_DUMP");
+      if (dump) {
+         FILE *f = fopen(dump, "wb");
+         if (f) {
+            fwrite(cmd->cs, 4, cmd->cs_count, f);
+            fclose(f);
+         }
+      }
+   }
+
    if (getenv("TA5_TRACE_NULL")) {
       fprintf(stderr, "ta5[cs] %u dwords:\n", cmd->cs_count);
       for (uint32_t i = 0; i < cmd->cs_count; i++) {
@@ -990,7 +1187,22 @@ ta5_CmdDraw(VkCommandBuffer _cmd, uint32_t vertexCount, uint32_t instanceCount,
     * Viewport transform.  The vertex shader already produced NDC, so this is
     * the plain width/height to half-size mapping with no translate.
     */
-   ta5_emit_draw_state(cmd);
+   {
+      uint32_t w = cmd->bound_framebuffer->width;
+      uint32_t h = cmd->bound_framebuffer->height;
+
+      ta5_pkt4(cmd, REG_A5XX_GRAS_SC_SCREEN_SCISSOR_TL_0, 2);
+      ta5_cs_push(cmd, A5XX_GRAS_SC_SCREEN_SCISSOR_TL_0_X(0) |
+                        A5XX_GRAS_SC_SCREEN_SCISSOR_TL_0_Y(0));
+      ta5_cs_push(cmd, A5XX_GRAS_SC_SCREEN_SCISSOR_BR_0_X(w - 1) |
+                        A5XX_GRAS_SC_SCREEN_SCISSOR_BR_0_Y(h - 1));
+
+      ta5_pkt4(cmd, REG_A5XX_GRAS_SC_VIEWPORT_SCISSOR_TL_0, 2);
+      ta5_cs_push(cmd, A5XX_GRAS_SC_VIEWPORT_SCISSOR_TL_0_X(0) |
+                        A5XX_GRAS_SC_VIEWPORT_SCISSOR_TL_0_Y(0));
+      ta5_cs_push(cmd, A5XX_GRAS_SC_VIEWPORT_SCISSOR_BR_0_X(w - 1) |
+                        A5XX_GRAS_SC_VIEWPORT_SCISSOR_BR_0_Y(h - 1));
+   }
 
    ta5_pkt4(cmd, REG_A5XX_GRAS_CL_VPORT_XOFFSET_0, 6);
    ta5_cs_push(cmd, A5XX_GRAS_CL_VPORT_XOFFSET_0(0.0f));
@@ -1003,11 +1215,11 @@ ta5_CmdDraw(VkCommandBuffer _cmd, uint32_t vertexCount, uint32_t instanceCount,
    ta5_cs_push(cmd, A5XX_GRAS_CL_VPORT_ZSCALE_0(1.0f));
 
    if (ta5_emit_shader(cmd, pipe, &pipe->vertex, SB4_VS_SHADER,
-                       pipe->vs_offset) != VK_SUCCESS)
+                       REG_A5XX_SP_VS_OBJ_START, pipe->vs_offset) != VK_SUCCESS)
       return;
    if (pipe->has_fragment &&
        ta5_emit_shader(cmd, pipe, &pipe->fragment, SB4_FS_SHADER,
-                       pipe->fs_offset) != VK_SUCCESS)
+                       REG_A5XX_SP_FS_OBJ_START, pipe->fs_offset) != VK_SUCCESS)
       return;
 
    /*
