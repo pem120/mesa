@@ -743,7 +743,19 @@ ta5_emit_program_state(struct ta5_cmd_buffer *cmd, struct ta5_pipeline *pipe)
    ta5_pkt4(cmd, REG_A5XX_VPC_CNTL_0, 1);
    ta5_cs_push(cmd, A5XX_VPC_CNTL_0_STRIDE_IN_VPC(l.max_loc) |
                      (fs->total_in > 0 ? A5XX_VPC_CNTL_0_VARYING : 0) |
-                     0x10000 /* XXX */);
+                     0x00010000 /* XXX */);
+
+   /*
+    * The primitive assembler reads vertices out of the VPC with the same
+    * stride, so it has to agree with VPC_CNTL_0 above.  It lives here rather
+    * than in the draw state because that is where the stride is known --
+    * freedreno notes the same overlap and emits it after the program state.
+    * A stride that disagrees with the VPC reads positions from the wrong
+    * offsets and the draw rasterises nothing.
+    */
+   ta5_pkt4(cmd, REG_A5XX_PC_PRIMITIVE_CNTL, 1);
+   ta5_cs_push(cmd, A5XX_PC_PRIMITIVE_CNTL_STRIDE_IN_VPC(l.max_loc) |
+                     A5XX_PC_PRIMITIVE_CNTL_PROVOKING_VTX_LAST);
 
    ta5_pkt4(cmd, REG_A5XX_VFD_CONTROL_0, 1);
    ta5_cs_push(cmd, 0x00000000);
@@ -888,6 +900,17 @@ ta5_emit_consts(struct ta5_cmd_buffer *cmd, struct ta5_pipeline *pipe,
       if (size == 0)
          continue;
 
+      /*
+       * DST_OFF and NUM_UNIT are in units of vec4, which the computerator's
+       * load_constants() confirms: it divides a dword regid by four for
+       * DST_OFF and rounds a dword count up to four for NUM_UNIT.
+       *
+       * These two fields are not yet right for the draw path -- the vertex
+       * shader's positions still do not arrive, so the triangle does not
+       * rasterise -- but this form is the one that does not fault, and it
+       * keeps the whole stream clean while that is tracked down.  Do not take
+       * the values below as settled.
+       */
       ta5_pkt7(cmd, CP_LOAD_STATE4, 3);
       ta5_cs_push(cmd, CP_LOAD_STATE4_0_DST_OFF(state->range[i].offset / 4) |
                         CP_LOAD_STATE4_0_STATE_SRC(SS4_INDIRECT) |
@@ -1298,8 +1321,13 @@ ta5_emit_draw_state(struct ta5_cmd_buffer *cmd)
    ta5_pkt4(cmd, REG_A5XX_RB_RENDER_COMPONENTS, 1);
    ta5_cs_push(cmd, A5XX_RB_RENDER_COMPONENTS_RT0(0xf));
 
+   /*
+    * Clipper.  GL leaves this zero for a pipeline with no user clip
+    * distances, so match that rather than setting a bit the field layout
+    * does not define.
+    */
    ta5_pkt4(cmd, REG_A5XX_GRAS_CL_CNTL, 1);
-   ta5_cs_push(cmd, 0x00000080);
+   ta5_cs_push(cmd, 0x00000000);
 
    ta5_pkt4(cmd, REG_A5XX_RB_ALPHA_CONTROL, 1);
    ta5_cs_push(cmd, 0x00000000);
@@ -1316,21 +1344,33 @@ ta5_emit_draw_state(struct ta5_cmd_buffer *cmd)
                      A5XX_SP_FS_OUTPUT_CNTL_DEPTH_REGID(regid(63, 0)) |
                      A5XX_SP_FS_OUTPUT_CNTL_SAMPLEMASK_REGID(regid(63, 0)));
 
-   /* Vertex output stride in VPC; pos + colour = 8 dwords. */
-   ta5_pkt4(cmd, REG_A5XX_PC_PRIMITIVE_CNTL, 1);
-   ta5_cs_push(cmd, A5XX_PC_PRIMITIVE_CNTL_STRIDE_IN_VPC(8));
-
    ta5_pkt4(cmd, REG_A5XX_SP_BLEND_CNTL, 1);
    ta5_cs_push(cmd, 0x00000000);
 
    ta5_pkt4(cmd, REG_A5XX_RB_BLEND_CNTL, 1);
    ta5_cs_push(cmd, 0x00000000);
 
-   ta5_pkt4(cmd, REG_A5XX_RB_MRT_CONTROL(0), 1);
-   ta5_cs_push(cmd, 0x00000000);
+   /*
+    * Per-attachment ROP.  RB_MRT_CONTROL_COMPONENT_ENABLE is a *mask of colour
+    * components the RB may write*, not a list of bound attachments, so leaving
+    * it at zero makes every fragment write a no-op: the clear still lands
+    * (it goes through RB_CLEAR_CNTL and does not consult this register) but
+    * a draw changes nothing.  fd5_blend.c builds the same value from
+    * ROP_CODE(ROP_COPY) | COMPONENT_ENABLE(colormask); with no blending and a
+    * full colormask that is 0x7e0, which is what GL's stream carries.
+    *
+    * RB_MRT_CONTROL(i) is strided by 7 registers, so each slot is a separate
+    * one-dword write -- a multi-dword T4 here would spill into the unrelated
+    * registers in between.
+    */
+   for (int i = 0; i < 8; i++) {
+      ta5_pkt4(cmd, REG_A5XX_RB_MRT_CONTROL(i), 1);
+      ta5_cs_push(cmd, A5XX_RB_MRT_CONTROL_ROP_CODE(ROP_COPY) |
+                        A5XX_RB_MRT_CONTROL_COMPONENT_ENABLE(0xf));
 
-   ta5_pkt4(cmd, REG_A5XX_RB_MRT_BLEND_CONTROL(0), 1);
-   ta5_cs_push(cmd, 0x00000000);
+      ta5_pkt4(cmd, REG_A5XX_RB_MRT_BLEND_CONTROL(i), 1);
+      ta5_cs_push(cmd, 0x00000000);
+   }
 
    /* No textures bound in any stage. */
    ta5_pkt4(cmd, REG_A5XX_TPL1_VS_TEX_COUNT, 1);
@@ -1356,9 +1396,12 @@ ta5_emit_draw_state(struct ta5_cmd_buffer *cmd)
    ta5_cs_push(cmd, 0x00000000);
    ta5_cs_push(cmd, 0x00000000);
 
-   /* Rasteriser: filled triangles, width 1, no polygon offset. */
+   /* Rasteriser: filled triangles, width 1, no polygon offset, no culling.
+    * FRONT_CW is what GL's rasteriser state carries on this part.
+    */
    ta5_pkt4(cmd, REG_A5XX_GRAS_SU_CNTL, 1);
-   ta5_cs_push(cmd, A5XX_GRAS_SU_CNTL_LINEHALFWIDTH(0.5f));
+   ta5_cs_push(cmd, A5XX_GRAS_SU_CNTL_FRONT_CW |
+                     A5XX_GRAS_SU_CNTL_LINEHALFWIDTH(0.5f));
 
    ta5_pkt4(cmd, REG_A5XX_GRAS_SU_POINT_MINMAX, 2);
    ta5_cs_push(cmd, A5XX_GRAS_SU_POINT_MINMAX_MIN(1.0f) |
@@ -1705,8 +1748,11 @@ ta5_CmdDraw(VkCommandBuffer _cmd, uint32_t vertexCount, uint32_t instanceCount,
       return;
 
    /*
-    * Viewport transform.  The vertex shader already produced NDC, so this is
-    * the plain width/height to half-size mapping with no translate.
+    * Viewport transform.  The vertex shader produces NDC, so this is the
+    * width/height-to-half-size mapping *plus* the half-size offset that puts
+    * NDC -1 at pixel 0.  Without the offset the whole frame lands off the
+    * left and bottom edges and the draw rasterises nothing.  GL's stream
+    * carries 32/32 offsets and 0.5/0.5 for z on a 64x64 target.
     */
    {
       uint32_t w = cmd->bound_framebuffer->width;
@@ -1726,14 +1772,16 @@ ta5_CmdDraw(VkCommandBuffer _cmd, uint32_t vertexCount, uint32_t instanceCount,
    }
 
    ta5_pkt4(cmd, REG_A5XX_GRAS_CL_VPORT_XOFFSET_0, 6);
-   ta5_cs_push(cmd, A5XX_GRAS_CL_VPORT_XOFFSET_0(0.0f));
+   ta5_cs_push(cmd, A5XX_GRAS_CL_VPORT_XOFFSET_0(cmd->bound_framebuffer->width
+                                                 / 2.0f));
    ta5_cs_push(cmd, A5XX_GRAS_CL_VPORT_XSCALE_0(cmd->bound_framebuffer->width
                                                 / 2.0f));
-   ta5_cs_push(cmd, A5XX_GRAS_CL_VPORT_YOFFSET_0(0.0f));
+   ta5_cs_push(cmd, A5XX_GRAS_CL_VPORT_YOFFSET_0(cmd->bound_framebuffer->height
+                                                 / 2.0f));
    ta5_cs_push(cmd, A5XX_GRAS_CL_VPORT_YSCALE_0(cmd->bound_framebuffer->height
                                                 / 2.0f));
-   ta5_cs_push(cmd, A5XX_GRAS_CL_VPORT_ZOFFSET_0(0.0f));
-   ta5_cs_push(cmd, A5XX_GRAS_CL_VPORT_ZSCALE_0(1.0f));
+   ta5_cs_push(cmd, A5XX_GRAS_CL_VPORT_ZOFFSET_0(0.5f));
+   ta5_cs_push(cmd, A5XX_GRAS_CL_VPORT_ZSCALE_0(0.5f));
 
    ta5_emit_program_state(cmd, pipe);
 
