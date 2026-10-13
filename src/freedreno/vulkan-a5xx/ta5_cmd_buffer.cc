@@ -449,6 +449,20 @@ ta5_event_write_ts(struct ta5_cmd_buffer *cmd, struct ta5_bo *bo, uint32_t evt)
  * VS at the bottom of the constant space, FS taking the rest -- so that the
  * register values can be diffed against the GL backend's.
  */
+/*
+ * Advance a register id, keeping the invalid marker intact.  Mirrors
+ * next_regid() in fd5_program.c: an invalid regid has no neighbours, so the
+ * result stays invalid rather than wrapping into a real register.
+ */
+static inline uint32_t
+ta5_next_regid(uint32_t reg, uint32_t increment)
+{
+   if (VALIDREG(reg))
+      return reg + increment;
+   else
+      return regid(63, 0);
+}
+
 static void
 ta5_emit_program_state(struct ta5_cmd_buffer *cmd, struct ta5_pipeline *pipe)
 {
@@ -518,9 +532,18 @@ ta5_emit_program_state(struct ta5_cmd_buffer *cmd, struct ta5_pipeline *pipe)
    ta5_cs_push(cmd, A5XX_HLSQ_FS_CONFIG_CONSTOBJECTOFFSET(fs_constoff) |
                      A5XX_HLSQ_FS_CONFIG_SHADEROBJOFFSET(fs_instroff) |
                      A5XX_HLSQ_FS_CONFIG_ENABLED);
-   ta5_cs_push(cmd, 0x00000000);   /* HLSQ_HS_CONFIG */
-   ta5_cs_push(cmd, 0x00000000);   /* HLSQ_DS_CONFIG */
-   ta5_cs_push(cmd, 0x00000000);   /* HLSQ_GS_CONFIG */
+   /*
+    * HS/DS/GS are disabled but their CONFIG is still part of the constant
+    * object layout: freedreno gives them the constoff accumulated past the
+    * fragment stage and the fragment stage's shader-object offset.  Leaving
+    * them at zero is not the same thing as "off" to the HLSQ.
+    */
+   ta5_cs_push(cmd, A5XX_HLSQ_HS_CONFIG_CONSTOBJECTOFFSET(fs_constoff) |
+                     A5XX_HLSQ_HS_CONFIG_SHADEROBJOFFSET(fs_instroff));
+   ta5_cs_push(cmd, A5XX_HLSQ_DS_CONFIG_CONSTOBJECTOFFSET(fs_constoff) |
+                     A5XX_HLSQ_DS_CONFIG_SHADEROBJOFFSET(fs_instroff));
+   ta5_cs_push(cmd, A5XX_HLSQ_GS_CONFIG_CONSTOBJECTOFFSET(fs_constoff) |
+                     A5XX_HLSQ_GS_CONFIG_SHADEROBJOFFSET(fs_instroff));
 
    ta5_pkt4(cmd, REG_A5XX_HLSQ_CS_CONFIG, 1);
    ta5_cs_push(cmd, 0x00000000);
@@ -539,9 +562,12 @@ ta5_emit_program_state(struct ta5_cmd_buffer *cmd, struct ta5_pipeline *pipe)
    ta5_cs_push(cmd, A5XX_SP_FS_CONFIG_CONSTOBJECTOFFSET(fs_constoff) |
                      A5XX_SP_FS_CONFIG_SHADEROBJOFFSET(fs_instroff) |
                      A5XX_SP_FS_CONFIG_ENABLED);
-   ta5_cs_push(cmd, 0x00000000);   /* SP_HS_CONFIG */
-   ta5_cs_push(cmd, 0x00000000);   /* SP_DS_CONFIG */
-   ta5_cs_push(cmd, 0x00000000);   /* SP_GS_CONFIG */
+   ta5_cs_push(cmd, A5XX_SP_HS_CONFIG_CONSTOBJECTOFFSET(fs_constoff) |
+                     A5XX_SP_HS_CONFIG_SHADEROBJOFFSET(fs_instroff));
+   ta5_cs_push(cmd, A5XX_SP_DS_CONFIG_CONSTOBJECTOFFSET(fs_constoff) |
+                     A5XX_SP_DS_CONFIG_SHADEROBJOFFSET(fs_instroff));
+   ta5_cs_push(cmd, A5XX_SP_GS_CONFIG_CONSTOBJECTOFFSET(fs_constoff) |
+                     A5XX_SP_GS_CONFIG_SHADEROBJOFFSET(fs_instroff));
 
    ta5_pkt4(cmd, REG_A5XX_SP_CS_CONFIG, 1);
    ta5_cs_push(cmd, 0x00000000);
@@ -596,9 +622,55 @@ ta5_emit_program_state(struct ta5_cmd_buffer *cmd, struct ta5_pipeline *pipe)
                      A5XX_HLSQ_CONTROL_0_REG_CSTHREADSIZE(TWO_QUADS) |
                      0x00000880 /* XXX HLSQ_CONTROL_0 */);
    ta5_cs_push(cmd, A5XX_HLSQ_CONTROL_1_REG_PRIMALLOCTHRESHOLD(63));
-   ta5_cs_push(cmd, 0x00000000);   /* CONTROL_2: face/sample regids */
-   ta5_cs_push(cmd, 0x00000000);   /* CONTROL_3: ij regids */
-   ta5_cs_push(cmd, 0x00000000);   /* CONTROL_4: coord/sample regids */
+
+   /*
+    * CONTROL_2..4 hold the register ids the rasterizer uses to deliver face,
+    * sample and barycentric values to the fragment shader.  For a shader that
+    * consumes none of them every field must be the *invalid* regid, regid(63,
+    * 0) == 0xfc, which is what ir3_find_sysval_regid() returns for a missing
+    * sysval.  Writing 0 here instead names a real register -- one the shader
+    * never allocated for interpolation -- and the draw faults with
+    * UCHE_OOB_ACCESS | RBBM_AHB_ERROR.
+    */
+   {
+      uint32_t face_regid =
+         ir3_find_sysval_regid(fs, SYSTEM_VALUE_FRONT_FACE);
+      uint32_t samp_id_regid =
+         ir3_find_sysval_regid(fs, SYSTEM_VALUE_SAMPLE_ID);
+      uint32_t samp_mask_regid =
+         ir3_find_sysval_regid(fs, SYSTEM_VALUE_SAMPLE_MASK_IN);
+      uint32_t coord_regid =
+         ir3_find_sysval_regid(fs, SYSTEM_VALUE_FRAG_COORD);
+      uint32_t zwcoord_regid = ta5_next_regid(coord_regid, 2);
+      uint32_t ij_regid[IJ_COUNT];
+
+      for (unsigned i = 0; i < IJ_COUNT; i++)
+         ij_regid[i] = ir3_find_sysval_regid(
+            fs, SYSTEM_VALUE_BARYCENTRIC_PERSP_PIXEL + i);
+
+      ta5_cs_push(cmd,
+                  A5XX_HLSQ_CONTROL_2_REG_FACEREGID(face_regid) |
+                     A5XX_HLSQ_CONTROL_2_REG_SAMPLEID(samp_id_regid) |
+                     A5XX_HLSQ_CONTROL_2_REG_SAMPLEMASK(samp_mask_regid) |
+                     A5XX_HLSQ_CONTROL_2_REG_CENTERRHW(
+                        ij_regid[IJ_PERSP_CENTER_RHW]));
+      ta5_cs_push(cmd,
+                  A5XX_HLSQ_CONTROL_3_REG_IJ_PERSP_PIXEL(
+                     ij_regid[IJ_PERSP_PIXEL]) |
+                     A5XX_HLSQ_CONTROL_3_REG_IJ_LINEAR_PIXEL(
+                        ij_regid[IJ_LINEAR_PIXEL]) |
+                     A5XX_HLSQ_CONTROL_3_REG_IJ_PERSP_CENTROID(
+                        ij_regid[IJ_PERSP_CENTROID]) |
+                     A5XX_HLSQ_CONTROL_3_REG_IJ_LINEAR_CENTROID(
+                        ij_regid[IJ_LINEAR_CENTROID]));
+      ta5_cs_push(cmd,
+                  A5XX_HLSQ_CONTROL_4_REG_XYCOORDREGID(coord_regid) |
+                     A5XX_HLSQ_CONTROL_4_REG_ZWCOORDREGID(zwcoord_regid) |
+                     A5XX_HLSQ_CONTROL_4_REG_IJ_PERSP_SAMPLE(
+                        ij_regid[IJ_PERSP_SAMPLE]) |
+                     A5XX_HLSQ_CONTROL_4_REG_IJ_LINEAR_SAMPLE(
+                        ij_regid[IJ_LINEAR_SAMPLE]));
+   }
 
    ta5_pkt4(cmd, REG_A5XX_VPC_GS_SIV_CNTL, 1);
    ta5_cs_push(cmd, 0x0000ffff);   /* XXX */
@@ -613,10 +685,16 @@ ta5_emit_program_state(struct ta5_cmd_buffer *cmd, struct ta5_pipeline *pipe)
    ta5_cs_push(cmd, 0x00000000);
    ta5_cs_push(cmd, 0x00000000);
 
+   /*
+    * Only attachment 0 is bound.  The unused slots must carry the invalid
+    * regid (0xfc) rather than 0, so a stray write to an unbound MRT cannot be
+    * attributed to a real register.
+    */
    ta5_pkt4(cmd, REG_A5XX_SP_FS_OUTPUT_REG(0), 8);
    for (int i = 0; i < 8; i++) {
-      ta5_cs_push(cmd, (i == 0 ? color_regid : 0) |
-                        (VALIDREG(color_regid) && (color_regid & HALF_REG_ID)
+      ta5_cs_push(cmd, (i == 0 ? color_regid : regid(63, 0)) |
+                        ((i == 0 && VALIDREG(color_regid) &&
+                          (color_regid & HALF_REG_ID))
                             ? A5XX_SP_FS_OUTPUT_REG_HALF_PRECISION
                             : 0));
    }
@@ -656,7 +734,11 @@ ta5_emit_program_state(struct ta5_cmd_buffer *cmd, struct ta5_pipeline *pipe)
    ta5_cs_push(cmd, VALIDREG(psize_regid) ? A5XX_PC_PRIM_VTX_CNTL_PSIZE : 0);
 
    ta5_pkt4(cmd, REG_A5XX_SP_PRIMITIVE_CNTL, 1);
-   ta5_cs_push(cmd, A5XX_SP_PRIMITIVE_CNTL_VSOUT(l.max_loc));
+   /* VSOUT counts outputs the VS actually produces, which is l.cnt -- not the
+    * l.max_loc stride, which is a different (larger) number and tells the SP
+    * to emit more vectors per vertex than exist.
+    */
+   ta5_cs_push(cmd, A5XX_SP_PRIMITIVE_CNTL_VSOUT(l.cnt));
 
    ta5_pkt4(cmd, REG_A5XX_VPC_CNTL_0, 1);
    ta5_cs_push(cmd, A5XX_VPC_CNTL_0_STRIDE_IN_VPC(l.max_loc) |
@@ -724,6 +806,101 @@ ta5_emit_program_state(struct ta5_cmd_buffer *cmd, struct ta5_pipeline *pipe)
 }
 
 /**
+ * Upload one stage's immediate constants into its constant file.
+ *
+ * a5xx does *not* carry shader constants in the shader preamble.  That is an
+ * a7xx feature -- GPUProps.load_shader_consts_via_preamble is only set on
+ * a7xx_gen3 -- so on this generation immediates and constant data sit in the
+ * shader's constant file and the CP must fetch them with a
+ * CP_LOAD_STATE4/ST4_CONSTANTS load ahead of the draw.  A vertex shader that
+ * indexes a constant array, which is the ordinary way to spell a triangle,
+ * then reads c[...] that was never written, and the UCHE reports it as an
+ * out-of-bounds access at the draw.
+ *
+ * This mirrors ir3_emit_immediates() in ir3_const.h; we cannot call it
+ * directly because it emits into an fd_ringbuffer rather than our command
+ * buffer.
+ */
+static void
+ta5_emit_consts(struct ta5_cmd_buffer *cmd, struct ta5_pipeline *pipe,
+                const struct ta5_compiled_shader *shader,
+                enum a4xx_state_block state_block, uint32_t bo_offset)
+{
+   const struct ir3_shader_variant *v =
+      (const struct ir3_shader_variant *)shader->variant;
+   const struct ir3_const_state *const_state = ir3_const_state(v);
+   const struct ir3_ubo_analysis_state *state = &const_state->ubo_state;
+   uint32_t base = const_state->allocs.max_const_offset_vec4;
+   uint32_t size, regid, sizedwords;
+
+   /* a7xx+ folds these into the preamble instead; nothing to upload. */
+   if (v->compiler->info->props.load_shader_consts_via_preamble)
+      return;
+
+   /*
+    * Immediate constants.  Truncate to the constants this shader actually
+    * uses.  These live in the variant, not the shader BO, so they are pushed
+    * inline via SS4_DIRECT.
+    */
+   size = DIV_ROUND_UP(v->imm_state.count, 4);
+   size = MIN2(size + base, v->constlen) - base;
+   regid = base * 4;          /* vec4 -> dwords */
+   sizedwords = size * 4;
+   if (sizedwords > 0) {
+      ta5_pkt7(cmd, CP_LOAD_STATE4, 3 + sizedwords);
+      ta5_cs_push(cmd, CP_LOAD_STATE4_0_DST_OFF(regid / 4) |
+                        CP_LOAD_STATE4_0_STATE_SRC(SS4_DIRECT) |
+                        CP_LOAD_STATE4_0_STATE_BLOCK(state_block) |
+                        CP_LOAD_STATE4_0_NUM_UNIT(sizedwords / 4));
+      ta5_cs_push(cmd, CP_LOAD_STATE4_1_EXT_SRC_ADDR(0) |
+                        CP_LOAD_STATE4_1_STATE_TYPE(ST4_CONSTANTS));
+      ta5_cs_push(cmd, CP_LOAD_STATE4_2_EXT_SRC_ADDR_HI(0));
+      for (uint32_t i = 0; i < sizedwords; i++)
+         ta5_cs_push(cmd, v->imm_state.values[i]);
+   }
+
+   /*
+    * Constant data.  This is the other half and the one that matters for a
+    * plain triangle: the vertex shader's position array is NIR constant data
+    * indexed by the vertex id, and IR3 stores it in the variant BO after the
+    * microcode.  ta5_pipeline.cc copies that whole BO, so the data now lives
+    * at bo_offset + v->info.constant_data_offset in the shader BO; load it
+    * from there into the constant file at the regid the analysis assigned.
+    *
+    * Mirrors ir3_emit_constant_data() in ir3_const.h.
+    */
+   for (unsigned i = 0; i < state->num_enabled; i++) {
+      unsigned ubo = state->range[i].ubo.block;
+
+      if (ubo != const_state->consts_ubo.idx)
+         continue;
+
+      size = state->range[i].end - state->range[i].start;
+
+      /* Pre-a6xx, a range can be enabled in the shader but unused in the
+       * binning variant. */
+      if (16 * v->constlen <= state->range[i].offset)
+         continue;
+
+      /* and even if the start is before first_immediate, the end may not be */
+      size = MIN2(size, (16 * v->constlen) - state->range[i].offset);
+
+      if (size == 0)
+         continue;
+
+      ta5_pkt7(cmd, CP_LOAD_STATE4, 3);
+      ta5_cs_push(cmd, CP_LOAD_STATE4_0_DST_OFF(state->range[i].offset / 4) |
+                        CP_LOAD_STATE4_0_STATE_SRC(SS4_INDIRECT) |
+                        CP_LOAD_STATE4_0_STATE_BLOCK(state_block) |
+                        CP_LOAD_STATE4_0_NUM_UNIT(size / 4));
+      ta5_cs_reloc(cmd, pipe->shader_bo,
+                   bo_offset + v->info.constant_data_offset +
+                      state->range[i].start,
+                   CP_LOAD_STATE4_1_STATE_TYPE(ST4_CONSTANTS));
+   }
+}
+
+/**
  * Program SP_xS_OBJ_START, the descriptor HLSQ fetches the shader from.
  *
  * CP_LOAD_STATE4 only pushes the microcode into HLSQ's state block; the draw
@@ -782,6 +959,9 @@ ta5_emit_shader(struct ta5_cmd_buffer *cmd, struct ta5_pipeline *pipe,
                       CP_LOAD_STATE4_1_STATE_TYPE(ST4_SHADER));
    if (ret != VK_SUCCESS)
       return ret;
+
+   ta5_emit_consts(cmd, pipe, shader, state_block, bo_offset);
+
    return VK_SUCCESS;
 }
 
@@ -1270,37 +1450,34 @@ ta5_emit_clear(struct ta5_cmd_buffer *cmd, struct ta5_device *device,
 static VkResult
 ta5_emit_sysmem_fini(struct ta5_cmd_buffer *cmd)
 {
-   VkResult ret = VK_SUCCESS;
+   VkResult ret;
 
    ta5_pkt7(cmd, CP_SKIP_IB2_ENABLE_GLOBAL, 1);
    ta5_cs_push(cmd, 0);
 
+   /* fd5_emit_lrz_flush(): the trailing disable is part of the sequence. */
    ta5_pkt4(cmd, REG_A5XX_GRAS_LRZ_CNTL, 1);
    ta5_cs_push(cmd, A5XX_GRAS_LRZ_CNTL_ENABLE);
-
    ta5_event_write(cmd, LRZ_FLUSH_INVALIDATE);
-   ta5_event_write(cmd, PC_CCU_FLUSH_COLOR_TS);
+   ta5_pkt4(cmd, REG_A5XX_GRAS_LRZ_CNTL, 1);
+   ta5_cs_push(cmd, 0x0);
 
    /*
-    * Every attachment the application will read back needs its cache lines
-    * flushed, and CACHE_FLUSH_TS is how that is asked for: the timestamp
-    * destination doubles as the address whose cache is flushed.  GL emits one
-    * per frame per buffer at the very end of the stream.  Without it a
-    * MSM_BO_CACHED buffer keeps whatever the CPU last had mapped, and a
-    * successful render reads back as untouched memory.
+    * Both CCU flushes are timestamped.  The timestamp destination is the
+    * device-wide 16-byte blit scratch buffer, never a render target: freedreno
+    * always points fd5_event_write()'s relocation at blit_mem, and the
+    * timestamp's job is to make the CP report when the flush has *completed*
+    * so the wait is meaningful.  Handing it an attachment instead asks the CCU
+    * to flush on behalf of a buffer nothing is waiting on, and the packet
+    * faults -- it is the only packet left that does.
     */
-   if (cmd->bound_framebuffer) {
-      for (uint32_t i = 0; i < cmd->bound_framebuffer->attachment_count; i++) {
-         struct ta5_image *img =
-            cmd->bound_framebuffer->attachments[i]->image;
+   ret = ta5_event_write_ts(cmd, cmd->device->blit_bo,
+                            PC_CCU_FLUSH_COLOR_TS);
+   if (ret != VK_SUCCESS)
+      return ret;
 
-         ret = ta5_event_write_ts(cmd, img->bound_memory->bo, CACHE_FLUSH_TS);
-         if (ret != VK_SUCCESS)
-            return ret;
-      }
-   }
-
-   return ret;
+   return ta5_event_write_ts(cmd, cmd->device->blit_bo,
+                             PC_CCU_FLUSH_DEPTH_TS);
 }
 
 /* ------------------------------------------------------------------ */

@@ -51,6 +51,36 @@
 
 #include "drm/msm_drm.h"
 
+#include "ir3/ir3_shader.h"
+
+/**
+ * Bytes one variant occupies in the staging buffer.
+ *
+ * IR3 lays a variant out as microcode at offset 0 followed by the stage's
+ * constant data at info.constant_data_offset, so the variant is as large as
+ * whichever of the two reaches further.
+ */
+static uint32_t
+ta5_variant_size(const struct ir3_shader_variant *v)
+{
+   uint32_t microcode = v->info.sizedwords * 4;
+   uint32_t constants = v->info.constant_data_offset + v->constant_data_size;
+
+   return MAX2(microcode, constants);
+}
+
+/** Copy a variant's microcode and constant data into the staging buffer. */
+static void
+ta5_copy_variant(void *dst, const struct ta5_compiled_shader *shader,
+                 const struct ir3_shader_variant *v)
+{
+   memcpy(dst, shader->code, v->info.sizedwords * 4);
+
+   if (v->constant_data_size > 0)
+      memcpy((char *)dst + v->info.constant_data_offset, v->constant_data,
+             v->constant_data_size);
+}
+
 /** Copy the SPIR-V word stream out of a runtime shader module. */
 static const uint32_t *
 ta5_module_words(const struct vk_shader_module *module, size_t *out_size)
@@ -194,22 +224,47 @@ ta5_CreateGraphicsPipelines(VkDevice _device, VkPipelineCache pipelineCache,
 
       /* Stage both shader variants into one buffer for indirect upload. */
       {
-         uint32_t vs_size = pipe->has_vertex ? pipe->vertex.code_size : 0;
-         uint32_t fs_size = pipe->has_fragment ? pipe->fragment.code_size : 0;
-
-         /* The shader fetch unit wants each variant 64-byte aligned, so the
+         /*
+          * Copy each variant's *entire* BO, not just variant->bin.  IR3 lays a
+          * variant out as
+          *
+          *     [ microcode @ 0 ][ constant data @ info.constant_data_offset ]
+          *
+          * and that constant data is what the shader's indexed `c[...]` reads
+          * resolve against.  Copying only the microcode leaves those reads
+          * pointing at whatever happened to be in the object beforehand, which
+          * the UCHE reports as an out-of-bounds access when the draw runs.
+          *
+          * The shader fetch unit wants each variant 64-byte aligned, so the
           * fragment stage starts on the next 64-byte boundary -- and the
           * allocation has to include the gap.  Sizing the buffer from the
-          * unaligned total puts the tail of the fragment microcode past the
-          * end of the object, which the GPU reports as a UCHE out-of-bounds
-          * access rather than anything to do with the shader itself. */
+          * unaligned total puts the tail of the fragment variant past the end
+          * of the object.
+          */
+         const struct ir3_shader_variant *vs_v =
+            pipe->has_vertex
+               ? (const struct ir3_shader_variant *)pipe->vertex.variant
+               : NULL;
+         const struct ir3_shader_variant *fs_v =
+            pipe->has_fragment
+               ? (const struct ir3_shader_variant *)pipe->fragment.variant
+               : NULL;
+         uint32_t vs_size = vs_v ? ta5_variant_size(vs_v) : 0;
+         uint32_t fs_size = fs_v ? ta5_variant_size(fs_v) : 0;
+
          pipe->vs_offset = 0;
-         pipe->fs_offset = (vs_size * 4 + 63) & ~63u;
+         pipe->fs_offset = (vs_size + 63) & ~63u;
 
-         uint32_t total = pipe->fs_offset + fs_size * 4;
+         uint32_t total = pipe->fs_offset + fs_size;
 
+         /* CPU-written, GPU-read: needs WC.  This kernel's GEM_CPU_PREP is
+          * a no-op ("TODO cache maintenance"), so a cached mapping is never
+          * flushed and the UCHE would fetch whatever stale DRAM held.  WC
+          * bypasses the CPU cache, matching the ring buffer and freedreno,
+          * which allocates WC by default.
+          */
          pipe->shader_bo = ta5_bo_alloc(device, total ? total : 4,
-                                        MSM_BO_CACHED);
+                                        MSM_BO_WC);
          if (pipe->shader_bo == NULL) {
             vk_free(pAllocator, pipe);
             return vk_error(&device->instance->vk,
@@ -222,11 +277,11 @@ ta5_CreateGraphicsPipelines(VkDevice _device, VkPipelineCache pipelineCache,
             return vk_error(&device->instance->vk,
                             VK_ERROR_OUT_OF_HOST_MEMORY);
          }
-         if (vs_size)
-            memcpy(map, pipe->vertex.code, vs_size * 4);
-         if (fs_size)
-            memcpy((char *)map + pipe->fs_offset, pipe->fragment.code,
-                   fs_size * 4);
+         if (vs_v)
+            ta5_copy_variant(map, &pipe->vertex, vs_v);
+         if (fs_v)
+            ta5_copy_variant((char *)map + pipe->fs_offset, &pipe->fragment,
+                             fs_v);
       }
 
       /*
