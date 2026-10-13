@@ -143,6 +143,40 @@ static const VkQueueFamilyProperties ta5_gfx_queue_properties = {
  * Deliberately conservative: this is the set the GL backend already exercises
  * on real a5xx hardware, so nothing here is speculative.  Anything not listed
  * is reported unsupported rather than assumed.
+ *
+ * A bit here is a promise the driver keeps.  The ones cleared below are
+ * dropped because the pipeline throws the corresponding create-info state
+ * away -- see ta5_pipeline.cc, where only the compiled stages and
+ * graphics_state are retained -- so advertising them would hand an application
+ * silently wrong pixels rather than a clean "unsupported":
+ *
+ *   geometryShader, tessellationShader
+ *       ta5_emit_program_state() programs VS and FS only; there is no stage
+ *       plumbing for either, and no vkCmdDrawIndexed or vkCmdBindVertexBuffers
+ *       to feed them.
+ *   independentBlend, logicOp, dualSrcBlend, alphaToOne
+ *       VkPipelineColorBlendStateCreateInfo is never retained, and
+ *       ta5_emit_draw_state() writes RB_MRT_BLEND_CONTROL(i) = 0 for all eight
+ *       slots.
+ *   sampleRateShading, depthBounds, depthClamp, depthBiasClamp
+ *       VkPipelineMultisampleStateCreateInfo and
+ *       VkPipelineDepthStencilStateCreateInfo are never retained, and
+ *       ta5_emit_draw_state() hardcodes RB_DEPTH_CNTL = 0.
+ *   fillModeNonSolid, largePoints, wideLines
+ *       VkPipelineRasterizationStateCreateInfo is never retained, and
+ *       ta5_emit_draw_state() hardcodes PC_RASTER_CNTL POLYMODE_*_PTYPE to
+ *       PC_DRAW_TRIANGLES regardless of polygonMode.
+ *   multiViewport
+ *       ta5_CmdSetViewport() and ta5_CmdSetScissor() are no-ops; the viewport
+ *       used at draw time is derived from the framebuffer, so a viewport with
+ *       a non-zero origin is ignored.
+ *   multiDrawIndirect, drawIndirectFirstInstance
+ *       There is no vkCmdDrawIndirect.
+ *
+ * Each is straightforward to re-advertise once the state is read out of
+ * graphics_state and emitted.  The four named explicitly below with `false`
+ * are the ones that were previously advertised as true; everything else was
+ * already left at the zero the struct initialiser gives it.
  */
 static void
 ta5_get_features(struct ta5_physical_device *pdevice,
@@ -154,22 +188,10 @@ ta5_get_features(struct ta5_physical_device *pdevice,
    features->robustBufferAccess = true;
    features->fullDrawIndexUint32 = true;
    features->imageCubeArray = true;
-   features->independentBlend = true;
-   features->geometryShader = true;
-   features->tessellationShader = true;
-   features->sampleRateShading = true;
-   features->dualSrcBlend = true;
-   features->logicOp = true;
-   features->multiDrawIndirect = true;
-   features->drawIndirectFirstInstance = true;
-   features->depthClamp = true;
-   features->depthBiasClamp = true;
-   features->fillModeNonSolid = true;
-   features->depthBounds = true;
-   features->wideLines = true;
-   features->largePoints = true;
-   features->alphaToOne = true;
-   features->multiViewport = true;
+   features->wideLines = false;
+   features->largePoints = false;
+   features->alphaToOne = false;
+   features->multiViewport = false;
    features->samplerAnisotropy = true;
    features->textureCompressionETC2 = true;
    features->textureCompressionASTC_LDR = true;
