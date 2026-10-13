@@ -344,10 +344,6 @@ fail:
 void
 ta5_compiled_shader_free(struct ta5_compiled_shader *shader)
 {
-   if (getenv("TA5_TRACE_NULL"))
-      fprintf(stderr, "ta5[free]: shader=%p ir3=%p variant=%p code=%p\n",
-              (void *)shader, shader->shader, shader->variant,
-              (void *)shader->code);
    if (shader->shader)
       ir3_shader_destroy((struct ir3_shader *)shader->shader);
    shader->shader = NULL;

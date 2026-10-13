@@ -196,13 +196,19 @@ ta5_CreateGraphicsPipelines(VkDevice _device, VkPipelineCache pipelineCache,
       {
          uint32_t vs_size = pipe->has_vertex ? pipe->vertex.code_size : 0;
          uint32_t fs_size = pipe->has_fragment ? pipe->fragment.code_size : 0;
-         uint32_t total = vs_size + fs_size;
 
-         /* The shader fetch unit wants each variant 64-byte aligned. */
+         /* The shader fetch unit wants each variant 64-byte aligned, so the
+          * fragment stage starts on the next 64-byte boundary -- and the
+          * allocation has to include the gap.  Sizing the buffer from the
+          * unaligned total puts the tail of the fragment microcode past the
+          * end of the object, which the GPU reports as a UCHE out-of-bounds
+          * access rather than anything to do with the shader itself. */
          pipe->vs_offset = 0;
-         pipe->fs_offset = (vs_size * 4 + 63) & ~63;
+         pipe->fs_offset = (vs_size * 4 + 63) & ~63u;
 
-         pipe->shader_bo = ta5_bo_alloc(device, total ? total * 4 : 4,
+         uint32_t total = pipe->fs_offset + fs_size * 4;
+
+         pipe->shader_bo = ta5_bo_alloc(device, total ? total : 4,
                                         MSM_BO_CACHED);
          if (pipe->shader_bo == NULL) {
             vk_free(pAllocator, pipe);

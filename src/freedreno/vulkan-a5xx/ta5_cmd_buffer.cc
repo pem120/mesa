@@ -846,7 +846,10 @@ ta5_emit_restore(struct ta5_cmd_buffer *cmd)
       { REG_A5XX_HLSQ_UPDATE_CNTL, 1, { 0x000fffff } },
       { REG_A5XX_PC_RESTART_INDEX, 1, { 0xffffffff } },
       { REG_A5XX_PC_RASTER_CNTL, 1, { 0x00000012 } },
-      { REG_A5XX_GRAS_SU_POINT_MINMAX, 0, {  } },
+      { REG_A5XX_GRAS_SU_POINT_MINMAX, 2,
+        { A5XX_GRAS_SU_POINT_MINMAX_MIN(1.0f) |
+              A5XX_GRAS_SU_POINT_MINMAX_MAX(4092.0f),
+          A5XX_GRAS_SU_POINT_SIZE(0.5f) } },
       { REG_A5XX_GRAS_SU_CONSERVATIVE_RAS_CNTL, 1, { 0x00000000 } },
       { REG_A5XX_GRAS_SC_SCREEN_SCISSOR_CNTL, 1, { 0x00000000 } },
       { REG_A5XX_SP_VS_CONFIG_MAX_CONST, 1, { 0x00000000 } },
@@ -857,9 +860,6 @@ ta5_emit_restore(struct ta5_cmd_buffer *cmd)
       { REG_A5XX_VFD_MODE_CNTL, 1, { 0x00000000 } },
       { REG_A5XX_PC_MODE_CNTL, 1, { 0x0000001f } },
       { REG_A5XX_SP_MODE_CNTL, 1, { 0x0000001e } },
-      { REG_A5XX_SP_DBG_ECO_CNTL, 1, { 0x00000800 } },
-      { REG_A5XX_HLSQ_DBG_ECO_CNTL, 1, { 0x00000000 } },
-      { REG_A5XX_VPC_DBG_ECO_CNTL, 1, { 0x00800400 } },
       { REG_A5XX_SP_DBG_ECO_CNTL, 1, { 0x40000800 } },
       { REG_A5XX_TPL1_MODE_CNTL, 1, { 0x00000544 } },
       { REG_A5XX_HLSQ_TIMEOUT_THRESHOLD_0, 2, { 0x00000080, 0x00000000 } },
@@ -1223,14 +1223,16 @@ ta5_emit_clear(struct ta5_cmd_buffer *cmd, struct ta5_device *device,
 
    /*
     * Switch the RB into blit mode for the duration of the clear.  This is
-    * fd5_emit_render_cntl(ctx, blit = true, binning = false): RB_RENDER_CNTL
-    * and GRAS_SC_CNTL both lose their 0x8 bit while a blit is in flight.
+    * fd5_emit_render_cntl(ctx, blit = true, binning = false): only
+    * RB_RENDER_CNTL loses its 0x8 bit -- GRAS_SC_CNTL keeps it for a blit,
+    * exactly as it does for a normal render pass.  Clearing it here takes the
+    * screen controller out of the loop and the CCU never resolves the clear.
     */
    ta5_pkt4(cmd, REG_A5XX_RB_RENDER_CNTL, 1);
    ta5_cs_push(cmd, 0x00000000);
 
    ta5_pkt4(cmd, REG_A5XX_GRAS_SC_CNTL, 1);
-   ta5_cs_push(cmd, 0x00000000);
+   ta5_cs_push(cmd, 0x00000008);
 
    ta5_pkt4(cmd, REG_A5XX_RB_BLIT_CNTL, 1);
    ta5_cs_push(cmd, A5XX_RB_BLIT_CNTL_BUF(BLIT_MRT0));
@@ -1244,15 +1246,10 @@ ta5_emit_clear(struct ta5_cmd_buffer *cmd, struct ta5_device *device,
    ta5_cs_push(cmd, color->u32[2]);
    ta5_cs_push(cmd, color->u32[3]);
 
-   if (device->blit_bo == NULL) {
-      device->blit_bo = ta5_bo_alloc(device, 16, MSM_BO_CACHED);
-      if (device->blit_bo == NULL)
-         return VK_ERROR_OUT_OF_DEVICE_MEMORY;
-      if (ta5_bo_map(device->blit_bo) == NULL)
-         return VK_ERROR_OUT_OF_DEVICE_MEMORY;
-   }
+   if (device->blit_bo == NULL)
+      return VK_ERROR_OUT_OF_DEVICE_MEMORY;
 
-   ret = ta5_event_write_ts(cmd, device->blit_bo, CACHE_FLUSH_TS);
+   ret = ta5_event_write_ts(cmd, device->blit_bo, CCU_RESOLVE);
    if (ret != VK_SUCCESS)
       return ret;
 

@@ -153,6 +153,7 @@ ta5_MapMemory(VkDevice _device, VkDeviceMemory _memory, VkDeviceSize offset,
       }
    }
 
+
    /*
     * a5xx system memory is not coherent with the CPU, and the submit fence
     * only tells us the work was queued.  CPU_PREP is what the kernel says to

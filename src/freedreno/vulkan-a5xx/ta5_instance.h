@@ -103,6 +103,7 @@ struct ta5_device
     * blit_mem allocation for it.  Allocated on first use.
     */
    struct ta5_bo *blit_bo;
+
 };
 VK_DEFINE_HANDLE_CASTS(ta5_device, vk.base, VkDevice, VK_OBJECT_TYPE_DEVICE)
 

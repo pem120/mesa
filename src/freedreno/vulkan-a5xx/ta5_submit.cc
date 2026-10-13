@@ -340,7 +340,20 @@ ta5_submit_cmd_relocs(struct ta5_queue *queue, const uint32_t *cs,
 
    cmds[0].type = MSM_SUBMIT_CMD_BUF;
    cmds[0].submit_idx = 0;
-   cmds[0].submit_offset = queue->ring_offset;
+   /*
+    * The two fields use different units, which is easy to get wrong:
+    *
+    *   submit_offset  dwords -- the kernel computes the command stream's GPU
+    *                             address as iova + submit_offset * 4.
+    *   size           bytes  -- the kernel rejects a value that is not a
+    *                             multiple of 4, and hands it to the CP
+    *                             verbatim as the IB1 length, which the CP
+    *                             also reads as bytes.
+    *
+    * drm_msm_gem_submit_reloc.submit_offset is bytes as well (the kernel
+    * divides that one by four itself when indexing the stream).
+    */
+   cmds[0].submit_offset = queue->ring_offset / 4;
    cmds[0].size = size;
    cmds[0].pad = 0;
    cmds[0].nr_relocs = reloc_count;

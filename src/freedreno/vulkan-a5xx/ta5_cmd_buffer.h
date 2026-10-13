@@ -143,16 +143,24 @@ VK_DEFINE_NONDISP_HANDLE_CASTS(ta5_cmd_buffer, base, VkCommandBuffer,
  */
 #define TA5_CP_TYPE7_PKT 0x70000000u
 
-/** Odd parity of the low 8 bits of x. */
+/**
+ * Odd parity of x, as PM4 header fields require.
+ *
+ * The bit at position i of 0x6996 is set when popcount(i) is odd, so
+ * inverting it and shifting by x isolates the parity bit.  This has to be
+ * *odd* parity: folding x down to its parity (x ^ x>>1 ... & 1) gives the
+ * even-parity answer, which is wrong for exactly the multi-bit values --
+ * counts of 3 and larger -- and the CP rejects a header whose parity bit is
+ * wrong, aborting the whole indirect buffer.  Compare pm4_odd_parity_bit().
+ */
 static inline uint32_t
 ta5_pm4_odd_parity(uint32_t x)
 {
    x ^= x >> 16;
    x ^= x >> 8;
    x ^= x >> 4;
-   x ^= x >> 2;
-   x ^= x >> 1;
-   return x & 1;
+   x &= 0xf;
+   return (~0x6996u >> x) & 1;
 }
 
 /** Build a type-7 packet header for an opcode with `count` total dwords. */

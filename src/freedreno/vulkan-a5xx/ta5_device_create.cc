@@ -87,6 +87,15 @@ ta5_CreateDevice(VkPhysicalDevice physicalDevice,
    device->instance = pdevice->instance;
    device->physical_device = pdevice;
    device->fd = pdevice->dev_fd;
+
+   /*
+    * Scratch buffer for timestamped CP_EVENT_WRITE -- both the CCU_RESOLVE a
+    * clear needs and the trailing barrier the host waits on.  Allocated here
+    * and mapped up front so it exists before anything can reference it.
+    */
+   device->blit_bo = ta5_bo_alloc(device, 16, MSM_BO_CACHED);
+   if (device->blit_bo == NULL || ta5_bo_map(device->blit_bo) == NULL)
+      return vk_error(&pdevice->instance->vk, VK_ERROR_OUT_OF_DEVICE_MEMORY);
    list_inithead(&device->queues);
 
    /*
