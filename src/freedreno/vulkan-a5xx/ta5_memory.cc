@@ -48,6 +48,9 @@
 #include "ta5_memory.h"
 #include "ta5_formats.h"
 #include "ta5_entrypoints.h"
+#include "ta5_submit.h"
+
+#include "drm/msm_drm.h"
 
 /* ------------------------------------------------------------------ */
 /* Memory                                                              */
@@ -82,6 +85,19 @@ ta5_AllocateMemory(VkDevice _device, const VkMemoryAllocateInfo *pAllocateInfo,
    list_inithead(&memory->bound_images);
    list_inithead(&memory->bound_buffers);
 
+   /*
+    * Cacheable sysmem: the GPU renders into it and the host reads the result
+    * back through mmap.  MSM_BO_CACHED is inside MSM_BO_FLAGS' cache mask;
+    * MSM_BO_CACHED_COHERENT (0x080000) is not, and passing it makes
+    * DRM_IOCTL_GEM_NEW fail with EINVAL.
+    */
+   memory->bo = ta5_bo_alloc(device, (uint32_t)memory->size, MSM_BO_CACHED);
+   if (!memory->bo) {
+      vk_free(pAllocator, memory);
+      return vk_error(&device->instance->vk,
+                      VK_ERROR_OUT_OF_DEVICE_MEMORY);
+   }
+
 
    *pDeviceMemory = ta5_memory_to_handle(memory);
    return VK_SUCCESS;
@@ -100,6 +116,7 @@ ta5_FreeMemory(VkDevice _device, VkDeviceMemory _memory,
    assert(list_is_empty(&memory->bound_images));
    assert(list_is_empty(&memory->bound_buffers));
 
+   ta5_bo_unref(memory->bo);
    vk_free(pAllocator, memory);
 }
 
@@ -107,12 +124,16 @@ VKAPI_ATTR VkResult VKAPI_CALL
 ta5_MapMemory(VkDevice _device, VkDeviceMemory _memory, VkDeviceSize offset,
               VkDeviceSize size, VkMemoryMapFlags flags, void **ppData)
 {
-   /* Allocations are host-side only in this phase, so there is nothing to
-    * hand back.  Reporting MEMAP_FAILED is correct: the memory was not
-    * created host-visible-mappable, and silently returning NULL would let
-    * the caller write through a null pointer. */
-   *ppData = NULL;
-   return VK_ERROR_MEMORY_MAP_FAILED;
+   struct ta5_memory *memory = ta5_memory_from_handle(_memory);
+   struct ta5_bo *bo = memory->bo;
+   void *map;
+
+   if (bo == NULL || (map = ta5_bo_map(bo)) == NULL)
+      return vk_error(&memory->device->instance->vk,
+                      VK_ERROR_MEMORY_MAP_FAILED);
+
+   *ppData = (char *)map + offset;
+   return VK_SUCCESS;
 }
 
 VKAPI_ATTR void VKAPI_CALL

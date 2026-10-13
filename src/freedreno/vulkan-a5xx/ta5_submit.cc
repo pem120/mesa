@@ -247,12 +247,31 @@ int
 ta5_submit_cmd(struct ta5_queue *queue, const uint32_t *cs, uint32_t words,
                uint32_t reloc_count)
 {
+   return ta5_submit_cmd_relocs(queue, cs, words, NULL, NULL, 0,
+                                   reloc_count);
+}
+
+/**
+ * Submit a command stream, optionally referring to other buffers.
+ *
+ * relocs[] names buffers whose GPU addresses must be patched into the stream.
+ * Each referenced buffer needs its own entry in bos[] (after the command
+ * stream itself) or the kernel rejects the submit.
+ */
+int
+ta5_submit_cmd_relocs(struct ta5_queue *queue, const uint32_t *cs,
+                      uint32_t words, struct ta5_reloc *relocs,
+                      struct ta5_bo **reloc_bo, uint32_t reloc_bo_count,
+                      uint32_t reloc_count)
+{
    struct ta5_device *device = queue->device;
    struct ta5_bo *ring;
-   struct drm_msm_gem_submit_bo bos[1];
+   struct drm_msm_gem_submit_bo *bos;
+   struct drm_msm_gem_submit_reloc *krelocs = NULL;
    struct drm_msm_gem_submit_cmd cmds[1];
    struct drm_msm_gem_submit req;
    uint32_t size = words * sizeof(uint32_t);
+   uint32_t i;
    int ret;
 
    ring = ta5_queue_ring(queue);
@@ -269,9 +288,30 @@ ta5_submit_cmd(struct ta5_queue *queue, const uint32_t *cs, uint32_t words,
 
    memcpy((char *)queue->ring_map + queue->ring_offset, cs, size);
 
+   /* Index 0 is always the command stream itself. */
+   bos = (struct drm_msm_gem_submit_bo *)calloc(1 + reloc_bo_count,
+                                                    sizeof(*bos));
+   if (!bos)
+      return -1;
+
    bos[0].flags = MSM_SUBMIT_BO_READ | MSM_SUBMIT_BO_WRITE;
    bos[0].handle = ring->handle;
    bos[0].presumed = 0;
+
+   for (i = 0; i < reloc_bo_count; i++) {
+      bos[i + 1].flags = MSM_SUBMIT_BO_READ | MSM_SUBMIT_BO_WRITE;
+      bos[i + 1].handle = reloc_bo[i]->handle;
+      bos[i + 1].presumed = 0;
+   }
+
+   if (reloc_count) {
+      krelocs = (struct drm_msm_gem_submit_reloc *)calloc(reloc_count,
+                                                          sizeof(*krelocs));
+      if (!krelocs) {
+         free(bos);
+         return -1;
+      }
+   }
 
    cmds[0].type = MSM_SUBMIT_CMD_BUF;
    cmds[0].submit_idx = 0;
@@ -279,20 +319,56 @@ ta5_submit_cmd(struct ta5_queue *queue, const uint32_t *cs, uint32_t words,
    cmds[0].size = size;
    cmds[0].pad = 0;
    cmds[0].nr_relocs = reloc_count;
-   cmds[0].relocs = 0;
+   cmds[0].relocs = (uint64_t)(uintptr_t)krelocs;
 
    memset(&req, 0, sizeof(req));
    req.flags = MSM_PIPE_3D0 | MSM_SUBMIT_FENCE_FD_OUT;
    req.queueid = 0;
    req.bos = (uint64_t)(uintptr_t)bos;
-   req.nr_bos = ARRAY_SIZE(bos);
+   req.nr_bos = 1 + reloc_bo_count;
    req.cmds = (uint64_t)(uintptr_t)cmds;
    req.nr_cmds = ARRAY_SIZE(cmds);
+
+   if (krelocs) {
+      for (i = 0; i < reloc_count; i++) {
+         /*
+          * submit_offset is relative to the start of the *submit buffer*,
+          * not to the start of this command stream -- the kernel does
+          * ptr[submit_offset / 4] = iova on the ring object's mapping.  The
+          * stream was copied to ring_map + ring_offset above, so every reloc
+          * target has to be biased by that.  Without the bias the patch lands
+          * on whatever the previous submission left at the head of the ring,
+          * the render target base stays 0, and the CCU hangs on the clear.
+          */
+         krelocs[i].submit_offset = relocs[i].dst_off + queue->ring_offset;
+         krelocs[i]._or = relocs[i].or_mask;   /* `or` is a C++ keyword */
+         krelocs[i].shift = 0;
+         /* +1: bos[0] is the command stream itself. */
+         krelocs[i].reloc_idx = relocs[i].bo_index + 1;
+         krelocs[i].reloc_offset = relocs[i].bo_offset;
+      }
+   }
 
    ret = drmCommandWriteRead(device->fd, DRM_MSM_GEM_SUBMIT, &req, sizeof(req));
    if (ret) {
       TA5_DBG("submit failed: %d (%s)", ret, strerror(errno));
+      free(krelocs);
+      free(bos);
       return -1;
+   }
+
+   free(krelocs);
+   free(bos);
+
+   if (getenv("TA5_TRACE_NULL") && reloc_count) {
+      for (i = 0; i < reloc_count; i++) {
+         uint32_t off = relocs[i].dst_off + queue->ring_offset;
+         const uint32_t *rp = (const uint32_t *)queue->ring_map;
+         fprintf(stderr,
+                 "ta5[submit]: reloc %u -> ring[%u] = %08x (bo %p off %llu or %x)\n",
+                 i, off / 4, rp[off / 4], (void *)reloc_bo[relocs[i].bo_index],
+                 (unsigned long long)relocs[i].bo_offset, relocs[i].or_mask);
+      }
    }
 
    queue->ring_offset += size;

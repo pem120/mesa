@@ -315,6 +315,7 @@ ta5_shader_compile(struct ta5_device *device, VkShaderStageFlagBits stage,
     * ir3_shader_destroy() below frees it.
     */
    out->code_size = variant->info.sizedwords;
+   out->instrlen = variant->instrlen;
    out->code = (uint32_t *)malloc(out->code_size * sizeof(uint32_t));
    if (!out->code) {
       ir3_shader_destroy(ir3_shader);

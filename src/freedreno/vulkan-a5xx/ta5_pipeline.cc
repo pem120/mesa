@@ -47,6 +47,9 @@
 #include "ta5_render.h"
 #include "ta5_pipeline.h"
 #include "ta5_entrypoints.h"
+#include "ta5_submit.h"
+
+#include "drm/msm_drm.h"
 
 /** Copy the SPIR-V word stream out of a runtime shader module. */
 static const uint32_t *
@@ -189,6 +192,36 @@ ta5_CreateGraphicsPipelines(VkDevice _device, VkPipelineCache pipelineCache,
          pipe->has_fragment = true;
       }
 
+      /* Stage both shader variants into one buffer for indirect upload. */
+      {
+         uint32_t vs_size = pipe->has_vertex ? pipe->vertex.code_size : 0;
+         uint32_t fs_size = pipe->has_fragment ? pipe->fragment.code_size : 0;
+         uint32_t total = vs_size + fs_size;
+
+         pipe->vs_offset = 0;
+         pipe->fs_offset = vs_size * 4;
+
+         pipe->shader_bo = ta5_bo_alloc(device, total ? total * 4 : 4,
+                                        MSM_BO_CACHED);
+         if (pipe->shader_bo == NULL) {
+            vk_free(pAllocator, pipe);
+            return vk_error(&device->instance->vk,
+                            VK_ERROR_OUT_OF_DEVICE_MEMORY);
+         }
+
+         void *map = ta5_bo_map(pipe->shader_bo);
+         if (map == NULL) {
+            vk_free(pAllocator, pipe);
+            return vk_error(&device->instance->vk,
+                            VK_ERROR_OUT_OF_HOST_MEMORY);
+         }
+         if (vs_size)
+            memcpy(map, pipe->vertex.code, vs_size * 4);
+         if (fs_size)
+            memcpy((char *)map + pipe->fs_offset, pipe->fragment.code,
+                   fs_size * 4);
+      }
+
       /*
        * Hand the runtime the subpass description it expects.  This is the
        * step the generic implementation could not do for us.
@@ -252,5 +285,6 @@ ta5_DestroyPipeline(VkDevice _device, VkPipeline _pipeline,
 
    ta5_compiled_shader_free(&pipe->vertex);
    ta5_compiled_shader_free(&pipe->fragment);
+   ta5_bo_unref(pipe->shader_bo);
    vk_free(pAllocator, pipe);
 }

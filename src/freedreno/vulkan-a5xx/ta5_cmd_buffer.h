@@ -58,6 +58,21 @@ VK_DEFINE_NONDISP_HANDLE_CASTS(ta5_cmd_pool, base, VkCommandPool,
  * buffer is a growable byte buffer (ta5_cs).  Bin and render state is
  * gathered separately and emitted at flush time; see ta5_cmd_buffer.cc.
  */
+struct ta5_pipeline;
+struct ta5_framebuffer;
+struct ta5_render_pass;
+struct ta5_descriptor_set;
+struct ta5_bo;
+
+/** One buffer relocation in the recorded command stream. */
+struct ta5_reloc
+{
+   uint32_t bo_index;   /**< index into ta5_cmd_buffer::reloc_bos */
+   uint64_t bo_offset;  /**< offset into that BO */
+   uint32_t dst_off;    /**< byte offset of the dword to patch */
+   uint32_t or_mask;    /**< value OR'd into the patched dword */
+};
+
 struct ta5_cmd_buffer
 {
    struct vk_object_base base;
@@ -70,6 +85,29 @@ struct ta5_cmd_buffer
    uint32_t *cs;
    uint32_t cs_size;    /**< capacity in words */
    uint32_t cs_count;   /**< used words */
+
+   /**
+    * Buffer relocations referenced by the command stream.
+    *
+    * a5xx submits with relocations rather than binding buffers into the IB
+    * (freedreno never sets MSM_PARAM_EN_VM_BIND), so any buffer the GPU must
+    * touch -- a render target, a vertex buffer -- is patched into the
+    * command stream by the kernel at submit time.  Each entry names a BO and
+    * the dword in the stream that receives its GPU address.
+    */
+   struct ta5_reloc *relocs;
+   uint32_t reloc_size;   /**< capacity in entries */
+   uint32_t reloc_count;  /**< used entries */
+
+   /** BOs referenced, so they can be listed in the submit ioctl. */
+   struct ta5_bo **reloc_bos;
+   uint32_t reloc_bo_count;
+
+   /** Bound state at the point of recording. */
+   struct ta5_pipeline *bound_pipeline;
+   struct ta5_framebuffer *bound_framebuffer;
+   struct ta5_render_pass *bound_render_pass;
+   struct ta5_descriptor_set *bound_sets[4];
 
    /** Fence to signal when this submission completes. */
    struct ta5_fence *fence;

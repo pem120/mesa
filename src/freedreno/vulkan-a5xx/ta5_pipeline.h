@@ -70,6 +70,19 @@ struct ta5_pipeline
    bool has_vertex;
    bool has_fragment;
 
+   /**
+    * Compiled shader microcode, staged in one buffer.
+    *
+    * The shader fetch unit wants the instruction stream in memory, so this is
+    * uploaded with CP_LOAD_STATE4/SS4_INDIRECT rather than inline in the
+    * command stream.  Emitting it inline (SS4_DIRECT) is something the GL
+    * backend only does behind its DIRECT debug flag, and the GPU faults on
+    * it here -- the CP opcode error lands mid-upload.
+    */
+   struct ta5_bo *shader_bo;
+   uint32_t vs_offset;
+   uint32_t fs_offset;
+
    /** Shaders were given as gl_Position/gl_FragCoord-only; no vertex buffer
     * fetch is configured yet. */
    bool uses_vertex_buffers;

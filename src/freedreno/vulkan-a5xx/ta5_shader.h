@@ -50,6 +50,7 @@ struct ta5_compiled_shader
    void *variant;      /**< struct ir3_shader_variant * */
    uint32_t *code;     /**< the assembled PM4 microcode */
    uint32_t code_size; /**< in dwords */
+   uint32_t instrlen;  /**< dwords, for CP_LOAD_STATE4_0_NUM_UNIT */
    uint32_t constlen;  /**< constant bank size in dwords */
 };
 

@@ -63,6 +63,16 @@ struct ta5_memory
    struct list_head bound_images;  /**< list of ta5_image */
    struct list_head bound_buffers; /**< list of ta5_buffer */
    bool is_linear;                 /**< linear tiling */
+
+   /**
+    * Backing GEM object.
+    *
+    * Until now allocation was pure bookkeeping and vkMapMemory reported
+    * MEMAP_FAILED.  Once the GPU writes render targets, the allocation has to
+    * be a real msm buffer that the command stream can reference through a
+    * relocation, and that the host can map for readback.
+    */
+   struct ta5_bo *bo;
 };
 
 VK_DEFINE_NONDISP_HANDLE_CASTS(ta5_memory, base, VkDeviceMemory,

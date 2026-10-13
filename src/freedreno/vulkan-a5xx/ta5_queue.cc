@@ -30,6 +30,7 @@
 #include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <alloca.h>
 #include <string.h>
 #include <poll.h>
 #include <unistd.h>
@@ -157,18 +158,75 @@ ta5_queue_submit_batch(struct ta5_queue *queue, const VkSubmitInfo *submit,
    if (!stream)
       return vk_error(&device->instance->vk, VK_ERROR_OUT_OF_HOST_MEMORY);
 
+   /*
+    * Concatenating the buffers shifts every relocation target, because
+    * dst_off is a byte offset into the stream that now starts earlier in the
+    * merged copy.  Each command buffer also indexes its own BO list, so those
+    * have to be merged and the indices remapped into one table.
+    */
+   uint32_t total_relocs = 0, total_bo = 0;
    for (uint32_t i = 0; i < submit->commandBufferCount; i++) {
       struct ta5_cmd_buffer *cmd = ta5_cmd_buffer_from_handle(
          submit->pCommandBuffers[i]);
+      total_relocs += cmd->reloc_count;
+      total_bo += cmd->reloc_bo_count;
+   }
+
+   struct ta5_reloc *merged_relocs = NULL;
+   struct ta5_bo **merged_bos = NULL;
+   uint32_t merged_bo_count = 0;
+
+   if (total_bo) {
+      merged_bos = (struct ta5_bo **)calloc(total_bo, sizeof(*merged_bos));
+      merged_relocs = (struct ta5_reloc *)calloc(
+         total_relocs ? total_relocs : 1, sizeof(*merged_relocs));
+      if (!merged_bos || !merged_relocs) {
+         free(merged_bos);
+         free(merged_relocs);
+         free(stream);
+         return vk_error(&device->instance->vk, VK_ERROR_OUT_OF_HOST_MEMORY);
+      }
+   }
+
+   uint32_t reloc_n = 0;
+   for (uint32_t i = 0; i < submit->commandBufferCount; i++) {
+      struct ta5_cmd_buffer *cmd = ta5_cmd_buffer_from_handle(
+         submit->pCommandBuffers[i]);
+
+      /* Remap this buffer's BO indices into the merged table. */
+      uint32_t *remap =
+         (uint32_t *)alloca(cmd->reloc_bo_count * sizeof(uint32_t));
+      for (uint32_t j = 0; j < cmd->reloc_bo_count; j++) {
+         struct ta5_bo *bo = cmd->reloc_bos[j];
+         uint32_t k = 0;
+         while (k < merged_bo_count && merged_bos[k] != bo)
+            k++;
+         if (k == merged_bo_count)
+            merged_bos[merged_bo_count++] = bo;
+         remap[j] = k;
+      }
+
+      for (uint32_t j = 0; j < cmd->reloc_count; j++) {
+         merged_relocs[reloc_n] = cmd->relocs[j];
+         merged_relocs[reloc_n].bo_index = remap[cmd->relocs[j].bo_index];
+         merged_relocs[reloc_n].dst_off += n * 4;
+         reloc_n++;
+      }
+
       memcpy(&stream[n], cmd->cs, cmd->cs_count * sizeof(uint32_t));
       n += cmd->cs_count;
    }
 
-   fence_fd = ta5_submit_cmd(queue, stream, total_words, 0);
+   fence_fd = ta5_submit_cmd_relocs(queue, stream, total_words, merged_relocs,
+                                    merged_bos, merged_bo_count, reloc_n);
+   free(merged_relocs);
+   free(merged_bos);
    free(stream);
 
-   if (fence_fd < 0)
+   if (fence_fd < 0) {
+      TA5_DBG("fence_fd < 0 (%d) -> DEVICE_LOST", fence_fd);
       return vk_error(&device->instance->vk, VK_ERROR_DEVICE_LOST);
+   }
 
    /* Mark the command buffers pending so they cannot be resubmitted. */
    for (uint32_t i = 0; i < submit->commandBufferCount; i++) {
@@ -185,14 +243,24 @@ ta5_queue_submit_batch(struct ta5_queue *queue, const VkSubmitInfo *submit,
       close(queue->idle_fence_fd);
    queue->idle_fence_fd = dup(fence_fd);
 
-   /* Import the kernel fence into the Vulkan fence so vkWaitForFences works. */
+   /*
+    * Import the kernel fence into the Vulkan fence so vkWaitForFences works.
+    *
+    * MSM_SUBMIT_FENCE_FD_OUT hands back a dma-buf *sync file*, not a DRM
+    * syncobj fd, so this has to be vk_sync_import_sync_file().  The opaque-fd
+    * path runs DRM_IOCTL_SYNCOBJ_FD_TO_HANDLE, which fails with EINVAL on a
+    * sync file -- and that is how it showed up: vkQueueSubmit returning
+    * VK_ERROR_DEVICE_LOST *after* the submit ioctl had already succeeded, on a
+    * submission the GPU had finished.
+    */
    if (fence != VK_NULL_HANDLE) {
       struct ta5_fence *ta5_fence = ta5_fence_from_handle(fence);
       VkResult result =
-         vk_sync_import_opaque_fd(&device->vk, ta5_fence->sync, fence_fd);
+         vk_sync_import_sync_file(&device->vk, ta5_fence->sync, fence_fd);
       TA5_DBG("fence import: fd %d -> %d (errno %d: %s)", fence_fd, result,
              errno, strerror(errno));
       if (result != VK_SUCCESS) {
+         TA5_DBG("fence import failed -> %d", result);
          close(fence_fd);
          return vk_error(&device->instance->vk, result);
       }

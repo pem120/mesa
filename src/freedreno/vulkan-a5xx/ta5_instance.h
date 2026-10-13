@@ -95,6 +95,14 @@ struct ta5_device
     * CP_LOAD_STATE6 and cannot be shared.
     */
    struct ir3_compiler *compiler;
+
+   /**
+    * Scratch buffer for timestamped CP_EVENT_WRITE.
+    *
+    * A timestamped CCU_RESOLVE has to write somewhere; GL uses a dedicated
+    * blit_mem allocation for it.  Allocated on first use.
+    */
+   struct ta5_bo *blit_bo;
 };
 VK_DEFINE_HANDLE_CASTS(ta5_device, vk.base, VkDevice, VK_OBJECT_TYPE_DEVICE)
 

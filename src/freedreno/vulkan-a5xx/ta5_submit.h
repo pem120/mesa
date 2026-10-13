@@ -77,6 +77,14 @@ void *ta5_bo_map(struct ta5_bo *bo);
  * DRM_MSM_GEM_SUBMIT.  Returns the DRM fence fd on success, or -1.  The
  * caller owns the returned fd and must close it.
  */
+struct ta5_reloc;
+
+/** Submit with buffer relocations; reloc_bo[] are the referenced buffers. */
+int ta5_submit_cmd_relocs(struct ta5_queue *queue, const uint32_t *cs,
+                          uint32_t words, struct ta5_reloc *relocs,
+                          struct ta5_bo **reloc_bo, uint32_t reloc_bo_count,
+                          uint32_t reloc_count);
+
 int ta5_submit_cmd(struct ta5_queue *queue, const uint32_t *cs, uint32_t words,
                    uint32_t reloc_count);
 

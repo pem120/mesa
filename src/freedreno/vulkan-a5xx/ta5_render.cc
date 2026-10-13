@@ -157,6 +157,7 @@ ta5_CreateRenderPass(VkDevice _device,
        * its format instead.
        */
       dst->used_as_color = ta5_format_is_color(a->format);
+      dst->load_op = a->loadOp;
    }
 
    /*

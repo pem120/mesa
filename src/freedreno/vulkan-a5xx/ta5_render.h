@@ -75,6 +75,10 @@ struct ta5_render_pass_attachment
    VkImageLayout initial_layout;
    VkImageLayout final_layout;
    bool used_as_color;
+
+   /** Load op, so the command buffer knows whether to clear on begin. */
+   VkAttachmentLoadOp load_op;
+   VkClearValue clear_value;
 };
 
 /**
