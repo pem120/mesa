@@ -1056,10 +1056,36 @@ ta5_emit_shader(struct ta5_cmd_buffer *cmd, struct ta5_pipeline *pipe,
       return VK_SUCCESS;
 
    ta5_pkt7(cmd, CP_LOAD_STATE4, 3);
-   ta5_cs_push(cmd, CP_LOAD_STATE4_0_DST_OFF(0) |
-                     CP_LOAD_STATE4_0_STATE_SRC(SS4_INDIRECT) |
-                     CP_LOAD_STATE4_0_STATE_BLOCK(state_block) |
-                     CP_LOAD_STATE4_0_NUM_UNIT(shader->instrlen));
+   {
+      /*
+       * NUM_UNIT counts units of 16 instructions.  IR3 reports instrlen in
+       * those units, but our variants report instrlen == 1 while carrying
+       * 32-34 dwords of program, so the load copies a quarter of the shader
+       * and the HLSQ runs off the end of what it was given.  Round the
+       * instruction count up to whole units ourselves; over-reading into the
+       * padding is harmless, under-reading is not.
+       */
+      const struct ir3_shader_variant *v =
+         (const struct ir3_shader_variant *)shader->variant;
+      uint32_t units = shader->instrlen;
+      uint32_t need = DIV_ROUND_UP(v->info.sizedwords, 16);
+
+      if (need > units)
+         units = need;
+      {
+         const char *ov = getenv("TA5_SHADER_UNITS");
+         if (ov) {
+            uint32_t o = (uint32_t)atoi(ov);
+            if (o > units)
+               units = o;
+         }
+      }
+
+      ta5_cs_push(cmd, CP_LOAD_STATE4_0_DST_OFF(0) |
+                        CP_LOAD_STATE4_0_STATE_SRC(SS4_INDIRECT) |
+                        CP_LOAD_STATE4_0_STATE_BLOCK(state_block) |
+                        CP_LOAD_STATE4_0_NUM_UNIT(units));
+   }
    ret = ta5_cs_reloc(cmd, bo, 0, CP_LOAD_STATE4_1_STATE_TYPE(ST4_SHADER));
    if (ret != VK_SUCCESS)
       return ret;
