@@ -59,6 +59,7 @@ VK_DEFINE_NONDISP_HANDLE_CASTS(ta5_cmd_pool, base, VkCommandPool,
  * gathered separately and emitted at flush time; see ta5_cmd_buffer.cc.
  */
 struct ta5_pipeline;
+struct ta5_buffer;
 struct ta5_framebuffer;
 struct ta5_render_pass;
 struct ta5_descriptor_set;
@@ -109,6 +110,17 @@ struct ta5_cmd_buffer
    struct ta5_framebuffer *bound_framebuffer;
    struct ta5_render_pass *bound_render_pass;
    struct ta5_descriptor_set *bound_sets[4];
+
+   /**
+    * Vertex buffer binding, as recorded by vkCmdBindVertexBuffers.
+    *
+    * One slot for now: that is what a non-indexed draw of one attribute
+    * needs, and it is the smallest thing that can tell whether the VFD is
+    * fed at all.  Slot 0 only -- a binding above firstSlot + bindingCount
+    * is dropped rather than silently landing in the wrong slot.
+    */
+   struct ta5_buffer *bound_vb;
+   VkDeviceSize bound_vb_offset;
 
    /**
     * The draw currently being recorded, needed by the driver-parameter upload.

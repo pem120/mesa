@@ -1818,6 +1818,32 @@ ta5_CmdSetScissor(VkCommandBuffer _cmd, uint32_t firstScissor,
 }
 
 VKAPI_ATTR void VKAPI_CALL
+ta5_CmdBindVertexBuffers(VkCommandBuffer _cmd, uint32_t firstBinding,
+                         uint32_t bindingCount,
+                         const VkBuffer *pBuffers,
+                         const VkDeviceSize *pOffsets)
+{
+   struct ta5_cmd_buffer *cmd = ta5_cmd_buffer_from_handle(_cmd);
+
+   if (cmd->state != MESA_VK_COMMAND_BUFFER_STATE_RECORDING)
+      return;
+
+   /*
+    * Slot 0 only.  A draw consumes exactly one attribute from exactly one
+    * binding, so a second slot would be recorded and then silently ignored
+    * at draw time -- worse than not recording it.  Dropping it here keeps
+    * the recorded state honest about what the stream will actually use.
+    */
+   if (firstBinding != 0 || bindingCount == 0)
+      return;
+
+   cmd->bound_vb = bindingCount == 1 && pBuffers
+                      ? ta5_buffer_from_handle(pBuffers[0])
+                      : NULL;
+   cmd->bound_vb_offset = pOffsets ? pOffsets[0] : 0;
+}
+
+VKAPI_ATTR void VKAPI_CALL
 ta5_CmdBindDescriptorSets(VkCommandBuffer _cmd,
                           VkPipelineBindPoint pipelineBindPoint,
                           VkPipelineLayout _layout, uint32_t firstSet,
@@ -2114,6 +2140,62 @@ ta5_CmdDraw(VkCommandBuffer _cmd, uint32_t vertexCount, uint32_t instanceCount,
                         A5XX_GRAS_SC_VIEWPORT_SCISSOR_TL_0_Y(0));
       ta5_cs_push(cmd, A5XX_GRAS_SC_VIEWPORT_SCISSOR_BR_0_X(w - 1) |
                         A5XX_GRAS_SC_VIEWPORT_SCISSOR_BR_0_Y(h - 1));
+   }
+
+   /*
+    * Vertex fetch.
+    *
+    * Transcribed from fd5_emit_fetch(): one fetch slot per vertex attribute
+    * the VS consumes.  VFD_CONTROL_1 (REGID4VTX/REGID4INST) is already
+    * emitted by ta5_emit_program_state(); this is the per-attribute half plus
+    * the count saying how many slots are live.
+    *
+    * With no vertex buffer bound, no fetch slot is written and VTXCNT stays at
+    * zero, so an AUTO_INDEX draw is unaffected -- the vertex id still arrives
+    * through the VFD's synth path rather than from memory.
+    */
+   if (pipe->uses_vertex_buffers && cmd->bound_vb &&
+       cmd->bound_vb->bound_memory && cmd->bound_vb->bound_memory->bo) {
+      const struct ir3_shader_variant *vs =
+         (const struct ir3_shader_variant *)pipe->vertex.variant;
+      struct ta5_bo *bo = cmd->bound_vb->bound_memory->bo;
+      unsigned vregid = regid(63, 0); /* invalid/unused marker */
+      VkDeviceSize off = cmd->bound_vb_offset;
+      VkDeviceSize size = cmd->bound_vb->size - off;
+
+      /* Location 0, and not a system value -- that is the vertex attribute. */
+      for (unsigned j = 0; j < vs->inputs_count; j++)
+         if (!vs->inputs[j].sysval && vs->inputs[j].slot == 0)
+            vregid = vs->inputs[j].regid;
+
+      if (vregid != regid(63, 0) && size >= 8) {
+         ret = ta5_cmd_buffer_alloc_cs(cmd, cmd->cs_count + 64);
+         if (ret != VK_SUCCESS)
+            return;
+
+         ta5_pkt4(cmd, REG_A5XX_VFD_FETCH(0), 4);
+         ret = ta5_cs_reloc(cmd, bo, off, 0);
+         if (ret != VK_SUCCESS)
+            return;
+         ta5_cs_push(cmd, (uint32_t)size); /* VFD_FETCH[0].SIZE */
+         ta5_cs_push(cmd, 8);              /* VFD_FETCH[0].STRIDE */
+
+         ta5_pkt4(cmd, REG_A5XX_VFD_DECODE(0), 2);
+         ta5_cs_push(cmd, A5XX_VFD_DECODE_INSTR_IDX(0) |
+                              A5XX_VFD_DECODE_INSTR_FORMAT(
+                                 VFMT5_32_32_FLOAT) |
+                              A5XX_VFD_DECODE_INSTR_UNK30 |
+                              A5XX_VFD_DECODE_INSTR_FLOAT);
+         ta5_cs_push(cmd, 1); /* VFD_DECODE[0].STEP_RATE */
+
+         ta5_pkt4(cmd, REG_A5XX_VFD_DEST_CNTL(0), 1);
+         ta5_cs_push(cmd,
+                     A5XX_VFD_DEST_CNTL_INSTR_WRITEMASK(0x3) |
+                        A5XX_VFD_DEST_CNTL_INSTR_REGID(vregid));
+
+         ta5_pkt4(cmd, REG_A5XX_VFD_CONTROL_0, 1);
+         ta5_cs_push(cmd, A5XX_VFD_CONTROL_0_VTXCNT(1));
+      }
    }
 
    ta5_pkt4(cmd, REG_A5XX_GRAS_CL_VPORT_XOFFSET_0, 6);
