@@ -1574,8 +1574,24 @@ ta5_emit_sysmem_fini(struct ta5_cmd_buffer *cmd)
    if (ret != VK_SUCCESS)
       return ret;
 
-   return ta5_event_write_ts(cmd, cmd->device->blit_bo,
-                             PC_CCU_FLUSH_DEPTH_TS);
+   ret = ta5_event_write_ts(cmd, cmd->device->blit_bo,
+                            PC_CCU_FLUSH_DEPTH_TS);
+   if (ret != VK_SUCCESS)
+      return ret;
+
+   /*
+    * CACHE_FLUSH_TS closes the pass, again into blit_mem.  GL's sysmem pass
+    * emits this with a data word of 1; emitting it with 0, or aimed at an
+    * attachment instead of the scratch buffer, is what made it fault when it
+    * was first added.
+    */
+   ta5_pkt7(cmd, CP_EVENT_WRITE, 4);
+   ta5_cs_push(cmd, CP_EVENT_WRITE_0_EVENT(CACHE_FLUSH_TS));
+   ret = ta5_cs_reloc(cmd, cmd->device->blit_bo, 0, 0);
+   if (ret != VK_SUCCESS)
+      return ret;
+   ta5_cs_push(cmd, 0x00000001);
+   return VK_SUCCESS;
 }
 
 /* ------------------------------------------------------------------ */
