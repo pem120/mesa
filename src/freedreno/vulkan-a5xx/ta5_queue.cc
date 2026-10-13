@@ -166,17 +166,19 @@ ta5_queue_submit_batch(struct ta5_queue *queue, const VkCommandBuffer *cmds,
     * merged copy.  Each command buffer also indexes its own BO list, so those
     * have to be merged and the indices remapped into one table.
     */
-   uint32_t total_relocs = 0, total_bo = 0;
-   for (uint32_t i = 0; i < cmd_count; i++) {
-      struct ta5_cmd_buffer *cmd = ta5_cmd_buffer_from_handle(
-         cmds[i]);
-      total_relocs += cmd->reloc_count;
-      total_bo += cmd->reloc_bo_count;
-   }
+    uint32_t total_relocs = 0, total_bo = 0, total_ibs = 0;
+    for (uint32_t i = 0; i < cmd_count; i++) {
+       struct ta5_cmd_buffer *cmd = ta5_cmd_buffer_from_handle(
+          cmds[i]);
+       total_relocs += cmd->reloc_count;
+       total_bo += cmd->reloc_bo_count;
+       total_ibs += cmd->ib_count;
+    }
 
-   struct ta5_reloc *merged_relocs = NULL;
-   struct ta5_bo **merged_bos = NULL;
-   uint32_t merged_bo_count = 0;
+    struct ta5_reloc *merged_relocs = NULL;
+    struct ta5_bo **merged_bos = NULL;
+    struct ta5_ib **merged_ibs = NULL;
+    uint32_t merged_bo_count = 0;
 
    if (total_bo) {
       merged_bos = (struct ta5_bo **)calloc(total_bo, sizeof(*merged_bos));
@@ -187,11 +189,22 @@ ta5_queue_submit_batch(struct ta5_queue *queue, const VkCommandBuffer *cmds,
          free(merged_relocs);
          free(stream);
          return vk_error(&device->instance->vk, VK_ERROR_OUT_OF_HOST_MEMORY);
-      }
-   }
+       }
+    }
 
-   uint32_t reloc_n = 0;
-   for (uint32_t i = 0; i < cmd_count; i++) {
+    if (total_ibs) {
+       merged_ibs = (struct ta5_ib **)malloc(total_ibs * sizeof(*merged_ibs));
+       if (!merged_ibs) {
+          free(merged_bos);
+          free(merged_relocs);
+          free(stream);
+          return vk_error(&device->instance->vk, VK_ERROR_OUT_OF_HOST_MEMORY);
+       }
+    }
+
+    uint32_t reloc_n = 0;
+    uint32_t ib_n = 0;
+    for (uint32_t i = 0; i < cmd_count; i++) {
       struct ta5_cmd_buffer *cmd = ta5_cmd_buffer_from_handle(
          cmds[i]);
 
@@ -217,12 +230,17 @@ ta5_queue_submit_batch(struct ta5_queue *queue, const VkCommandBuffer *cmds,
 
       memcpy(&stream[n], cmd->cs, cmd->cs_count * sizeof(uint32_t));
       n += cmd->cs_count;
-   }
 
-   fence_fd = ta5_submit_cmd_relocs(queue, stream, total_words, merged_relocs,
-                                    merged_bos, merged_bo_count, reloc_n);
-   free(merged_relocs);
-   free(merged_bos);
+      for (uint32_t j = 0; j < cmd->ib_count; j++)
+         merged_ibs[ib_n++] = &cmd->ibs[j];
+    }
+
+    fence_fd = ta5_submit_cmd_relocs(queue, stream, total_words, merged_relocs,
+                                     merged_bos, merged_bo_count, reloc_n,
+                                     merged_ibs, ib_n);
+    free(merged_relocs);
+    free(merged_bos);
+    free(merged_ibs);
    free(stream);
 
    if (fence_fd < 0) {
