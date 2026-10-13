@@ -34,6 +34,7 @@
 #include <assert.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 #include "util/u_math.h"
 #include "util/format/u_format.h"
@@ -45,6 +46,8 @@
 
 #include "ta5_instance.h"
 #include "ta5_device.h"
+#include <sys/mman.h>
+
 #include "ta5_memory.h"
 #include "ta5_formats.h"
 #include "ta5_entrypoints.h"
@@ -135,6 +138,29 @@ ta5_MapMemory(VkDevice _device, VkDeviceMemory _memory, VkDeviceSize offset,
    if (bo == NULL || (map = ta5_bo_map(bo)) == NULL)
       return vk_error(&memory->device->instance->vk,
                       VK_ERROR_MEMORY_MAP_FAILED);
+
+   if (getenv("TA5_TRACE_NULL")) {
+      for (int round = 0; round < 4; round++) {
+         const uint8_t *q = (const uint8_t *)map;
+         unsigned long n = 0;
+         for (uint32_t i = 0; i < bo->size; i++)
+            if (q[i] != 0xAB)
+               n++;
+         fprintf(stderr, "ta5[probe]: round %d: %lu/%u bytes != 0xAB, "
+                         "px0=%02x%02x%02x%02x\n",
+                 round, n, bo->size, q[0], q[1], q[2], q[3]);
+         usleep(300000);
+      }
+   }
+
+   /*
+    * a5xx system memory is not coherent with the CPU, and the submit fence
+    * only tells us the work was queued.  CPU_PREP is what the kernel says to
+    * use before touching a buffer the GPU has seen; without it a read back
+    * can run ahead of the render.
+    */
+   if (ta5_bo_cpu_prep(bo, MSM_PREP_READ) != VK_SUCCESS)
+      return vk_error(&memory->device->instance->vk, VK_ERROR_DEVICE_LOST);
 
    *ppData = (char *)map + offset;
    return VK_SUCCESS;

@@ -472,7 +472,8 @@ ta5_emit_program_state(struct ta5_cmd_buffer *cmd, struct ta5_pipeline *pipe)
    uint8_t pos_loc = 0, psize_loc = ~0;
    uint8_t clip_mask = vs->clip_mask, cull_mask = vs->cull_mask;
    uint8_t clip_cull_mask = clip_mask | cull_mask;
-   enum a3xx_threadsize fssz = TWO_QUADS;
+   enum a3xx_threadsize fssz =
+      fs->info.double_threadsize ? FOUR_QUADS : TWO_QUADS;
 
    pos_regid = ir3_find_output_regid(vs, VARYING_SLOT_POS);
    psize_regid = ir3_find_output_regid(vs, VARYING_SLOT_PSIZ);
@@ -662,6 +663,13 @@ ta5_emit_program_state(struct ta5_cmd_buffer *cmd, struct ta5_pipeline *pipe)
                      (fs->total_in > 0 ? A5XX_VPC_CNTL_0_VARYING : 0) |
                      0x10000 /* XXX */);
 
+   ta5_pkt4(cmd, REG_A5XX_VFD_CONTROL_0, 1);
+   ta5_cs_push(cmd, 0x00000000);
+
+   ta5_pkt4(cmd, REG_A5XX_VFD_INDEX_OFFSET, 2);
+   ta5_cs_push(cmd, 0x00000000);
+   ta5_cs_push(cmd, 0x00000000);
+
    ta5_pkt4(cmd, REG_A5XX_VFD_CONTROL_1, 5);
    ta5_cs_push(cmd, A5XX_VFD_CONTROL_1_REGID4VTX(vertex_regid) |
                      A5XX_VFD_CONTROL_1_REGID4INST(instance_regid) | 0xfc0000);
@@ -675,6 +683,42 @@ ta5_emit_program_state(struct ta5_cmd_buffer *cmd, struct ta5_pipeline *pipe)
     * GL emits it mid-program, but nothing between there and the draw reads
     * HLSQ state, so emitting it once here is equivalent.
     */
+   /*
+    * SP_VS_OUT / SP_VS_VPC_DST: where the shader core drops each vertex output
+    * and where VPC then places it.  Two linked varyings per SP_VS_OUT word and
+    * four locations per SP_VS_VPC_DST word.  GL emits these from
+    * fd5_program_emit(); without them the vertex stage has nowhere to put its
+    * results and the draw produces nothing, however correct the shaders are.
+    */
+   for (int i = 0, j = 0; i < 16 && j < l.cnt; i++) {
+      uint32_t reg = 0;
+
+      ta5_pkt4(cmd, REG_A5XX_SP_VS_OUT(i), 1);
+
+      reg |= A5XX_SP_VS_OUT_REG_A_REGID(l.var[j].regid) |
+             A5XX_SP_VS_OUT_REG_A_COMPMASK(l.var[j].compmask);
+      j++;
+
+      reg |= A5XX_SP_VS_OUT_REG_B_REGID(l.var[j].regid) |
+             A5XX_SP_VS_OUT_REG_B_COMPMASK(l.var[j].compmask);
+      j++;
+
+      ta5_cs_push(cmd, reg);
+   }
+
+   for (int i = 0, j = 0; i < 8 && j < l.cnt; i++) {
+      uint32_t reg = 0;
+
+      ta5_pkt4(cmd, REG_A5XX_SP_VS_VPC_DST(i), 1);
+
+      reg |= A5XX_SP_VS_VPC_DST_REG_OUTLOC0(l.var[j++].loc);
+      reg |= A5XX_SP_VS_VPC_DST_REG_OUTLOC1(l.var[j++].loc);
+      reg |= A5XX_SP_VS_VPC_DST_REG_OUTLOC2(l.var[j++].loc);
+      reg |= A5XX_SP_VS_VPC_DST_REG_OUTLOC3(l.var[j++].loc);
+
+      ta5_cs_push(cmd, reg);
+   }
+
    ta5_pkt4(cmd, REG_A5XX_HLSQ_UPDATE_CNTL, 1);
    ta5_cs_push(cmd, 0x020fffff);   /* XXX */
 }
@@ -1021,6 +1065,27 @@ ta5_emit_sysmem_prep(struct ta5_cmd_buffer *cmd,
    ta5_cs_push(cmd, 0);
 
    /*
+    * The unused colour slots.  They are never read for a single-attachment
+    * pass, but they are register state that survives across submissions, and
+    * GL zeroes them as part of emit_mrt(); leaving them at whatever a
+    * previous client configured is how the CCU ends up with a second live
+    * target.  fd5's own value for an unused slot is 0x000007e0.
+    */
+   for (uint32_t i = 1; i < 8; i++) {
+      ta5_pkt4(cmd, REG_A5XX_RB_MRT(i), 5);
+      ta5_cs_push(cmd, 0x000007e0);
+      for (uint32_t j = 0; j < 4; j++)
+         ta5_cs_push(cmd, 0x00000000);
+
+      ta5_pkt4(cmd, REG_A5XX_SP_FS_MRT(i), 1);
+      ta5_cs_push(cmd, 0x00000000);
+
+      ta5_pkt4(cmd, REG_A5XX_RB_MRT_FLAG_BUFFER(i), 4);
+      for (uint32_t j = 0; j < 4; j++)
+         ta5_cs_push(cmd, 0x00000000);
+   }
+
+   /*
     * Enable RT0 before the clear.  The component mask tells the RB which
     * colour targets are live; with it still zero from the state restore the
     * CCU has nowhere to write and the clear is silently dropped.
@@ -1068,8 +1133,8 @@ ta5_emit_draw_state(struct ta5_cmd_buffer *cmd)
 
    ta5_pkt4(cmd, REG_A5XX_SP_FS_OUTPUT_CNTL, 1);
    ta5_cs_push(cmd, A5XX_SP_FS_OUTPUT_CNTL_MRT(1) |
-                     A5XX_SP_FS_OUTPUT_CNTL_DEPTH_REGID(63) |
-                     A5XX_SP_FS_OUTPUT_CNTL_SAMPLEMASK_REGID(63));
+                     A5XX_SP_FS_OUTPUT_CNTL_DEPTH_REGID(regid(63, 0)) |
+                     A5XX_SP_FS_OUTPUT_CNTL_SAMPLEMASK_REGID(regid(63, 0)));
 
    /* Vertex output stride in VPC; pos + colour = 8 dwords. */
    ta5_pkt4(cmd, REG_A5XX_PC_PRIMITIVE_CNTL, 1);
@@ -1183,9 +1248,11 @@ ta5_emit_clear(struct ta5_cmd_buffer *cmd, struct ta5_device *device,
       device->blit_bo = ta5_bo_alloc(device, 16, MSM_BO_CACHED);
       if (device->blit_bo == NULL)
          return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+      if (ta5_bo_map(device->blit_bo) == NULL)
+         return VK_ERROR_OUT_OF_DEVICE_MEMORY;
    }
 
-   ret = ta5_event_write_ts(cmd, device->blit_bo, CCU_RESOLVE);
+   ret = ta5_event_write_ts(cmd, device->blit_bo, CACHE_FLUSH_TS);
    if (ret != VK_SUCCESS)
       return ret;
 
@@ -1203,9 +1270,11 @@ ta5_emit_clear(struct ta5_cmd_buffer *cmd, struct ta5_device *device,
 }
 
 /** End of the render pass: flush colour out of the CCU. */
-static void
+static VkResult
 ta5_emit_sysmem_fini(struct ta5_cmd_buffer *cmd)
 {
+   VkResult ret = VK_SUCCESS;
+
    ta5_pkt7(cmd, CP_SKIP_IB2_ENABLE_GLOBAL, 1);
    ta5_cs_push(cmd, 0);
 
@@ -1214,6 +1283,27 @@ ta5_emit_sysmem_fini(struct ta5_cmd_buffer *cmd)
 
    ta5_event_write(cmd, LRZ_FLUSH_INVALIDATE);
    ta5_event_write(cmd, PC_CCU_FLUSH_COLOR_TS);
+
+   /*
+    * Every attachment the application will read back needs its cache lines
+    * flushed, and CACHE_FLUSH_TS is how that is asked for: the timestamp
+    * destination doubles as the address whose cache is flushed.  GL emits one
+    * per frame per buffer at the very end of the stream.  Without it a
+    * MSM_BO_CACHED buffer keeps whatever the CPU last had mapped, and a
+    * successful render reads back as untouched memory.
+    */
+   if (cmd->bound_framebuffer) {
+      for (uint32_t i = 0; i < cmd->bound_framebuffer->attachment_count; i++) {
+         struct ta5_image *img =
+            cmd->bound_framebuffer->attachments[i]->image;
+
+         ret = ta5_event_write_ts(cmd, img->bound_memory->bo, CACHE_FLUSH_TS);
+         if (ret != VK_SUCCESS)
+            return ret;
+      }
+   }
+
+   return ret;
 }
 
 /* ------------------------------------------------------------------ */
@@ -1328,7 +1418,8 @@ ta5_CmdEndRenderPass(VkCommandBuffer _cmd)
    if (cmd->state != MESA_VK_COMMAND_BUFFER_STATE_RECORDING)
       return;
 
-   ta5_emit_sysmem_fini(cmd);
+   if (ta5_emit_sysmem_fini(cmd) != VK_SUCCESS)
+      return;
    ta5_wfi(cmd);
 
    /*

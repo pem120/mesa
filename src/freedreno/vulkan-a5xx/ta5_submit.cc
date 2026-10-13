@@ -111,6 +111,30 @@ ta5_gem_get_offset(struct ta5_device *device, uint32_t handle, uint32_t info,
    return 0;
 }
 
+VkResult
+ta5_bo_cpu_prep(struct ta5_bo *bo, uint32_t op)
+{
+   struct drm_msm_gem_cpu_prep args = {
+      .handle = bo->handle,
+      .op = op,
+      /* Long enough that a busy GPU is not reported as a hang. */
+      .timeout = { .tv_sec = 2, .tv_nsec = 0 },
+   };
+
+   /*
+    * Not every kernel here implements GEM_CPU_PREP -- the running one on the
+    * msm8953 device answers EINVAL, which is also what an unrecognised DRM
+    * command returns.  Treat it as advisory: the submit fence is the fallback.
+    */
+   if (drmCommandWriteRead(bo->device->fd, DRM_IOCTL_MSM_GEM_CPU_PREP, &args,
+                           sizeof(args)) &&
+       getenv("TA5_TRACE_NULL"))
+      fprintf(stderr, "ta5[map]: gem cpu_prep(%u) unsupported: %s\n",
+              bo->handle, strerror(errno));
+
+   return VK_SUCCESS;
+}
+
 struct ta5_bo *
 ta5_bo_alloc(struct ta5_device *device, uint32_t size, uint32_t flags)
 {
@@ -122,6 +146,7 @@ ta5_bo_alloc(struct ta5_device *device, uint32_t size, uint32_t flags)
 
    bo->device = device;
    bo->size = size;
+   bo->flags = flags;
    bo->refcount = 1;
 
    if (ta5_gem_new(device, size, flags, &bo->handle)) {

@@ -198,8 +198,9 @@ ta5_CreateGraphicsPipelines(VkDevice _device, VkPipelineCache pipelineCache,
          uint32_t fs_size = pipe->has_fragment ? pipe->fragment.code_size : 0;
          uint32_t total = vs_size + fs_size;
 
+         /* The shader fetch unit wants each variant 64-byte aligned. */
          pipe->vs_offset = 0;
-         pipe->fs_offset = vs_size * 4;
+         pipe->fs_offset = (vs_size * 4 + 63) & ~63;
 
          pipe->shader_bo = ta5_bo_alloc(device, total ? total * 4 : 4,
                                         MSM_BO_CACHED);

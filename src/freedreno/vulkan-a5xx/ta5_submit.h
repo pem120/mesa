@@ -35,6 +35,8 @@
 #include "vk_object.h"
 #include "vk_device.h"
 
+#include "drm/msm_drm.h"
+
 #include "ta5_instance.h"
 
 /**
@@ -51,6 +53,7 @@ struct ta5_bo
    struct ta5_device *device;
    uint32_t handle;
    uint32_t size;
+   uint32_t flags; /**< MSM_BO_* cache flags given to GEM_NEW */
    void *map;      /**< lazily created host mapping, NULL until mapped */
    uint32_t refcount;
 };
@@ -60,6 +63,32 @@ struct ta5_bo
  *
  * flags are MSM_BO_* values from drm/msm_drm.h.
  */
+/**
+ * True when `bo` was allocated with a CPU-cacheable mapping.
+ *
+ * Such a mapping is the only one the CPU and the GPU can both touch, and a5xx
+ * memory is not coherent, so these need explicit write-out and invalidation
+ * around a host mapping -- see ta5_MapMemory() and ta5_UnmapMemory().
+ */
+static inline bool
+ta5_bo_is_cached(const struct ta5_bo *bo)
+{
+   return (bo->flags & MSM_BO_CACHE_MASK) == MSM_BO_CACHED;
+}
+
+/**
+ * Block until the GPU is done with `bo`.
+ *
+ * msm_drv.c is explicit that this is "the normal way to synchronize with the
+ * GPU": the submit fence fd only tells you the submission was queued, and on
+ * this kernel a render is still in flight after it becomes readable.  CPU_PREP
+ * waits on the buffer's dma-reservation instead, which is released when the
+ * GPU actually retires the work.
+ *
+ * `op` is a mask of MSM_PREP_READ / MSM_PREP_WRITE.
+ */
+VkResult ta5_bo_cpu_prep(struct ta5_bo *bo, uint32_t op);
+
 struct ta5_bo *ta5_bo_alloc(struct ta5_device *device, uint32_t size,
                              uint32_t flags);
 struct ta5_bo *ta5_bo_from_handle(struct ta5_device *device, uint32_t handle,

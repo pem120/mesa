@@ -50,6 +50,8 @@
 #include "ta5_device.h"
 #include "ta5_sync.h"
 #include "ta5_cmd_buffer.h"
+#include <time.h>
+
 #include "ta5_queue.h"
 #include "ta5_submit.h"
 #include "ta5_entrypoints.h"
@@ -322,7 +324,14 @@ ta5_QueueWaitIdle(VkQueue _queue)
          .fd = queue->idle_fence_fd,
          .events = POLLIN,
       };
+      struct timespec t0, t1;
+      clock_gettime(CLOCK_MONOTONIC, &t0);
       int ret = poll(&pfd, 1, -1);
+      clock_gettime(CLOCK_MONOTONIC, &t1);
+      if (getenv("TA5_TRACE_NULL"))
+         fprintf(stderr, "ta5[wait]: poll fd %d -> %d in %ld us\n", pfd.fd,
+                 ret, (t1.tv_sec - t0.tv_sec) * 1000000L +
+                          (t1.tv_nsec - t0.tv_nsec) / 1000);
 
       if (ret < 0) {
          if (errno == EINTR)
