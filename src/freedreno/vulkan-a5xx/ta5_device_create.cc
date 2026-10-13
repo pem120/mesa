@@ -96,6 +96,16 @@ ta5_CreateDevice(VkPhysicalDevice physicalDevice,
    device->blit_bo = ta5_bo_alloc(device, 16, MSM_BO_CACHED);
    if (device->blit_bo == NULL || ta5_bo_map(device->blit_bo) == NULL)
       return vk_error(&pdevice->instance->vk, VK_ERROR_OUT_OF_DEVICE_MEMORY);
+
+   /*
+    * Scratch for the draw packet.  fd5 stages the draw into its own object
+    * and reaches it with CP_INDIRECT_BUFFER (freedreno_util.h __OUT_IB5), and
+    * that is the only packet its sysmem stream contains that we do not.
+    */
+   device->draw_bo = ta5_bo_alloc(device, 256, MSM_BO_CACHED);
+   if (device->draw_bo == NULL || ta5_bo_map(device->draw_bo) == NULL)
+      return vk_error(&pdevice->instance->vk, VK_ERROR_OUT_OF_DEVICE_MEMORY);
+
    list_inithead(&device->queues);
 
    /*

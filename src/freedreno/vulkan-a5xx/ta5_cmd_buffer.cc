@@ -1151,6 +1151,9 @@ ta5_emit_shader(struct ta5_cmd_buffer *cmd, struct ta5_pipeline *pipe,
  *   TA5_SKIP_DRAW          record no draw state, shaders or CP_DRAW_INDX_OFFSET
  *   TA5_SKIP_FS            load no fragment program at all
  *   TA5_FS_NO_DEPTH_OUT    leave DEPTH_REGID out of SP_FS_OUTPUT_CNTL
+ *   TA5_CLEAR_IN_DRAW      emit a magenta clear at the top of the draw path,
+ *                          as a reachability probe (if it lands, the CP got
+ *                          that far; if not, it never did)
  *   TA5_SHADER_UNITS=N     raise the CP_LOAD_STATE4 program-load length
  *   TA5_INSTRLEN=N         raise HLSQ_xS_CNTL.INSTRLEN
  *   TA5_PREAMBLE_ROWS=N    emit only the first N state-restore register rows
@@ -1967,6 +1970,21 @@ ta5_CmdDraw(VkCommandBuffer _cmd, uint32_t vertexCount, uint32_t instanceCount,
       return;
 
    /*
+    * TA5_CLEAR_IN_DRAW emits a second clear here, at the top of the draw
+    * path.  It is a probe, not a feature: if this clear lands then the CP
+    * reached the draw and whatever is wrong is in the draw itself, and if it
+    * does not then the CP never got this far.
+    */
+   if (getenv("TA5_CLEAR_IN_DRAW")) {
+      union ta5_color probe = {{0}};
+      probe.u32[0] = 0xff;
+      probe.u32[1] = 0x00;
+      probe.u32[2] = 0xff;
+      probe.u32[3] = 0xff;
+      ta5_emit_clear(cmd, cmd->device, &probe);
+   }
+
+   /*
     * Viewport transform.  The vertex shader produces NDC, so this is the
     * width/height-to-half-size mapping *plus* the half-size offset that puts
     * NDC -1 at pixel 0.  Without the offset the whole frame lands off the
@@ -2040,4 +2058,34 @@ ta5_CmdDraw(VkCommandBuffer _cmd, uint32_t vertexCount, uint32_t instanceCount,
                      CP_DRAW_INDX_OFFSET_0_VIS_CULL(IGNORE_VISIBILITY));
    ta5_cs_push(cmd, instanceCount);
    ta5_cs_push(cmd, vertexCount);
+
+   /*
+    * Stage the draw into its own object and reach it with CP_INDIRECT_BUFFER,
+    * which is what fd5 does (freedreno_util.h __OUT_IB5) and the one packet
+    * its sysmem stream contains that an inline draw does not.
+    *
+    * Only the draw packet moves.  The state and the shader loads stay in the
+    * main stream, because they carry relocations and the kernel's patching
+    * only reaches the submitted command buffer -- so this is not yet the
+    * whole of GL's arrangement, but it isolates the one packet.
+    */
+   if (cmd->device->draw_bo && !getenv("TA5_NO_INDIRECT_DRAW")) {
+      uint32_t off = cmd->cs_count - 4;
+      void *map = ta5_bo_map(cmd->device->draw_bo);
+
+      if (map != NULL) {
+         memcpy(map, &cmd->cs[off], 4 * sizeof(uint32_t));
+         __sync_synchronize();
+
+         cmd->cs_count = off;
+         ta5_pkt7(cmd, CP_INDIRECT_BUFFER, 3);
+         ret = ta5_cs_reloc(cmd, cmd->device->draw_bo, 0, 0);
+         if (ret != VK_SUCCESS)
+            return;
+         ta5_cs_push(cmd, 4); /* IB_SIZE, in dwords */
+
+         ta5_pkt7(cmd, CP_SKIP_IB2_ENABLE_GLOBAL, 1);
+         ta5_cs_push(cmd, 0);
+      }
+   }
 }

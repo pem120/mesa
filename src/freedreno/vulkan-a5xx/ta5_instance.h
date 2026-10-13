@@ -104,6 +104,10 @@ struct ta5_device
     */
    struct ta5_bo *blit_bo;
 
+   /* Scratch object the CP_DRAW_INDX_OFFSET packet is staged in, so that the
+    * draw is reached through CP_INDIRECT_BUFFER the way fd5 reaches it. */
+   struct ta5_bo *draw_bo;
+
 };
 VK_DEFINE_HANDLE_CASTS(ta5_device, vk.base, VkDevice, VK_OBJECT_TYPE_DEVICE)
 
