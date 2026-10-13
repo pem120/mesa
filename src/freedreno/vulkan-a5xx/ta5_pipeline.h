@@ -79,9 +79,8 @@ struct ta5_pipeline
     * backend only does behind its DIRECT debug flag, and the GPU faults on
     * it here -- the CP opcode error lands mid-upload.
     */
-   struct ta5_bo *shader_bo;
-   uint32_t vs_offset;
-   uint32_t fs_offset;
+   struct ta5_bo *vs_bo;
+   struct ta5_bo *fs_bo;
 
    /** Shaders were given as gl_Position/gl_FragCoord-only; no vertex buffer
     * fetch is configured yet. */

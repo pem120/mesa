@@ -862,7 +862,7 @@ ta5_emit_program_state(struct ta5_cmd_buffer *cmd, struct ta5_pipeline *pipe)
 static void
 ta5_emit_consts(struct ta5_cmd_buffer *cmd, struct ta5_pipeline *pipe,
                 const struct ta5_compiled_shader *shader,
-                enum a4xx_state_block state_block, uint32_t bo_offset)
+                enum a4xx_state_block state_block, struct ta5_bo *bo)
 {
    const struct ir3_shader_variant *v =
       (const struct ir3_shader_variant *)shader->variant;
@@ -989,9 +989,8 @@ ta5_emit_consts(struct ta5_cmd_buffer *cmd, struct ta5_pipeline *pipe,
                         CP_LOAD_STATE4_0_STATE_SRC(SS4_INDIRECT) |
                         CP_LOAD_STATE4_0_STATE_BLOCK(state_block) |
                         CP_LOAD_STATE4_0_NUM_UNIT(size_dwords / 4));
-      ta5_cs_reloc(cmd, pipe->shader_bo,
-                   bo_offset + v->info.constant_data_offset +
-                      state->range[i].start,
+      ta5_cs_reloc(cmd, bo,
+                   v->info.constant_data_offset + state->range[i].start,
                    CP_LOAD_STATE4_1_STATE_TYPE(ST4_CONSTANTS));
    }
 }
@@ -1011,12 +1010,12 @@ ta5_emit_consts(struct ta5_cmd_buffer *cmd, struct ta5_pipeline *pipe,
  */
 static VkResult
 ta5_emit_shader_obj(struct ta5_cmd_buffer *cmd, struct ta5_pipeline *pipe,
-                    uint32_t reg, uint32_t bo_offset)
+                    uint32_t reg, struct ta5_bo *bo)
 {
    VkResult ret;
 
    ta5_pkt4(cmd, reg, 6);
-   ret = ta5_cs_reloc(cmd, pipe->shader_bo, bo_offset, 0);
+   ret = ta5_cs_reloc(cmd, bo, 0, 0);
    if (ret != VK_SUCCESS)
       return ret;
    ta5_cs_push(cmd, 0x00000000);   /* SP_xS_PVT_MEM_PARAM */
@@ -1038,11 +1037,11 @@ static VkResult
 ta5_emit_shader(struct ta5_cmd_buffer *cmd, struct ta5_pipeline *pipe,
                 const struct ta5_compiled_shader *shader,
                 enum a4xx_state_block state_block, uint32_t obj_reg,
-                uint32_t bo_offset)
+                struct ta5_bo *bo)
 {
    VkResult ret;
 
-   ret = ta5_emit_shader_obj(cmd, pipe, obj_reg, bo_offset);
+   ret = ta5_emit_shader_obj(cmd, pipe, obj_reg, bo);
    if (ret != VK_SUCCESS)
       return ret;
 
@@ -1051,12 +1050,11 @@ ta5_emit_shader(struct ta5_cmd_buffer *cmd, struct ta5_pipeline *pipe,
                      CP_LOAD_STATE4_0_STATE_SRC(SS4_INDIRECT) |
                      CP_LOAD_STATE4_0_STATE_BLOCK(state_block) |
                      CP_LOAD_STATE4_0_NUM_UNIT(shader->instrlen));
-   ret = ta5_cs_reloc(cmd, pipe->shader_bo, bo_offset,
-                      CP_LOAD_STATE4_1_STATE_TYPE(ST4_SHADER));
+   ret = ta5_cs_reloc(cmd, bo, 0, CP_LOAD_STATE4_1_STATE_TYPE(ST4_SHADER));
    if (ret != VK_SUCCESS)
       return ret;
 
-   ta5_emit_consts(cmd, pipe, shader, state_block, bo_offset);
+   ta5_emit_consts(cmd, pipe, shader, state_block, bo);
 
    return VK_SUCCESS;
 }
@@ -1926,11 +1924,11 @@ ta5_CmdDraw(VkCommandBuffer _cmd, uint32_t vertexCount, uint32_t instanceCount,
    ta5_emit_program_state(cmd, pipe);
 
    if (ta5_emit_shader(cmd, pipe, &pipe->vertex, SB4_VS_SHADER,
-                       REG_A5XX_SP_VS_OBJ_START, pipe->vs_offset) != VK_SUCCESS)
+                       REG_A5XX_SP_VS_OBJ_START, pipe->vs_bo) != VK_SUCCESS)
       return;
    if (pipe->has_fragment &&
        ta5_emit_shader(cmd, pipe, &pipe->fragment, SB4_FS_SHADER,
-                       REG_A5XX_SP_FS_OBJ_START, pipe->fs_offset) != VK_SUCCESS)
+                       REG_A5XX_SP_FS_OBJ_START, pipe->fs_bo) != VK_SUCCESS)
       return;
 
    /*

@@ -81,6 +81,50 @@ ta5_copy_variant(void *dst, const struct ta5_compiled_shader *shader,
              v->constant_data_size);
 }
 
+/**
+ * Allocate and fill the object holding one stage's program.
+ *
+ * CPU-written, GPU-read, so it needs a WC mapping: this kernel's
+ * GEM_CPU_PREP is a no-op ("TODO cache maintenance"), so a cached mapping
+ * is never flushed and the shader fetch would read whatever stale DRAM
+ * held.  WC bypasses the CPU cache, matching the ring buffer and freedreno,
+ * which allocate WC by default.
+ */
+static VkResult
+ta5_stage_bo_alloc(struct ta5_device *device,
+                   const VkAllocationCallbacks *pAllocator,
+                   struct ta5_pipeline *pipe,
+                   const struct ir3_shader_variant *v,
+                   struct ta5_compiled_shader *shader, struct ta5_bo **out)
+{
+   uint32_t size = ta5_variant_size(v);
+   void *map;
+
+   *out = ta5_bo_alloc(device, size ? size : 4, MSM_BO_WC);
+   if (*out == NULL)
+      return vk_error(&device->instance->vk, VK_ERROR_OUT_OF_DEVICE_MEMORY);
+
+   map = ta5_bo_map(*out);
+   if (map == NULL) {
+      ta5_bo_unref(*out);
+      *out = NULL;
+      return vk_error(&device->instance->vk, VK_ERROR_OUT_OF_HOST_MEMORY);
+   }
+
+   ta5_copy_variant(map, shader, v);
+
+   if (getenv("TA5_DUMP_SHADER_BO")) {
+      const uint32_t *d = (const uint32_t *)map;
+      fprintf(stderr,
+              "ta5[shader-bo] size=%u sizedwords=%u instrlen=%u\n", size,
+              v->info.sizedwords, v->instrlen);
+      for (uint32_t i = 0; i < (size + 3) / 4; i++)
+         fprintf(stderr, "ta5[shader-bo] %05x: %08x\n", i * 4, d[i]);
+   }
+
+   return VK_SUCCESS;
+}
+
 /** Copy the SPIR-V word stream out of a runtime shader module. */
 static const uint32_t *
 ta5_module_words(const struct vk_shader_module *module, size_t *out_size)
@@ -249,60 +293,34 @@ ta5_CreateGraphicsPipelines(VkDevice _device, VkPipelineCache pipelineCache,
             pipe->has_fragment
                ? (const struct ir3_shader_variant *)pipe->fragment.variant
                : NULL;
-         uint32_t vs_size = vs_v ? ta5_variant_size(vs_v) : 0;
-         uint32_t fs_size = fs_v ? ta5_variant_size(fs_v) : 0;
 
          /*
-          * Both stages live in one staging object: the vertex program at 0,
-          * the fragment program at the next 64-byte boundary after it.
+          * One object per stage, the way IR3 hands out one BO per variant.
           *
-          * Giving each stage its own page was tried, on the theory that IR3
-          * hands out one BO per variant and the shader fetch unit might not
-          * accept a program living mid-page.  It makes no difference: same
-          * faults, same IOVAs, same empty readback.  Reverted, and recorded
-          * in the plan so it is not tried a third time.
+          * Packing both programs into a single staging object at an offset
+          * of our choosing reconstructs that layout rather than being it,
+          * and every register the draw programs is now byte-identical to
+          * what fd5 emits.  So if the fragment path is still unhappy, what
+          * it is unhappy about has to be the object it is reading from.
+          * Two objects puts each program at the base of its own allocation,
+          * at an address the hardware picked, as in GL's stream.
+          *
+          * (Page-aligning the stages *inside one object* was tried first and
+          * disproved: same faults, same IOVAs, same empty readback.  What
+          * changes here is the object, not the offset within it.)
           */
-         pipe->vs_offset = 0;
-         pipe->fs_offset = (vs_size + 63) & ~63u;
+         VkResult st;
 
-         uint32_t total = pipe->fs_offset + fs_size;
+         st = ta5_stage_bo_alloc(device, pAllocator, pipe, vs_v,
+                                 &pipe->vertex, &pipe->vs_bo);
+         if (st != VK_SUCCESS)
+            return st;
 
-         /* CPU-written, GPU-read: needs WC.  This kernel's GEM_CPU_PREP is
-          * a no-op ("TODO cache maintenance"), so a cached mapping is never
-          * flushed and the UCHE would fetch whatever stale DRAM held.  WC
-          * bypasses the CPU cache, matching the ring buffer and freedreno,
-          * which allocates WC by default.
-          */
-         pipe->shader_bo = ta5_bo_alloc(device, total ? total : 4,
-                                        MSM_BO_WC);
-         if (pipe->shader_bo == NULL) {
-            vk_free(pAllocator, pipe);
-            return vk_error(&device->instance->vk,
-                            VK_ERROR_OUT_OF_DEVICE_MEMORY);
-         }
-
-         void *map = ta5_bo_map(pipe->shader_bo);
-         if (map == NULL) {
-            vk_free(pAllocator, pipe);
-            return vk_error(&device->instance->vk,
-                            VK_ERROR_OUT_OF_HOST_MEMORY);
-         }
-         if (vs_v)
-            ta5_copy_variant(map, &pipe->vertex, vs_v);
-         if (fs_v)
-            ta5_copy_variant((char *)map + pipe->fs_offset, &pipe->fragment,
-                             fs_v);
-
-         if (getenv("TA5_DUMP_SHADER_BO")) {
-            const uint32_t *d = (const uint32_t *)map;
-            fprintf(stderr,
-                    "ta5[shader-bo] total=%u vs_off=%u fs_off=%u "
-                    "vs_sizedwords=%u fs_sizedwords=%u\n",
-                    total, pipe->vs_offset, pipe->fs_offset,
-                    vs_v ? vs_v->info.sizedwords : 0,
-                    fs_v ? fs_v->info.sizedwords : 0);
-            for (uint32_t i = 0; i < (total + 3) / 4; i++)
-               fprintf(stderr, "ta5[shader-bo] %05x: %08x\n", i * 4, d[i]);
+         if (fs_v) {
+            st = ta5_stage_bo_alloc(device, pAllocator, pipe, fs_v,
+                                    &pipe->fragment, &pipe->fs_bo);
+            if (st != VK_SUCCESS)
+               return st;
          }
       }
 
@@ -369,6 +387,7 @@ ta5_DestroyPipeline(VkDevice _device, VkPipeline _pipeline,
 
    ta5_compiled_shader_free(&pipe->vertex);
    ta5_compiled_shader_free(&pipe->fragment);
-   ta5_bo_unref(pipe->shader_bo);
+   ta5_bo_unref(pipe->vs_bo);
+   ta5_bo_unref(pipe->fs_bo);
    vk_free(pAllocator, pipe);
 }
