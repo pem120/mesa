@@ -845,6 +845,45 @@ ta5_emit_consts(struct ta5_cmd_buffer *cmd, struct ta5_pipeline *pipe,
    uint32_t base = const_state->allocs.max_const_offset_vec4;
    uint32_t size, regid, sizedwords;
 
+   /*
+    * Driver parameters.  Every vertex stage reserves a block at c0.x and the
+    * shader reads it -- this triangle's reads c0.y, which is vtxid_base, and
+    * adds it to the incoming vertex id.  They live in the variant rather than
+    * the shader BO, so they are pushed inline with SS4_DIRECT, exactly as
+    * ir3_emit_driver_params() does.
+    *
+    * Without this the vertex id is added to whatever happened to be in the
+    * constant file, and every vertex lands somewhere arbitrary.
+    */
+   if (v->need_driver_params) {
+      struct ir3_driver_params_vs params = {0};
+      uint32_t offset =
+         const_state->allocs.consts[IR3_CONST_ALLOC_DRIVER_PARAMS].offset_vec4;
+      uint32_t nparams = MIN2(const_state->num_driver_params,
+                              (v->constlen - offset) * 4);
+
+      params.vtxid_base = cmd->draw_index_size ? 0 : cmd->draw_first_vertex;
+      params.instid_base = cmd->draw_first_instance;
+      /* No transform feedback, and AUTO_INDEX rather than a real index
+       * buffer, so both of these are zero.
+       */
+      params.vtxcnt_max = 0;
+      params.is_indexed_draw = 0;
+
+      if (nparams > 0) {
+         ta5_pkt7(cmd, CP_LOAD_STATE4, 3 + nparams);
+         ta5_cs_push(cmd, CP_LOAD_STATE4_0_DST_OFF(offset) |
+                           CP_LOAD_STATE4_0_STATE_SRC(SS4_DIRECT) |
+                           CP_LOAD_STATE4_0_STATE_BLOCK(state_block) |
+                           CP_LOAD_STATE4_0_NUM_UNIT(nparams / 4));
+         ta5_cs_push(cmd, CP_LOAD_STATE4_1_EXT_SRC_ADDR(0) |
+                           CP_LOAD_STATE4_1_STATE_TYPE(ST4_CONSTANTS));
+         ta5_cs_push(cmd, CP_LOAD_STATE4_2_EXT_SRC_ADDR_HI(0));
+         for (uint32_t i = 0; i < nparams; i++)
+            ta5_cs_push(cmd, ((uint32_t *)&params)[i]);
+      }
+   }
+
    /* a7xx+ folds these into the preamble instead; nothing to upload. */
    if (v->compiler->info->props.load_shader_consts_via_preamble)
       return;
@@ -901,21 +940,29 @@ ta5_emit_consts(struct ta5_cmd_buffer *cmd, struct ta5_pipeline *pipe,
          continue;
 
       /*
-       * DST_OFF and NUM_UNIT are in units of vec4, which the computerator's
-       * load_constants() confirms: it divides a dword regid by four for
-       * DST_OFF and rounds a dword count up to four for NUM_UNIT.
+       * ir3_emit_constant_data() works in *bytes*: range.offset is where the
+       * range starts in the constant file and start/end are byte offsets into
+       * the variant's constant_data.  The disassembly says so directly --
        *
-       * These two fields are not yet right for the draw path -- the vertex
-       * shader's positions still do not arrive, so the triangle does not
-       * rasterise -- but this form is the one that does not fault, and it
-       * keeps the whole stream clean while that is tracked down.  Do not take
-       * the values below as settled.
+       *     ubo_ranges   c4.x (4 vec4)
+       *     offset:      c4.x
+       *     size:        4 vec4 (0b -> 64b)
+       *
+       * so c4.x is dword 16 and the range is 64 *bytes*.  DST_OFF and NUM_UNIT
+       * are in vec4, hence the two steps: bytes -> dwords -> vec4.  Feeding
+       * the raw byte counts straight into those fields loads four times too
+       * high and far too much, and the vertex shader's c[16..21] stays
+       * uninitialised -- which is why the triangle rasterised nothing while
+       * the stream itself stayed fault-free.
        */
+      uint32_t offset_dwords = state->range[i].offset / 4;
+      uint32_t size_dwords = size / 4;
+
       ta5_pkt7(cmd, CP_LOAD_STATE4, 3);
-      ta5_cs_push(cmd, CP_LOAD_STATE4_0_DST_OFF(state->range[i].offset / 4) |
+      ta5_cs_push(cmd, CP_LOAD_STATE4_0_DST_OFF(offset_dwords / 4) |
                         CP_LOAD_STATE4_0_STATE_SRC(SS4_INDIRECT) |
                         CP_LOAD_STATE4_0_STATE_BLOCK(state_block) |
-                        CP_LOAD_STATE4_0_NUM_UNIT(size / 4));
+                        CP_LOAD_STATE4_0_NUM_UNIT(size_dwords / 4));
       ta5_cs_reloc(cmd, pipe->shader_bo,
                    bo_offset + v->info.constant_data_offset +
                       state->range[i].start,
@@ -1734,8 +1781,13 @@ ta5_CmdDraw(VkCommandBuffer _cmd, uint32_t vertexCount, uint32_t instanceCount,
    struct ta5_pipeline *pipe = cmd->bound_pipeline;
    VkResult ret;
 
-   (void)firstVertex;
-   (void)firstInstance;
+   /*
+    * Driver parameters are recorded per draw, so remember what this one is
+    * before anything emits the shader.
+    */
+   cmd->draw_first_vertex = firstVertex;
+   cmd->draw_first_instance = firstInstance;
+   cmd->draw_index_size = 0;   /* AUTO_INDEX; no index buffer is bound */
 
    if (cmd->state != MESA_VK_COMMAND_BUFFER_STATE_RECORDING || pipe == NULL)
       return;

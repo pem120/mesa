@@ -110,6 +110,17 @@ struct ta5_cmd_buffer
    struct ta5_render_pass *bound_render_pass;
    struct ta5_descriptor_set *bound_sets[4];
 
+   /**
+    * The draw currently being recorded, needed by the driver-parameter upload.
+    *
+    * IR3 hands the vertex stage a block of driver parameters at c0.x and the
+    * shader reads them -- this one's c0.y is vtxid_base -- so they have to be
+    * filled in per draw rather than once per pipeline.
+    */
+   uint32_t draw_first_vertex;
+   uint32_t draw_first_instance;
+   uint32_t draw_index_size;
+
    /** Fence to signal when this submission completes. */
    struct ta5_fence *fence;
 
