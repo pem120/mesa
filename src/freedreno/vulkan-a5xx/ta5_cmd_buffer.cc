@@ -202,6 +202,8 @@ ta5_BeginCommandBuffer(VkCommandBuffer _cmd,
    assert(cmd->state == MESA_VK_COMMAND_BUFFER_STATE_INITIAL);
 
    cmd->cs_count = 0;
+   cmd->reloc_count = 0;
+   cmd->reloc_bo_count = 0;
    cmd->submitted = 0;
    cmd->fence = NULL;
    cmd->state = MESA_VK_COMMAND_BUFFER_STATE_RECORDING;
@@ -242,6 +244,17 @@ ta5_ResetCommandBuffer(VkCommandBuffer _cmd, VkCommandBufferResetFlags flags)
    struct ta5_cmd_buffer *cmd = ta5_cmd_buffer_from_handle(_cmd);
 
    cmd->cs_count = 0;
+   /*
+    * The relocation list has to go too.  It is appended to as the stream is
+    * recorded and is never trimmed, so a buffer that is reset and recorded
+    * again -- which is what every per-frame app does -- would carry the first
+    * recording's relocations into the second.  The submission path then
+    * patches GPU addresses into payload dwords at the old stream offsets,
+    * which are now past the end of the shorter stream: silent corruption of
+    * the PM4 rather than a crash.
+    */
+   cmd->reloc_count = 0;
+   cmd->reloc_bo_count = 0;
    cmd->submitted = 0;
    cmd->fence = NULL;
    cmd->state = MESA_VK_COMMAND_BUFFER_STATE_INITIAL;
@@ -503,6 +516,19 @@ ta5_emit_program_state(struct ta5_cmd_buffer *cmd, struct ta5_pipeline *pipe)
 
    ir3_link_shaders(&l, vs, fs, true);
 
+   /*
+    * VPC_VAR_DISABLE is programmed from the *inter-stage* linkage alone.
+    * fd5 emits it before appending position/psize/clip distances to the
+    * linkage map (fd5_program.c:427, then :437-444), so position is
+    * deliberately absent from the mask.  Building the map first and
+    * programming the mask from it afterwards -- as this used to do -- marks
+    * varying slots 0-3 as live, and the VPC then goes looking for an
+    * interpolated position that the FS never consumes and the VS, whose
+    * outputs start at slot NUMNONPOSVAR, never stored.
+    */
+   const uint32_t varmask[4] = {l.varmask[0], l.varmask[1], l.varmask[2],
+                                l.varmask[3]};
+
    /* a5xx appends pos/psize to the end of the linkage map. */
    pos_loc = l.max_loc;
    if (VALIDREG(pos_regid))
@@ -705,10 +731,10 @@ ta5_emit_program_state(struct ta5_cmd_buffer *cmd, struct ta5_pipeline *pipe)
                                                                   : 0xff));
 
    ta5_pkt4(cmd, REG_A5XX_VPC_VAR_DISABLE(0), 4);
-   ta5_cs_push(cmd, ~l.varmask[0]);
-   ta5_cs_push(cmd, ~l.varmask[1]);
-   ta5_cs_push(cmd, ~l.varmask[2]);
-   ta5_cs_push(cmd, ~l.varmask[3]);
+   ta5_cs_push(cmd, ~varmask[0]);
+   ta5_cs_push(cmd, ~varmask[1]);
+   ta5_cs_push(cmd, ~varmask[2]);
+   ta5_cs_push(cmd, ~varmask[3]);
 
    ta5_pkt4(cmd, REG_A5XX_VPC_VARYING_INTERP_MODE(0), 8);
    for (int i = 0; i < 8; i++)
@@ -1315,16 +1341,17 @@ ta5_emit_sysmem_prep(struct ta5_cmd_buffer *cmd,
    ta5_cs_push(cmd, 0);
 
    /*
-    * The unused colour slots.  They are never read for a single-attachment
-    * pass, but they are register state that survives across submissions, and
-    * GL zeroes them as part of emit_mrt(); leaving them at whatever a
-    * previous client configured is how the CCU ends up with a second live
-    * target.  fd5's own value for an unused slot is 0x000007e0.
+    * The unused colour slots.  A slot is CONTROL, BLEND_CONTROL, BUF_INFO,
+    * PITCH, ARRAY_PITCH, BASE_LO, BASE_HI -- seven dwords -- so writing five
+    * dwords at RB_MRT(i) reaches BUF_INFO but never the base address.  fd5's
+    * emit_mrt() writes RB_MRT_BUF_INFO(i) as its own five-dword packet and
+    * zeroes the base of every slot it is not given a buffer for; leaving
+    * those two dwords at whatever a previous client configured is how the
+    * CCU ends up with a second live target.
     */
    for (uint32_t i = 1; i < 8; i++) {
-      ta5_pkt4(cmd, REG_A5XX_RB_MRT(i), 5);
-      ta5_cs_push(cmd, 0x000007e0);
-      for (uint32_t j = 0; j < 4; j++)
+      ta5_pkt4(cmd, REG_A5XX_RB_MRT_BUF_INFO(i), 5);
+      for (uint32_t j = 0; j < 5; j++)
          ta5_cs_push(cmd, 0x00000000);
 
       ta5_pkt4(cmd, REG_A5XX_SP_FS_MRT(i), 1);
@@ -1391,11 +1418,16 @@ ta5_emit_draw_state(struct ta5_cmd_buffer *cmd)
                      A5XX_SP_FS_OUTPUT_CNTL_DEPTH_REGID(regid(63, 0)) |
                      A5XX_SP_FS_OUTPUT_CNTL_SAMPLEMASK_REGID(regid(63, 0)));
 
+   /*
+    * No attachment blends, so both enable masks are zero -- but fd5 still
+    * carries the driver's UNK8 bit on the shader side and the full default
+    * sample mask on the RB side (fd5_blend.c:110-119, fd5_emit.c:848-850).
+    */
    ta5_pkt4(cmd, REG_A5XX_SP_BLEND_CNTL, 1);
-   ta5_cs_push(cmd, 0x00000000);
+   ta5_cs_push(cmd, A5XX_SP_BLEND_CNTL_UNK8);
 
    ta5_pkt4(cmd, REG_A5XX_RB_BLEND_CNTL, 1);
-   ta5_cs_push(cmd, 0x00000000);
+   ta5_cs_push(cmd, A5XX_RB_BLEND_CNTL_SAMPLE_MASK(0xffff));
 
    /*
     * Per-attachment ROP.  RB_MRT_CONTROL_COMPONENT_ENABLE is a *mask of colour
@@ -1429,7 +1461,36 @@ ta5_emit_draw_state(struct ta5_cmd_buffer *cmd)
    ta5_pkt4(cmd, REG_A5XX_TPL1_CS_TEX_COUNT, 1);
    ta5_cs_push(cmd, 0x00000000);
 
-   /* No depth or stencil attachment, so all of these stay cleared. */
+   /*
+    * No depth or stencil attachment.  fd5_emit_zs() programs the depth pipe
+    * explicitly rather than leaving it alone, and that distinction matters:
+    * clearing RB_DEPTH_CNTL only switches depth testing off, it does not say
+    * what the depth format is or where the depth buffer lives.  Both of those
+    * are register state that outlives a submission, so leaving them stale lets
+    * the CCU keep a Z-fetch live against whatever base the previous client
+    * left behind -- which is a pair of unmapped reads, one per fetch, at the
+    * moment the first fragments arrive.
+    *
+    * Transcribed from fd5_gmem.c:198-216, the no-zsbuf branch.
+    */
+   ta5_pkt4(cmd, REG_A5XX_RB_DEPTH_BUFFER_INFO, 5);
+   ta5_cs_push(cmd, A5XX_RB_DEPTH_BUFFER_INFO_DEPTH_FORMAT(DEPTH5_NONE));
+   ta5_cs_push(cmd, 0x00000000); /* RB_DEPTH_BUFFER_BASE_LO */
+   ta5_cs_push(cmd, 0x00000000); /* RB_DEPTH_BUFFER_BASE_HI */
+   ta5_cs_push(cmd, 0x00000000); /* RB_DEPTH_BUFFER_PITCH */
+   ta5_cs_push(cmd, 0x00000000); /* RB_DEPTH_BUFFER_ARRAY_PITCH */
+
+   ta5_pkt4(cmd, REG_A5XX_GRAS_SU_DEPTH_BUFFER_INFO, 1);
+   ta5_cs_push(cmd, A5XX_GRAS_SU_DEPTH_BUFFER_INFO_DEPTH_FORMAT(DEPTH5_NONE));
+
+   ta5_pkt4(cmd, REG_A5XX_RB_DEPTH_FLAG_BUFFER_BASE, 3);
+   ta5_cs_push(cmd, 0x00000000); /* RB_DEPTH_FLAG_BUFFER_BASE */
+   ta5_cs_push(cmd, 0x00000000); /* RB_DEPTH_FLAG_BUFFER_BASE_HI */
+   ta5_cs_push(cmd, 0x00000000); /* RB_DEPTH_FLAG_BUFFER_PITCH */
+
+   ta5_pkt4(cmd, REG_A5XX_RB_STENCIL_INFO, 1);
+   ta5_cs_push(cmd, 0x00000000);
+
    ta5_pkt4(cmd, REG_A5XX_RB_DEPTH_CNTL, 1);
    ta5_cs_push(cmd, 0x00000000);
 
@@ -1863,12 +1924,14 @@ ta5_CmdDraw(VkCommandBuffer _cmd, uint32_t vertexCount, uint32_t instanceCount,
 
    /*
     * CP_DRAW_INDX_OFFSET, no index buffer.  AUTO_INDEX synthesises vertex ids
-    * 0..count-1, which is exactly what gl_VertexIndex reads.
+    * 0..count-1, which is exactly what gl_VertexIndex reads.  With no index
+    * buffer fd5 still programs INDEX_SIZE as 32-bit (fd5_draw.h:114) rather
+    * than leaving it at the 8-bit reset value.
     */
    ta5_pkt7(cmd, CP_DRAW_INDX_OFFSET, 3);
    ta5_cs_push(cmd, CP_DRAW_INDX_OFFSET_0_PRIM_TYPE(DI_PT_TRILIST) |
                      CP_DRAW_INDX_OFFSET_0_SOURCE_SELECT(DI_SRC_SEL_AUTO_INDEX) |
-                     CP_DRAW_INDX_OFFSET_0_INDEX_SIZE(INDEX4_SIZE_8_BIT) |
+                     CP_DRAW_INDX_OFFSET_0_INDEX_SIZE(INDEX4_SIZE_32_BIT) |
                      CP_DRAW_INDX_OFFSET_0_VIS_CULL(IGNORE_VISIBILITY));
    ta5_cs_push(cmd, instanceCount);
    ta5_cs_push(cmd, vertexCount);

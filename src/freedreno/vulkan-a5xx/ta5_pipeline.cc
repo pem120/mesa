@@ -252,6 +252,16 @@ ta5_CreateGraphicsPipelines(VkDevice _device, VkPipelineCache pipelineCache,
          uint32_t vs_size = vs_v ? ta5_variant_size(vs_v) : 0;
          uint32_t fs_size = fs_v ? ta5_variant_size(fs_v) : 0;
 
+         /*
+          * Both stages live in one staging object: the vertex program at 0,
+          * the fragment program at the next 64-byte boundary after it.
+          *
+          * Giving each stage its own page was tried, on the theory that IR3
+          * hands out one BO per variant and the shader fetch unit might not
+          * accept a program living mid-page.  It makes no difference: same
+          * faults, same IOVAs, same empty readback.  Reverted, and recorded
+          * in the plan so it is not tried a third time.
+          */
          pipe->vs_offset = 0;
          pipe->fs_offset = (vs_size + 63) & ~63u;
 
@@ -282,6 +292,18 @@ ta5_CreateGraphicsPipelines(VkDevice _device, VkPipelineCache pipelineCache,
          if (fs_v)
             ta5_copy_variant((char *)map + pipe->fs_offset, &pipe->fragment,
                              fs_v);
+
+         if (getenv("TA5_DUMP_SHADER_BO")) {
+            const uint32_t *d = (const uint32_t *)map;
+            fprintf(stderr,
+                    "ta5[shader-bo] total=%u vs_off=%u fs_off=%u "
+                    "vs_sizedwords=%u fs_sizedwords=%u\n",
+                    total, pipe->vs_offset, pipe->fs_offset,
+                    vs_v ? vs_v->info.sizedwords : 0,
+                    fs_v ? fs_v->info.sizedwords : 0);
+            for (uint32_t i = 0; i < (total + 3) / 4; i++)
+               fprintf(stderr, "ta5[shader-bo] %05x: %08x\n", i * 4, d[i]);
+         }
       }
 
       /*
