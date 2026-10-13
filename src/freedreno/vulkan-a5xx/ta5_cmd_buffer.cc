@@ -1922,6 +1922,31 @@ ta5_CmdSetScissor(VkCommandBuffer _cmd, uint32_t firstScissor,
    (void)pScissors;
 }
 
+/**
+ * Vertex attribute format as a VFMT5 value, or UINT32_MAX if unsupported.
+ *
+ * Only the 32-bit float forms the fetch unit decodes natively are mapped.
+ * Anything else is reported as unsupported so the attribute is skipped rather
+ * than silently decoded as something else, which would feed the shader
+ * garbage that looks like a pipeline bug rather than a format one.
+ */
+static uint32_t
+ta5_vfd_format(VkFormat format)
+{
+   switch (format) {
+   case VK_FORMAT_R32_SFLOAT:
+      return VFMT5_32_FLOAT;
+   case VK_FORMAT_R32G32_SFLOAT:
+      return VFMT5_32_32_FLOAT;
+   case VK_FORMAT_R32G32B32_SFLOAT:
+      return VFMT5_32_32_32_FLOAT;
+   case VK_FORMAT_R32G32B32A32_SFLOAT:
+      return VFMT5_32_32_32_32_FLOAT;
+   default:
+      return UINT32_MAX;
+   }
+}
+
 VKAPI_ATTR void VKAPI_CALL
 ta5_CmdBindVertexBuffers(VkCommandBuffer _cmd, uint32_t firstBinding,
                          uint32_t bindingCount,
@@ -1934,18 +1959,26 @@ ta5_CmdBindVertexBuffers(VkCommandBuffer _cmd, uint32_t firstBinding,
       return;
 
    /*
-    * Slot 0 only.  A draw consumes exactly one attribute from exactly one
-    * binding, so a second slot would be recorded and then silently ignored
-    * at draw time -- worse than not recording it.  Dropping it here keeps
-    * the recorded state honest about what the stream will actually use.
+    * Binding 0 rebinds the whole array, so the stale slots below it are
+    * cleared first; anything above firstBinding + bindingCount keeps the
+    * binding it already had, exactly as the spec requires.  A slot past the
+    * end of the array is dropped rather than silently landing somewhere else.
     */
-   if (firstBinding != 0 || bindingCount == 0)
-      return;
+   if (firstBinding == 0) {
+      memset(cmd->bound_vb, 0, sizeof(cmd->bound_vb));
+      memset(cmd->bound_vb_offset, 0, sizeof(cmd->bound_vb_offset));
+   }
 
-   cmd->bound_vb = bindingCount == 1 && pBuffers
-                      ? ta5_buffer_from_handle(pBuffers[0])
-                      : NULL;
-   cmd->bound_vb_offset = pOffsets ? pOffsets[0] : 0;
+   for (uint32_t i = 0; i < bindingCount; i++) {
+      uint32_t slot = firstBinding + i;
+
+      if (slot >= MESA_VK_MAX_VERTEX_BINDINGS)
+         break;
+
+      cmd->bound_vb[slot] = pBuffers ? ta5_buffer_from_handle(pBuffers[i])
+                                     : NULL;
+      cmd->bound_vb_offset[slot] = pOffsets ? pOffsets[i] : 0;
+   }
 }
 
 VKAPI_ATTR void VKAPI_CALL
@@ -2290,65 +2323,132 @@ ta5_CmdDraw(VkCommandBuffer _cmd, uint32_t vertexCount, uint32_t instanceCount,
     * zero, so an AUTO_INDEX draw is unaffected -- the vertex id still arrives
     * through the VFD's synth path rather than from memory.
     */
-   if (pipe->uses_vertex_buffers && cmd->bound_vb &&
-       cmd->bound_vb->bound_memory && cmd->bound_vb->bound_memory->bo) {
+   if (pipe->uses_vertex_buffers && pipe->graphics_state.vi) {
       const struct ir3_shader_variant *vs =
          (const struct ir3_shader_variant *)pipe->vertex.variant;
-      struct ta5_bo *bo = cmd->bound_vb->bound_memory->bo;
-      unsigned vregid = regid(63, 0); /* invalid/unused marker */
-      VkDeviceSize off = cmd->bound_vb_offset;
-      VkDeviceSize size = cmd->bound_vb->size - off;
+      const struct vk_vertex_input_state *vi = pipe->graphics_state.vi;
+      unsigned fetch_cnt = 0;
+
+      ret = ta5_cmd_buffer_alloc_cs(
+         draw, draw->cs_count + 32 * MESA_VK_MAX_VERTEX_ATTRIBUTES + 16);
+      if (ret != VK_SUCCESS)
+         goto draw_error;
 
       /*
+       * One fetch slot per vertex attribute the VS actually consumes,
+       * emitted in ascending Vulkan location order, which is the order
+       * fd5_emit_fetch() walks its vertex elements in.
+       *
        * Vertex attribute locations use VERT_ATTRIB_GENERIC0 as their base in
        * IR3's input table (location 0 was observed as slot 15), unlike
        * fragment varying slots which start at VARYING_SLOT_VAR0.  System
-       * values are kept in the same table but have sysval set and must not be
-       * wired to a fetch slot.
+       * values sit in the same table but have sysval set and must not be wired
+       * to a fetch slot.
+       *
+       * The order is not cosmetic: IR3 hands back its inputs in whatever order
+       * it allocated registers, so a shader whose location 1 is allocated
+       * first would otherwise get fetch slot 0.  The VFD is happy with that
+       * -- each slot's fetch, decode and destination agree -- but the
+       * fragment stage then sees the varying pinned to a single vertex.
        */
-      for (unsigned j = 0; j < vs->inputs_count; j++) {
-         if (getenv("TA5_TRACE_NULL"))
-            fprintf(stderr, "ta5[vfd]: input %u slot=%u sysval=%u regid=%u\n",
-                    j, vs->inputs[j].slot, vs->inputs[j].sysval,
-                    vs->inputs[j].regid);
-         if (!vs->inputs[j].sysval &&
-             vs->inputs[j].slot == VERT_ATTRIB_GENERIC0)
-            vregid = vs->inputs[j].regid;
-      }
+      for (unsigned location = 0; location < MESA_VK_MAX_VERTEX_ATTRIBUTES;
+           location++) {
+         const struct vk_vertex_attribute_state *attr;
+         const struct vk_vertex_binding_state *bstate;
+         struct ta5_buffer *buf;
+         struct ta5_bo *bo;
+         uint32_t fmt;
+         unsigned i, binding;
+         VkDeviceSize base, size;
 
-      if (getenv("TA5_TRACE_NULL"))
-         fprintf(stderr, "ta5[vfd]: uses_vb=%u bound=%p off=%llu size=%llu regid=%u\n",
-                 pipe->uses_vertex_buffers, (void *)cmd->bound_vb,
-                 (unsigned long long)off, (unsigned long long)size, vregid);
+         if (!(vi->attributes_valid & BITFIELD64_BIT(location)))
+            continue;
 
-      if (vregid != regid(63, 0) && size >= 8) {
-         ret = ta5_cmd_buffer_alloc_cs(draw, draw->cs_count + 64);
+         for (i = 0; i < vs->inputs_count; i++) {
+            if (!vs->inputs[i].sysval &&
+                vs->inputs[i].slot >= VERT_ATTRIB_GENERIC0 &&
+                vs->inputs[i].slot - VERT_ATTRIB_GENERIC0 == location)
+               break;
+         }
+         if (i == vs->inputs_count)
+            continue;
+
+         attr = &vi->attributes[location];
+         binding = attr->binding;
+         if (binding >= MESA_VK_MAX_VERTEX_BINDINGS ||
+             !(vi->bindings_valid & BITFIELD64_BIT(binding)))
+            continue;
+
+         buf = cmd->bound_vb[binding];
+         if (!buf || !buf->bound_memory || !buf->bound_memory->bo)
+            continue;
+
+         fmt = ta5_vfd_format(attr->format);
+         if (fmt == UINT32_MAX)
+            continue;
+
+         bstate = &vi->bindings[binding];
+         base = cmd->bound_vb_offset[binding] + attr->offset;
+         bo = buf->bound_memory->bo;
+         if (base > buf->size || buf->size - base < bstate->stride)
+            continue;
+
+         size = buf->size - base;
+
+         ta5_pkt4(draw, REG_A5XX_VFD_FETCH(fetch_cnt), 4);
+         ret = ta5_cs_reloc(draw, bo, base, 0);
          if (ret != VK_SUCCESS)
             goto draw_error;
+         ta5_cs_push(draw, (uint32_t)size); /* VFD_FETCH[].SIZE */
+         ta5_cs_push(draw, bstate->stride); /* VFD_FETCH[].STRIDE */
 
-         ta5_pkt4(draw, REG_A5XX_VFD_FETCH(0), 4);
-         ret = ta5_cs_reloc(draw, bo, off, 0);
-         if (ret != VK_SUCCESS)
-            goto draw_error;
-         ta5_cs_push(draw, (uint32_t)size); /* VFD_FETCH[0].SIZE */
-         ta5_cs_push(draw, 8);              /* VFD_FETCH[0].STRIDE */
-
-         ta5_pkt4(draw, REG_A5XX_VFD_DECODE(0), 2);
-         ta5_cs_push(draw, A5XX_VFD_DECODE_INSTR_IDX(0) |
+         ta5_pkt4(draw, REG_A5XX_VFD_DECODE(fetch_cnt), 2);
+         /*
+          * INSTR_IDX names the fetch instruction this decode slot reads.
+          * Leaving it at zero for every slot makes them all decode fetch
+          * slot 0, so a second attribute reads the first attribute's bytes
+          * and the shader silently sees the wrong vertex data.
+          */
+         ta5_cs_push(draw, A5XX_VFD_DECODE_INSTR_IDX(fetch_cnt) |
                               A5XX_VFD_DECODE_INSTR_FORMAT(
-                                 VFMT5_32_32_FLOAT) |
+                                 (enum a5xx_vtx_fmt)fmt) |
                               A5XX_VFD_DECODE_INSTR_UNK30 |
                               A5XX_VFD_DECODE_INSTR_FLOAT);
-         ta5_cs_push(draw, 1); /* VFD_DECODE[0].STEP_RATE */
-
-         ta5_pkt4(draw, REG_A5XX_VFD_DEST_CNTL(0), 1);
+         /*
+          * STEP_RATE is how many instances one fetch advances: 1 for
+          * per-vertex input, the divisor for per-instance (fd5_emit.c:490).
+          */
          ta5_cs_push(draw,
-                     A5XX_VFD_DEST_CNTL_INSTR_WRITEMASK(0x3) |
-                        A5XX_VFD_DEST_CNTL_INSTR_REGID(vregid));
+                     bstate->input_rate == VK_VERTEX_INPUT_RATE_INSTANCE
+                        ? MAX2(1u, bstate->divisor)
+                        : 1u);
 
-         ta5_pkt4(draw, REG_A5XX_VFD_CONTROL_0, 1);
-         ta5_cs_push(draw, A5XX_VFD_CONTROL_0_VTXCNT(1));
+         ta5_pkt4(draw, REG_A5XX_VFD_DEST_CNTL(fetch_cnt), 1);
+         ta5_cs_push(draw,
+                     A5XX_VFD_DEST_CNTL_INSTR_WRITEMASK(
+                        vs->inputs[i].compmask) |
+                        A5XX_VFD_DEST_CNTL_INSTR_REGID(vs->inputs[i].regid));
+
+         if (getenv("TA5_TRACE_NULL"))
+            fprintf(stderr,
+                    "ta5[vfd]: fetch %u loc=%u binding=%u fmt=%u stride=%u "
+                    "size=%u regid=%u wrmask=0x%x\n",
+                    fetch_cnt, location, binding, fmt, bstate->stride,
+                    (uint32_t)size, vs->inputs[i].regid,
+                    vs->inputs[i].compmask);
+
+         fetch_cnt++;
       }
+
+      /*
+       * VTXCNT is the number of live fetch slots and belongs to the fetch
+       * program, not to the draw state: GL emits it last in
+       * fd5_emit_vertex_bufs() (fd5_emit.c:501) and nothing clears it.  Zero
+       * here means no vertex data is fetched at all, so every attribute reads
+       * as zero and the draw degenerates into nothing.
+       */
+      ta5_pkt4(draw, REG_A5XX_VFD_CONTROL_0, 1);
+      ta5_cs_push(draw, A5XX_VFD_CONTROL_0_VTXCNT(fetch_cnt));
    }
 
    ta5_emit_draw_state(draw);

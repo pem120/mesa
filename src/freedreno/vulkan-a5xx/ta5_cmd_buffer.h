@@ -136,15 +136,15 @@ struct ta5_cmd_buffer
    struct ta5_descriptor_set *bound_sets[4];
 
    /**
-    * Vertex buffer binding, as recorded by vkCmdBindVertexBuffers.
+    * Vertex buffer bindings, as recorded by vkCmdBindVertexBuffers.
     *
-    * One slot for now: that is what a non-indexed draw of one attribute
-    * needs, and it is the smallest thing that can tell whether the VFD is
-    * fed at all.  Slot 0 only -- a binding above firstSlot + bindingCount
-    * is dropped rather than silently landing in the wrong slot.
+    * One entry per binding slot, indexed by binding number, so a pipeline
+    * whose attributes name more than one binding can fetch each of them.
+    * A slot that has not been bound stays NULL and its offset is zero;
+    * attributes pointing at it are skipped at draw time.
     */
-   struct ta5_buffer *bound_vb;
-   VkDeviceSize bound_vb_offset;
+   struct ta5_buffer *bound_vb[MESA_VK_MAX_VERTEX_BINDINGS];
+   VkDeviceSize bound_vb_offset[MESA_VK_MAX_VERTEX_BINDINGS];
 
    /**
     * The draw currently being recorded, needed by the driver-parameter upload.
