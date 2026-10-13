@@ -47,7 +47,25 @@
 struct ta5_compiled_shader
 {
    void *nir;          /**< nir_shader*, kept for diagnostics */
+   /**
+    * The compiled variant, owned by this object.
+    *
+    * CP_LOAD_STATE4 only needs the microcode, but almost all of the program
+    * state the hardware wants alongside it -- HLSQ config, register
+    * footprints, the register ids the vertex fetch unit reads -- lives on the
+    * variant, so it has to outlive compilation.  See
+    * ta5_emit_program_state().
+    */
    void *variant;      /**< struct ir3_shader_variant * */
+   void *shader;       /**< struct ir3_shader *, owns variant */
+   /**
+    * ralloc context that owns the NIR handed to ir3_shader_from_nir().
+    *
+    * Kept alive alongside the shader: ir3_shader_destroy() frees
+    * shader->nir, and that NIR is a child of this context, so the context
+    * has to outlive the shader or the destroy double-frees it.
+    */
+   void *nir_ctx;
    uint32_t *code;     /**< the assembled PM4 microcode */
    uint32_t code_size; /**< in dwords */
    uint32_t instrlen;  /**< dwords, for CP_LOAD_STATE4_0_NUM_UNIT */

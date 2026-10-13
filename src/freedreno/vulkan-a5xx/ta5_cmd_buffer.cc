@@ -435,6 +435,251 @@ ta5_event_write_ts(struct ta5_cmd_buffer *cmd, struct ta5_bo *bo, uint32_t evt)
 }
 
 /**
+ * Emit the program state fd5_program_emit() emits for a VS+FS pipeline.
+ *
+ * CP_LOAD_STATE4 on its own is not enough: HLSQ needs to be told where each
+ * stage's constant bank and instruction stream live, how big the register
+ * footprints are, and which registers the vertex fetch unit and the rasteriser
+ * should read.  GL emits all of this from fd5_program_emit(); without it the
+ * draw packet is accepted and discarded.
+ *
+ * The layout follows fd5_program_emit() for the subset this driver supports:
+ * vertex plus fragment, one colour target, no tessellation, geometry or
+ * stream-out.  Stages are laid out exactly the way setup_stages() does --
+ * VS at the bottom of the constant space, FS taking the rest -- so that the
+ * register values can be diffed against the GL backend's.
+ */
+static void
+ta5_emit_program_state(struct ta5_cmd_buffer *cmd, struct ta5_pipeline *pipe)
+{
+   const struct ir3_shader_variant *vs =
+      (const struct ir3_shader_variant *)pipe->vertex.variant;
+   const struct ir3_shader_variant *fs =
+      (const struct ir3_shader_variant *)pipe->fragment.variant;
+
+   /* constlen is in units of 4 * vec4 (setup_stages()). */
+   uint32_t vs_constlen = pipe->vertex.constlen / 4;
+   uint32_t fs_constlen = pipe->fragment.constlen / 4;
+   uint32_t vs_constoff = 0;
+   uint32_t fs_constoff = vs_constlen;
+   uint32_t vs_instrlen = pipe->vertex.instrlen;
+   uint32_t fs_instrlen = pipe->fragment.instrlen;
+   uint32_t fs_instroff = 64 - fs_instrlen;
+
+   struct ir3_shader_linkage l = {0};
+   uint32_t pos_regid, psize_regid, clip0_regid, clip1_regid;
+   uint32_t vertex_regid, instance_regid, color_regid;
+   uint8_t pos_loc = 0, psize_loc = ~0;
+   uint8_t clip_mask = vs->clip_mask, cull_mask = vs->cull_mask;
+   uint8_t clip_cull_mask = clip_mask | cull_mask;
+   enum a3xx_threadsize fssz = TWO_QUADS;
+
+   pos_regid = ir3_find_output_regid(vs, VARYING_SLOT_POS);
+   psize_regid = ir3_find_output_regid(vs, VARYING_SLOT_PSIZ);
+   clip0_regid = ir3_find_output_regid(vs, VARYING_SLOT_CLIP_DIST0);
+   clip1_regid = ir3_find_output_regid(vs, VARYING_SLOT_CLIP_DIST1);
+   vertex_regid =
+      ir3_find_sysval_regid(vs, SYSTEM_VALUE_VERTEX_ID_ZERO_BASE);
+   instance_regid = ir3_find_sysval_regid(vs, SYSTEM_VALUE_INSTANCE_ID);
+
+   color_regid = fs->color0_mrt
+                     ? ir3_find_output_regid(fs, FRAG_RESULT_COLOR)
+                     : ir3_find_output_regid(fs, FRAG_RESULT_DATA0);
+
+   ir3_link_shaders(&l, vs, fs, true);
+
+   /* a5xx appends pos/psize to the end of the linkage map. */
+   pos_loc = l.max_loc;
+   if (VALIDREG(pos_regid))
+      ir3_link_add(&l, VARYING_SLOT_POS, pos_regid, 0xf, l.max_loc);
+   if (VALIDREG(psize_regid)) {
+      psize_loc = l.max_loc;
+      ir3_link_add(&l, VARYING_SLOT_PSIZ, psize_regid, 0x1, l.max_loc);
+   }
+   if (l.clip0_loc == 0xff && VALIDREG(clip0_regid) &&
+       (clip_cull_mask & 0xf) != 0) {
+      l.clip0_loc = l.max_loc;
+      ir3_link_add(&l, VARYING_SLOT_CLIP_DIST0, clip0_regid,
+                   clip_cull_mask & 0xf, l.max_loc);
+   }
+   if (l.clip1_loc == 0xff && VALIDREG(clip1_regid) &&
+       (clip_cull_mask >> 4) != 0) {
+      l.clip1_loc = l.max_loc;
+      ir3_link_add(&l, VARYING_SLOT_CLIP_DIST1, clip1_regid,
+                   clip_cull_mask >> 4, l.max_loc);
+   }
+
+   /* HLSQ_xS_CONFIG: constant-object offset, shader-object offset, enable. */
+   ta5_pkt4(cmd, REG_A5XX_HLSQ_VS_CONFIG, 5);
+   ta5_cs_push(cmd, A5XX_HLSQ_VS_CONFIG_CONSTOBJECTOFFSET(vs_constoff) |
+                     A5XX_HLSQ_VS_CONFIG_SHADEROBJOFFSET(0) |
+                     A5XX_HLSQ_VS_CONFIG_ENABLED);
+   ta5_cs_push(cmd, A5XX_HLSQ_FS_CONFIG_CONSTOBJECTOFFSET(fs_constoff) |
+                     A5XX_HLSQ_FS_CONFIG_SHADEROBJOFFSET(fs_instroff) |
+                     A5XX_HLSQ_FS_CONFIG_ENABLED);
+   ta5_cs_push(cmd, 0x00000000);   /* HLSQ_HS_CONFIG */
+   ta5_cs_push(cmd, 0x00000000);   /* HLSQ_DS_CONFIG */
+   ta5_cs_push(cmd, 0x00000000);   /* HLSQ_GS_CONFIG */
+
+   ta5_pkt4(cmd, REG_A5XX_HLSQ_CS_CONFIG, 1);
+   ta5_cs_push(cmd, 0x00000000);
+
+   ta5_pkt4(cmd, REG_A5XX_HLSQ_VS_CNTL, 5);
+   ta5_cs_push(cmd, A5XX_HLSQ_VS_CNTL_INSTRLEN(vs_instrlen));
+   ta5_cs_push(cmd, A5XX_HLSQ_FS_CNTL_INSTRLEN(fs_instrlen));
+   ta5_cs_push(cmd, 0x00000000);   /* HLSQ_HS_CNTL */
+   ta5_cs_push(cmd, 0x00000000);   /* HLSQ_DS_CNTL */
+   ta5_cs_push(cmd, 0x00000000);   /* HLSQ_GS_CNTL */
+
+   ta5_pkt4(cmd, REG_A5XX_SP_VS_CONFIG, 5);
+   ta5_cs_push(cmd, A5XX_SP_VS_CONFIG_CONSTOBJECTOFFSET(vs_constoff) |
+                     A5XX_SP_VS_CONFIG_SHADEROBJOFFSET(0) |
+                     A5XX_SP_VS_CONFIG_ENABLED);
+   ta5_cs_push(cmd, A5XX_SP_FS_CONFIG_CONSTOBJECTOFFSET(fs_constoff) |
+                     A5XX_SP_FS_CONFIG_SHADEROBJOFFSET(fs_instroff) |
+                     A5XX_SP_FS_CONFIG_ENABLED);
+   ta5_cs_push(cmd, 0x00000000);   /* SP_HS_CONFIG */
+   ta5_cs_push(cmd, 0x00000000);   /* SP_DS_CONFIG */
+   ta5_cs_push(cmd, 0x00000000);   /* SP_GS_CONFIG */
+
+   ta5_pkt4(cmd, REG_A5XX_SP_CS_CONFIG, 1);
+   ta5_cs_push(cmd, 0x00000000);
+
+   /* HLSQ_xS_CONSTLEN / HLSQ_xS_INSTRLEN, per stage. */
+   ta5_pkt4(cmd, REG_A5XX_HLSQ_VS_CONSTLEN, 2);
+   ta5_cs_push(cmd, vs_constlen);
+   ta5_cs_push(cmd, vs_instrlen);
+
+   ta5_pkt4(cmd, REG_A5XX_HLSQ_FS_CONSTLEN, 2);
+   ta5_cs_push(cmd, fs_constlen);
+   ta5_cs_push(cmd, fs_instrlen);
+
+   ta5_pkt4(cmd, REG_A5XX_HLSQ_HS_CONSTLEN, 2);
+   ta5_cs_push(cmd, 0x00000000);
+   ta5_cs_push(cmd, 0x00000000);
+
+   ta5_pkt4(cmd, REG_A5XX_HLSQ_DS_CONSTLEN, 2);
+   ta5_cs_push(cmd, 0x00000000);
+   ta5_cs_push(cmd, 0x00000000);
+
+   ta5_pkt4(cmd, REG_A5XX_HLSQ_GS_CONSTLEN, 2);
+   ta5_cs_push(cmd, 0x00000000);
+   ta5_cs_push(cmd, 0x00000000);
+
+   ta5_pkt4(cmd, REG_A5XX_HLSQ_CS_CONSTLEN, 2);
+   ta5_cs_push(cmd, 0x00000000);
+   ta5_cs_push(cmd, 0x00000000);
+
+   ta5_pkt4(cmd, REG_A5XX_SP_VS_CTRL_REG0, 1);
+   ta5_cs_push(cmd,
+               A5XX_SP_VS_CTRL_REG0_HALFREGFOOTPRINT(vs->info.max_half_reg + 1) |
+                  A5XX_SP_VS_CTRL_REG0_FULLREGFOOTPRINT(vs->info.max_reg + 1) |
+                  A5XX_SP_VS_CTRL_REG0_BUFFER | 0x2 |
+                  A5XX_SP_VS_CTRL_REG0_BRANCHSTACK(
+                     ir3_shader_branchstack_hw(vs)));
+
+   ta5_pkt4(cmd, REG_A5XX_SP_FS_CTRL_REG0, 1);
+   ta5_cs_push(cmd,
+               (fs->total_in > 0 ? A5XX_SP_FS_CTRL_REG0_VARYING : 0) |
+                  0x40002 /* XXX set pretty much everywhere */ |
+                  A5XX_SP_FS_CTRL_REG0_BUFFER |
+                  A5XX_SP_FS_CTRL_REG0_THREADSIZE(fssz) |
+                  A5XX_SP_FS_CTRL_REG0_HALFREGFOOTPRINT(
+                     fs->info.max_half_reg + 1) |
+                  A5XX_SP_FS_CTRL_REG0_FULLREGFOOTPRINT(fs->info.max_reg + 1) |
+                  A5XX_SP_FS_CTRL_REG0_BRANCHSTACK(
+                     ir3_shader_branchstack_hw(fs)));
+
+   ta5_pkt4(cmd, REG_A5XX_HLSQ_CONTROL_0_REG, 5);
+   ta5_cs_push(cmd, A5XX_HLSQ_CONTROL_0_REG_FSTHREADSIZE(fssz) |
+                     A5XX_HLSQ_CONTROL_0_REG_CSTHREADSIZE(TWO_QUADS) |
+                     0x00000880 /* XXX HLSQ_CONTROL_0 */);
+   ta5_cs_push(cmd, A5XX_HLSQ_CONTROL_1_REG_PRIMALLOCTHRESHOLD(63));
+   ta5_cs_push(cmd, 0x00000000);   /* CONTROL_2: face/sample regids */
+   ta5_cs_push(cmd, 0x00000000);   /* CONTROL_3: ij regids */
+   ta5_cs_push(cmd, 0x00000000);   /* CONTROL_4: coord/sample regids */
+
+   ta5_pkt4(cmd, REG_A5XX_VPC_GS_SIV_CNTL, 1);
+   ta5_cs_push(cmd, 0x0000ffff);   /* XXX */
+
+   ta5_pkt4(cmd, REG_A5XX_SP_SP_CNTL, 1);
+   ta5_cs_push(cmd, 0x00000010);   /* XXX */
+
+   ta5_pkt4(cmd, REG_A5XX_GRAS_CNTL, 1);
+   ta5_cs_push(cmd, 0x00000000);
+
+   ta5_pkt4(cmd, REG_A5XX_RB_RENDER_CONTROL0, 2);
+   ta5_cs_push(cmd, 0x00000000);
+   ta5_cs_push(cmd, 0x00000000);
+
+   ta5_pkt4(cmd, REG_A5XX_SP_FS_OUTPUT_REG(0), 8);
+   for (int i = 0; i < 8; i++) {
+      ta5_cs_push(cmd, (i == 0 ? color_regid : 0) |
+                        (VALIDREG(color_regid) && (color_regid & HALF_REG_ID)
+                            ? A5XX_SP_FS_OUTPUT_REG_HALF_PRECISION
+                            : 0));
+   }
+
+   ta5_pkt4(cmd, REG_A5XX_VPC_PACK, 1);
+   ta5_cs_push(cmd, A5XX_VPC_PACK_NUMNONPOSVAR(pos_loc) |
+                     A5XX_VPC_PACK_PSIZELOC(VALIDREG(psize_regid) ? psize_loc
+                                                                  : 0xff));
+
+   ta5_pkt4(cmd, REG_A5XX_VPC_VAR_DISABLE(0), 4);
+   ta5_cs_push(cmd, ~l.varmask[0]);
+   ta5_cs_push(cmd, ~l.varmask[1]);
+   ta5_cs_push(cmd, ~l.varmask[2]);
+   ta5_cs_push(cmd, ~l.varmask[3]);
+
+   ta5_pkt4(cmd, REG_A5XX_VPC_VARYING_INTERP_MODE(0), 8);
+   for (int i = 0; i < 8; i++)
+      ta5_cs_push(cmd, 0x00000000);
+
+   ta5_pkt4(cmd, REG_A5XX_VPC_VARYING_PS_REPL_MODE(0), 8);
+   for (int i = 0; i < 8; i++)
+      ta5_cs_push(cmd, 0x00000000);
+
+   ta5_pkt4(cmd, REG_A5XX_GRAS_VS_CL_CNTL, 1);
+   ta5_cs_push(cmd, A5XX_GRAS_VS_CL_CNTL_CLIP_MASK(clip_mask) |
+                     A5XX_GRAS_VS_CL_CNTL_CULL_MASK(cull_mask));
+
+   ta5_pkt4(cmd, REG_A5XX_VPC_CLIP_CNTL, 1);
+   ta5_cs_push(cmd, A5XX_VPC_CLIP_CNTL_CLIP_MASK(clip_cull_mask) |
+                     A5XX_VPC_CLIP_CNTL_CLIP_DIST_03_LOC(l.clip0_loc) |
+                     A5XX_VPC_CLIP_CNTL_CLIP_DIST_47_LOC(l.clip1_loc));
+
+   ta5_pkt4(cmd, REG_A5XX_PC_CLIP_CNTL, 1);
+   ta5_cs_push(cmd, A5XX_PC_CLIP_CNTL_CLIP_MASK(clip_mask));
+
+   ta5_pkt4(cmd, REG_A5XX_PC_PRIM_VTX_CNTL, 1);
+   ta5_cs_push(cmd, VALIDREG(psize_regid) ? A5XX_PC_PRIM_VTX_CNTL_PSIZE : 0);
+
+   ta5_pkt4(cmd, REG_A5XX_SP_PRIMITIVE_CNTL, 1);
+   ta5_cs_push(cmd, A5XX_SP_PRIMITIVE_CNTL_VSOUT(l.max_loc));
+
+   ta5_pkt4(cmd, REG_A5XX_VPC_CNTL_0, 1);
+   ta5_cs_push(cmd, A5XX_VPC_CNTL_0_STRIDE_IN_VPC(l.max_loc) |
+                     (fs->total_in > 0 ? A5XX_VPC_CNTL_0_VARYING : 0) |
+                     0x10000 /* XXX */);
+
+   ta5_pkt4(cmd, REG_A5XX_VFD_CONTROL_1, 5);
+   ta5_cs_push(cmd, A5XX_VFD_CONTROL_1_REGID4VTX(vertex_regid) |
+                     A5XX_VFD_CONTROL_1_REGID4INST(instance_regid) | 0xfc0000);
+   ta5_cs_push(cmd, 0x0000fcfc);   /* VFD_CONTROL_2 */
+   ta5_cs_push(cmd, 0x0000fcfc);   /* VFD_CONTROL_3 */
+   ta5_cs_push(cmd, 0x000000fc);   /* VFD_CONTROL_4 */
+   ta5_cs_push(cmd, 0x00000000);   /* VFD_CONTROL_5 */
+
+   /*
+    * Pulse last: HLSQ latches the config words above when this is written.
+    * GL emits it mid-program, but nothing between there and the draw reads
+    * HLSQ state, so emitting it once here is equivalent.
+    */
+   ta5_pkt4(cmd, REG_A5XX_HLSQ_UPDATE_CNTL, 1);
+   ta5_cs_push(cmd, 0x020fffff);   /* XXX */
+}
+
+/**
  * Program SP_xS_OBJ_START, the descriptor HLSQ fetches the shader from.
  *
  * CP_LOAD_STATE4 only pushes the microcode into HLSQ's state block; the draw
@@ -880,10 +1125,13 @@ ta5_emit_draw_state(struct ta5_cmd_buffer *cmd)
    ta5_cs_push(cmd, 0x00000000);
    ta5_cs_push(cmd, 0x00000000);
 
-   /* Both POLYMODE_*_PTYPE fields are 0 for filled triangles, and
-    * POLYMODE_ENABLE stays clear; the field type has no generated enum. */
+   /* Both PTYPE fields select triangles for a filled primitive; PTYPE 0 is
+    * points, so a zero here quietly turns the triangle into three dots. */
    ta5_pkt4(cmd, REG_A5XX_PC_RASTER_CNTL, 1);
-   ta5_cs_push(cmd, 0x00000000);
+   ta5_cs_push(cmd, A5XX_PC_RASTER_CNTL_POLYMODE_FRONT_PTYPE(
+                      PC_DRAW_TRIANGLES) |
+                     A5XX_PC_RASTER_CNTL_POLYMODE_BACK_PTYPE(
+                        PC_DRAW_TRIANGLES));
 
    /* Depth range: Vulkan's default is 0..1 with clip_halfz off, which makes
     * the clamped range -1..1. */
@@ -1213,6 +1461,8 @@ ta5_CmdDraw(VkCommandBuffer _cmd, uint32_t vertexCount, uint32_t instanceCount,
                                                 / 2.0f));
    ta5_cs_push(cmd, A5XX_GRAS_CL_VPORT_ZOFFSET_0(0.0f));
    ta5_cs_push(cmd, A5XX_GRAS_CL_VPORT_ZSCALE_0(1.0f));
+
+   ta5_emit_program_state(cmd, pipe);
 
    if (ta5_emit_shader(cmd, pipe, &pipe->vertex, SB4_VS_SHADER,
                        REG_A5XX_SP_VS_OBJ_START, pipe->vs_offset) != VK_SUCCESS)

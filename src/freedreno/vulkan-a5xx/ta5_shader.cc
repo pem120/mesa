@@ -324,7 +324,16 @@ ta5_shader_compile(struct ta5_device *device, VkShaderStageFlagBits stage,
    memcpy(out->code, variant->bin, out->code_size * sizeof(uint32_t));
    out->constlen = variant->constlen;
 
-   ir3_shader_destroy(ir3_shader);
+   /*
+    * Hand the variant itself to the caller rather than destroying it here.
+    * ir3_link_shaders() and ir3_find_*_regid() run at record time, not
+    * compile time, and they read the variant.
+    */
+   out->variant = variant;
+   out->shader = ir3_shader;
+   out->nir_ctx = mem_ctx;
+   ir3_shader = NULL;
+   mem_ctx = NULL;
    ok = true;
 
 fail:
@@ -335,6 +344,16 @@ fail:
 void
 ta5_compiled_shader_free(struct ta5_compiled_shader *shader)
 {
+   if (getenv("TA5_TRACE_NULL"))
+      fprintf(stderr, "ta5[free]: shader=%p ir3=%p variant=%p code=%p\n",
+              (void *)shader, shader->shader, shader->variant,
+              (void *)shader->code);
+   if (shader->shader)
+      ir3_shader_destroy((struct ir3_shader *)shader->shader);
+   shader->shader = NULL;
+   shader->variant = NULL;
+   ralloc_free(shader->nir_ctx);
+   shader->nir_ctx = NULL;
    free(shader->code);
    shader->code = NULL;
    shader->code_size = 0;
