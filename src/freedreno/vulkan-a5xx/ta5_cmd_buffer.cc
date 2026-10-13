@@ -1420,11 +1420,19 @@ ta5_emit_clear(struct ta5_cmd_buffer *cmd, struct ta5_device *device,
    ta5_pkt4(cmd, REG_A5XX_RB_CLEAR_CNTL, 1);
    ta5_cs_push(cmd, A5XX_RB_CLEAR_CNTL_FAST_CLEAR | A5XX_RB_CLEAR_CNTL_MASK(0xf));
 
+   /*
+    * RB_CLEAR_COLOR_DW0..3 is one packed dword followed by three reserved
+    * ones, not four channel dwords.  The byte order is BGRA, which is only
+    * visible from GL's stream: its clear of rgba(0,0,0,1) lands as
+    * RB_CLEAR_COLOR_DW0 = 0xff000000, i.e. alpha in the high byte.  Writing
+    * the channels as separate dwords clears to (r,0,0,0) instead.
+    */
    ta5_pkt4(cmd, REG_A5XX_RB_CLEAR_COLOR_DW0, 4);
-   ta5_cs_push(cmd, color->u32[0]);
-   ta5_cs_push(cmd, color->u32[1]);
-   ta5_cs_push(cmd, color->u32[2]);
-   ta5_cs_push(cmd, color->u32[3]);
+   ta5_cs_push(cmd, (color->u32[3] << 24) | (color->u32[0] << 16) |
+                     (color->u32[1] << 8) | color->u32[2]);
+   ta5_cs_push(cmd, 0x00000000);
+   ta5_cs_push(cmd, 0x00000000);
+   ta5_cs_push(cmd, 0x00000000);
 
    if (device->blit_bo == NULL)
       return VK_ERROR_OUT_OF_DEVICE_MEMORY;
