@@ -105,10 +105,6 @@ struct ta5_device
     */
    struct ta5_bo *blit_bo;
 
-   /* Scratch object the CP_DRAW_INDX_OFFSET packet is staged in, so that the
-    * draw is reached through CP_INDIRECT_BUFFER the way fd5 reaches it. */
-   struct ta5_bo *draw_bo;
-
    /**
     * DRM syncobj sync type for this device.
     *
