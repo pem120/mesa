@@ -1236,7 +1236,23 @@ ta5_emit_restore(struct ta5_cmd_buffer *cmd)
       uint8_t count;
       uint32_t val[6];
    } restore[] = {
-      { REG_A5XX_HLSQ_UPDATE_CNTL, 1, { 0x000fffff } },
+      /*
+       * HLSQ_UPDATE_CNTL is deliberately absent.
+       *
+       * It used to lead the table as 0x000fffff, which no fd5 restore carries
+       * -- decoding GL's own stream (glsys.cs.0.bo5) shows exactly one write to
+       * this register, the 0x020fffff that fd5_program_emit() emits just
+       * before the program load.  Ours had two: 0x000fffff here and 0x020fffff
+       * in the program state.
+       *
+       * This register tells the HLSQ what changed so it knows what to re-fetch,
+       * so the extra write is not a harmless duplicate -- and it is the only
+       * register in the draw path that GL and this driver disagreed on before
+       * the vertex stage was found not to run at all.  If it is a sticky
+       * invalidate set, bits 0-19 survive the later 0x020fffff (which only adds
+       * bit 25) and the HLSQ never considers its state valid, which would
+       * explain a draw packet that the CP accepts and never dispatches.
+       */
       { REG_A5XX_PC_RESTART_INDEX, 1, { 0xffffffff } },
       { REG_A5XX_PC_RASTER_CNTL, 1, { 0x00000012 } },
       { REG_A5XX_GRAS_SU_POINT_MINMAX, 2,
