@@ -184,6 +184,19 @@ ta5_FreeCommandBuffers(VkDevice _device, VkCommandPool _commandPool,
       struct ta5_cmd_buffer *cmd =
          ta5_cmd_buffer_from_handle(pCommandBuffers[i]);
 
+      /*
+       * All three arrays are grown by vk_realloc during recording: cs by
+       * ta5_cmd_buffer_alloc_cs, relocs by ta5_cmd_buffer_grow_relocs and
+       * reloc_bos by ta5_cs_reloc.  Freeing only cs leaks the other two per
+       * command buffer, and relocs scales with how much the buffer recorded.
+       *
+       * device->vk.alloc, not pAllocator, because that is what all three were
+       * allocated with -- ta5_AllocateCommandBuffers likewise ignores the
+       * allocator from VkCommandBufferAllocateInfo, so there is nothing
+       * per-buffer to honour here.
+       */
+      vk_free(&cmd->device->vk.alloc, cmd->reloc_bos);
+      vk_free(&cmd->device->vk.alloc, cmd->relocs);
       vk_free(&cmd->device->vk.alloc, cmd->cs);
       vk_free(&cmd->device->vk.alloc, cmd);
    }
@@ -1946,6 +1959,73 @@ ta5_CmdEndRenderPass(VkCommandBuffer _cmd)
    cmd->bound_framebuffer = NULL;
 }
 
+/*
+ * vkCmdPipelineBarrier.
+ *
+ * This is a Vulkan 1.0 core command with no feature gating it, so its absence
+ * is not something the feature table can hide: without it every application
+ * that orders a copy against a draw gets an error from the loader's trampoline
+ * instead of a barrier, because the entrypoint is declared weak and the
+ * dispatch slot is NULL.
+ *
+ * The implementation is deliberately the blunt one: a full CP_WAIT_FOR_IDLE
+ * wherever a real dependency could exist.  That is always legal --
+ * over-synchronising is permitted, only under-synchronising is a bug -- and it
+ * is the only thing that is unambiguously correct without a CCU/ROP cache
+ * invalidation pass, which is what a real implementation would do instead for
+ * the shader-write-to-later-read cases this hardware needs it for.
+ *
+ * The two stage masks are ignored.  Narrowing them means reasoning about
+ * which stage each bit corresponds to on a5xx and which of those the CCU and
+ * the SP actually order against, and getting that wrong produces a stream that
+ * passes validation and corrupts a render.  One WFI cannot.
+ */
+VKAPI_ATTR void VKAPI_CALL
+ta5_CmdPipelineBarrier(VkCommandBuffer _cmd, VkPipelineStageFlags srcStageMask,
+                       VkPipelineStageFlags dstStageMask,
+                       VkDependencyFlags dependencyFlags,
+                       uint32_t memoryBarrierCount,
+                       const VkMemoryBarrier *pMemoryBarriers,
+                       uint32_t bufferMemoryBarrierCount,
+                       const VkBufferMemoryBarrier *pBufferMemoryBarriers,
+                       uint32_t imageMemoryBarrierCount,
+                       const VkImageMemoryBarrier *pImageMemoryBarriers)
+{
+   struct ta5_cmd_buffer *cmd = ta5_cmd_buffer_from_handle(_cmd);
+   VkResult ret;
+
+   /*
+    * The barrier ranges describe what the dependency is *for*; the stream
+    * does not change with them.  Read them so they cannot be optimised away,
+    * and so the unused-parameter warnings stay off.
+    */
+   (void)dependencyFlags;
+   (void)pMemoryBarriers;
+   (void)pBufferMemoryBarriers;
+   (void)pImageMemoryBarriers;
+   (void)memoryBarrierCount;
+   (void)bufferMemoryBarrierCount;
+   (void)imageMemoryBarrierCount;
+
+   if (cmd->state != MESA_VK_COMMAND_BUFFER_STATE_RECORDING)
+      return;
+
+   /*
+    * VK_PIPELINE_STAGE_NONE on either side means no dependency is being
+    * expressed and no work is required, which is the common case for the
+    * layout-transition barriers that surround a copy.
+    */
+   if (srcStageMask == VK_PIPELINE_STAGE_NONE ||
+       dstStageMask == VK_PIPELINE_STAGE_NONE)
+      return;
+
+   ret = ta5_cmd_buffer_alloc_cs(cmd, cmd->cs_count + 8);
+   if (ret != VK_SUCCESS)
+      return;
+
+   ta5_wfi(cmd);
+}
+
 VKAPI_ATTR void VKAPI_CALL
 ta5_CmdDraw(VkCommandBuffer _cmd, uint32_t vertexCount, uint32_t instanceCount,
             uint32_t firstVertex, uint32_t firstInstance)
@@ -2049,16 +2129,16 @@ ta5_CmdDraw(VkCommandBuffer _cmd, uint32_t vertexCount, uint32_t instanceCount,
       ta5_emit_consts(cmd, pipe, &pipe->fragment, SB4_FS_SHADER, pipe->fs_bo);
 
    /*
-    * CP_DRAW_INDX_OFFSET, no index buffer.  AUTO_INDEX synthesises vertex ids
-    * 0..count-1, which is exactly what gl_VertexIndex reads.  With no index
-    * buffer fd5 still programs INDEX_SIZE as 32-bit (fd5_draw.h:114) rather
-    * than leaving it at the 8-bit reset value.
-    */
-   /*
     * The prep enables LRZ and fd5 leaves it enabled across the draw, turning
     * it off only in the fini.  That has never been varied here, and LRZ gates
     * the depth path, so TA5_LRZ_OFF turns it off before the draw to see
     * whether it is what is swallowing the fragments.
+    *
+    * The fini disables LRZ only after an LRZ_FLUSH_INVALIDATE; this does not.
+    * That is sound here because ta5_emit_draw_state programs DEPTH5_NONE and
+    * RB_DEPTH_CNTL = 0, so the LRZ holds nothing to invalidate.  It would not
+    * be on a pipeline with a depth attachment, which is why this stays a probe
+    * and not a general "disable LRZ" path.
     */
    if (getenv("TA5_LRZ_OFF")) {
       ta5_pkt4(cmd, REG_A5XX_GRAS_LRZ_CNTL, 1);
@@ -2071,6 +2151,10 @@ ta5_CmdDraw(VkCommandBuffer _cmd, uint32_t vertexCount, uint32_t instanceCount,
     * buffer the draw is reached through.  TA5_DOUBLE_STATE repeats the
     * second emission immediately before the draw, to see whether the draw
     * needs the state re-armed that recently.
+    *
+    * ta5_emit_shader() is checked here for the same reason it is checked above:
+    * it can fail in ta5_cs_reloc(), and continuing past that would emit the
+    * draw packet against a half-loaded program.
     */
    if (getenv("TA5_DOUBLE_STATE")) {
       ret = ta5_cmd_buffer_alloc_cs(cmd, cmd->cs_count + 4096);
@@ -2078,16 +2162,27 @@ ta5_CmdDraw(VkCommandBuffer _cmd, uint32_t vertexCount, uint32_t instanceCount,
          return;
       ta5_emit_draw_state(cmd);
       ta5_emit_program_state(cmd, pipe);
-      ta5_emit_shader(cmd, pipe, &pipe->vertex, SB4_VS_SHADER,
-                      REG_A5XX_SP_VS_OBJ_START, pipe->vs_bo);
-      if (pipe->has_fragment)
-         ta5_emit_shader(cmd, pipe, &pipe->fragment, SB4_FS_SHADER,
-                         REG_A5XX_SP_FS_OBJ_START, pipe->fs_bo);
+      ret = ta5_emit_shader(cmd, pipe, &pipe->vertex, SB4_VS_SHADER,
+                            REG_A5XX_SP_VS_OBJ_START, pipe->vs_bo);
+      if (ret != VK_SUCCESS)
+         return;
+      if (pipe->has_fragment) {
+         ret = ta5_emit_shader(cmd, pipe, &pipe->fragment, SB4_FS_SHADER,
+                               REG_A5XX_SP_FS_OBJ_START, pipe->fs_bo);
+         if (ret != VK_SUCCESS)
+            return;
+      }
       ta5_emit_consts(cmd, pipe, &pipe->vertex, SB4_VS_SHADER, pipe->vs_bo);
       if (pipe->has_fragment)
          ta5_emit_consts(cmd, pipe, &pipe->fragment, SB4_FS_SHADER, pipe->fs_bo);
    }
 
+   /*
+    * CP_DRAW_INDX_OFFSET, no index buffer.  AUTO_INDEX synthesises vertex ids
+    * 0..count-1, which is exactly what gl_VertexIndex reads.  With no index
+    * buffer fd5 still programs INDEX_SIZE as 32-bit (fd5_draw.h:114) rather
+    * than leaving it at the 8-bit reset value.
+    */
    ta5_pkt7(cmd, CP_DRAW_INDX_OFFSET, 3);
    ta5_cs_push(cmd, CP_DRAW_INDX_OFFSET_0_PRIM_TYPE(DI_PT_TRILIST) |
                      CP_DRAW_INDX_OFFSET_0_SOURCE_SELECT(DI_SRC_SEL_AUTO_INDEX) |
