@@ -42,6 +42,7 @@
 #include "vk_alloc.h"
 #include "vk_device.h"
 #include "vk_physical_device.h"
+#include "vk_drm_syncobj.h"
 #include "vk_common_entrypoints.h"
 
 #include "ta5_instance.h"
@@ -132,6 +133,20 @@ ta5_CreateDevice(VkPhysicalDevice physicalDevice,
     * to happen after vk_device_init(), which memsets the device.
     */
    vk_device_set_drm_fd(&device->vk, device->fd);
+
+   /*
+    * Probe the DRM syncobj sync type once, here, rather than lazily on first
+    * fence.  Fence and semaphore creation may race across threads, and a
+    * check-then-set on a process-global `struct vk_sync_type` lets one thread
+    * publish the pointer before the struct stores are visible -- a table of
+    * function pointers read half-initialised.  Doing it per device also stops
+    * the first device's probed feature bits being reused for every later
+    * device in the process.
+    *
+    * This has to be after vk_device_set_drm_fd(), which is what
+    * vk_drm_syncobj_init() needs.
+    */
+   device->sync_type = vk_drm_syncobj_get_type(device->fd);
 
    /*
     * Bring up the IR3 compiler.  a5xx is generation 5, so IR3 picks its

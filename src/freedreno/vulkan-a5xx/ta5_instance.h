@@ -30,6 +30,7 @@
 #include "vk_object.h"
 #include "vk_device.h"
 #include "vk_physical_device.h"
+#include "vk_sync.h"
 
 #include "ta5_device.h"
 
@@ -108,6 +109,19 @@ struct ta5_device
     * draw is reached through CP_INDIRECT_BUFFER the way fd5 reaches it. */
    struct ta5_bo *draw_bo;
 
+   /**
+    * DRM syncobj sync type for this device.
+    *
+    * Probed once at device create rather than lazily on first fence: a
+    * process-global lazy init has two problems this avoids.  Fence and
+    * semaphore creation may race across threads, and a plain `if (!ptr)`
+    * check-then-set on a global `struct vk_sync_type` lets one thread publish
+    * the pointer before the struct stores are visible -- a table of function
+    * pointers read half-initialised.  And the probed feature bits come from
+    * one fd, so a global reuses the first device's answer for every later
+    * device in the process.
+    */
+   struct vk_sync_type sync_type;
 };
 VK_DEFINE_HANDLE_CASTS(ta5_device, vk.base, VkDevice, VK_OBJECT_TYPE_DEVICE)
 

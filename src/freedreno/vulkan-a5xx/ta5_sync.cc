@@ -51,13 +51,15 @@
 /* ------------------------------------------------------------------ */
 
 /*
- * DRM syncobj sync type for this device.  a5xx on mainline msm does not use
- * userspace-managed VM binding (freedreno never sets MSM_PARAM_EN_VM_BIND), so
- * the kernel hands back a fence FD from every submission and syncobj is the
- * only thing that can wait on it.
+ * DRM syncobj sync type.  a5xx on mainline msm does not use userspace-managed
+ * VM binding (freedreno never sets MSM_PARAM_EN_VM_BIND), so the kernel hands
+ * back a fence FD from every submission and syncobj is the only thing that can
+ * wait on it.
+ *
+ * The type itself lives on ta5_device and is probed once in ta5_CreateDevice
+ * -- see the note on ta5_device::sync_type for why it is not a lazily
+ * initialised global.
  */
-static struct vk_sync_type ta5_syncobj_type_storage;
-static const struct vk_sync_type *ta5_syncobj_type;
 
 VKAPI_ATTR VkResult VKAPI_CALL
 ta5_CreateFence(VkDevice _device, const VkFenceCreateInfo *pCreateInfo,
@@ -78,18 +80,13 @@ ta5_CreateFence(VkDevice _device, const VkFenceCreateInfo *pCreateInfo,
    vk_object_base_init(&device->vk, &fence->base, VK_OBJECT_TYPE_FENCE);
    fence->device = device;
 
-   if (!ta5_syncobj_type) {
-      ta5_syncobj_type_storage = vk_drm_syncobj_get_type(device->fd);
-      ta5_syncobj_type = &ta5_syncobj_type_storage;
-   }
-
    /*
     * DRM syncobj is used because the msm kernel hands back a fence FD from
     * every submission, and syncobj is the only sync type the driver supports
     * for that.  A created-with-signaled fence starts at value 1, otherwise
     * at 0.
     */
-   result = vk_sync_create(&device->vk, ta5_syncobj_type,
+   result = vk_sync_create(&device->vk, &device->sync_type,
                            (enum vk_sync_flags)0, 0, &fence->sync);
    if (result != VK_SUCCESS) {
       vk_free(pAllocator, fence);
