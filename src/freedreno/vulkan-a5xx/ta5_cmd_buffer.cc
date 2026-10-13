@@ -1527,7 +1527,10 @@ ta5_emit_draw_state(struct ta5_cmd_buffer *cmd)
    for (int i = 0; i < 8; i++) {
       ta5_pkt4(cmd, REG_A5XX_RB_MRT_CONTROL(i), 1);
       ta5_cs_push(cmd, A5XX_RB_MRT_CONTROL_ROP_CODE(ROP_COPY) |
-                        A5XX_RB_MRT_CONTROL_COMPONENT_ENABLE(0xf));
+                        A5XX_RB_MRT_CONTROL_COMPONENT_ENABLE(0xf) |
+                        (getenv("TA5_ROP_ENABLE")
+                             ? A5XX_RB_MRT_CONTROL_ROP_ENABLE
+                             : 0));
 
       ta5_pkt4(cmd, REG_A5XX_RB_MRT_BLEND_CONTROL(i), 1);
       ta5_cs_push(cmd, 0x00000000);
@@ -2051,6 +2054,40 @@ ta5_CmdDraw(VkCommandBuffer _cmd, uint32_t vertexCount, uint32_t instanceCount,
     * buffer fd5 still programs INDEX_SIZE as 32-bit (fd5_draw.h:114) rather
     * than leaving it at the 8-bit reset value.
     */
+   /*
+    * The prep enables LRZ and fd5 leaves it enabled across the draw, turning
+    * it off only in the fini.  That has never been varied here, and LRZ gates
+    * the depth path, so TA5_LRZ_OFF turns it off before the draw to see
+    * whether it is what is swallowing the fragments.
+    */
+   if (getenv("TA5_LRZ_OFF")) {
+      ta5_pkt4(cmd, REG_A5XX_GRAS_LRZ_CNTL, 1);
+      ta5_cs_push(cmd, 0x00000000);
+   }
+
+   /*
+    * GL's sysmem pass emits the draw state, the program state and both
+    * shader loads twice: once in the top-level stream and again inside the
+    * buffer the draw is reached through.  TA5_DOUBLE_STATE repeats the
+    * second emission immediately before the draw, to see whether the draw
+    * needs the state re-armed that recently.
+    */
+   if (getenv("TA5_DOUBLE_STATE")) {
+      ret = ta5_cmd_buffer_alloc_cs(cmd, cmd->cs_count + 4096);
+      if (ret != VK_SUCCESS)
+         return;
+      ta5_emit_draw_state(cmd);
+      ta5_emit_program_state(cmd, pipe);
+      ta5_emit_shader(cmd, pipe, &pipe->vertex, SB4_VS_SHADER,
+                      REG_A5XX_SP_VS_OBJ_START, pipe->vs_bo);
+      if (pipe->has_fragment)
+         ta5_emit_shader(cmd, pipe, &pipe->fragment, SB4_FS_SHADER,
+                         REG_A5XX_SP_FS_OBJ_START, pipe->fs_bo);
+      ta5_emit_consts(cmd, pipe, &pipe->vertex, SB4_VS_SHADER, pipe->vs_bo);
+      if (pipe->has_fragment)
+         ta5_emit_consts(cmd, pipe, &pipe->fragment, SB4_FS_SHADER, pipe->fs_bo);
+   }
+
    ta5_pkt7(cmd, CP_DRAW_INDX_OFFSET, 3);
    ta5_cs_push(cmd, CP_DRAW_INDX_OFFSET_0_PRIM_TYPE(DI_PT_TRILIST) |
                      CP_DRAW_INDX_OFFSET_0_SOURCE_SELECT(DI_SRC_SEL_AUTO_INDEX) |
