@@ -75,6 +75,25 @@ struct ta5_reloc
    int32_t shift;       /**< kernel right-shifts the address by -shift */
 };
 
+/**
+ * A relocatable second-level command buffer.
+ *
+ * The MSM submit UAPI supports MSM_SUBMIT_CMD_IB_TARGET_BUF: the kernel
+ * relocates these BOs normally, but does not add them to the first-level ring.
+ * CP_INDIRECT_BUFFER in the main stream enters the target after all relocations
+ * have been applied.  fd5 uses this for its per-draw state and shader loads.
+ */
+struct ta5_ib
+{
+   struct ta5_bo *bo;
+   uint32_t size; /**< command buffer size in dwords */
+
+   struct ta5_reloc *relocs;
+   uint32_t reloc_count;
+   struct ta5_bo **reloc_bos;
+   uint32_t reloc_bo_count;
+};
+
 struct ta5_cmd_buffer
 {
    struct vk_object_base base;
@@ -104,6 +123,11 @@ struct ta5_cmd_buffer
    /** BOs referenced, so they can be listed in the submit ioctl. */
    struct ta5_bo **reloc_bos;
    uint32_t reloc_bo_count;
+
+   /** Second-level draw/state command buffers, submitted as IB targets. */
+   struct ta5_ib *ibs;
+   uint32_t ib_count;
+   uint32_t ib_size;
 
    /** Bound state at the point of recording. */
    struct ta5_pipeline *bound_pipeline;

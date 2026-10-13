@@ -48,6 +48,7 @@
 #include "ta5_device.h"
 #include "ta5_sync.h"
 #include "ta5_cmd_buffer.h"
+#include "ta5_submit.h"
 #include "ta5_entrypoints.h"
 
 /** Initial command stream capacity, in 32-bit words. */
@@ -139,6 +140,81 @@ ta5_cmd_buffer_alloc_cs(struct ta5_cmd_buffer *cmd, uint32_t words)
    return VK_SUCCESS;
 }
 
+static void
+ta5_cmd_buffer_clear_ibs(struct ta5_cmd_buffer *cmd)
+{
+   for (uint32_t i = 0; i < cmd->ib_count; i++) {
+      struct ta5_ib *ib = &cmd->ibs[i];
+
+      ta5_bo_unref(ib->bo);
+      vk_free(&cmd->device->vk.alloc, ib->relocs);
+      vk_free(&cmd->device->vk.alloc, ib->reloc_bos);
+      memset(ib, 0, sizeof(*ib));
+   }
+
+   cmd->ib_count = 0;
+}
+
+/**
+ * Stage a recorded command stream as a relocatable MSM IB target.
+ *
+ * The caller owns src's CPU stream and reloc arrays.  On success the BO and
+ * reloc arrays move into cmd->ibs; on failure src remains untouched.
+ */
+static VkResult
+ta5_cmd_buffer_add_ib(struct ta5_cmd_buffer *cmd,
+                      struct ta5_cmd_buffer *src)
+{
+   struct ta5_bo *bo;
+   struct ta5_ib *ibs;
+   uint32_t bytes = src->cs_count * sizeof(uint32_t);
+   uint32_t bo_size = align(bytes, 4096);
+   void *map;
+
+   if (cmd->ib_count == cmd->ib_size) {
+      uint32_t new_size = cmd->ib_size ? cmd->ib_size * 2 : 2;
+      ibs = (struct ta5_ib *)vk_realloc(&cmd->device->vk.alloc, cmd->ibs,
+                                         new_size * sizeof(*ibs), 8,
+                                         VK_SYSTEM_ALLOCATION_SCOPE_OBJECT);
+      if (!ibs)
+         return vk_error(&cmd->device->instance->vk,
+                         VK_ERROR_OUT_OF_HOST_MEMORY);
+      cmd->ibs = ibs;
+      cmd->ib_size = new_size;
+   }
+
+   bo = ta5_bo_alloc(cmd->device, bo_size, MSM_BO_WC);
+   if (!bo)
+      return vk_error(&cmd->device->instance->vk,
+                      VK_ERROR_OUT_OF_DEVICE_MEMORY);
+
+   map = ta5_bo_map(bo);
+   if (!map) {
+      ta5_bo_unref(bo);
+      return vk_error(&cmd->device->instance->vk,
+                      VK_ERROR_MEMORY_MAP_FAILED);
+   }
+
+   memcpy(map, src->cs, bytes);
+   __sync_synchronize();
+
+   struct ta5_ib *ib = &cmd->ibs[cmd->ib_count++];
+   memset(ib, 0, sizeof(*ib));
+   ib->bo = bo;
+   ib->size = src->cs_count;
+   ib->relocs = src->relocs;
+   ib->reloc_count = src->reloc_count;
+   ib->reloc_bos = src->reloc_bos;
+   ib->reloc_bo_count = src->reloc_bo_count;
+
+   src->relocs = NULL;
+   src->reloc_count = src->reloc_size = 0;
+   src->reloc_bos = NULL;
+   src->reloc_bo_count = 0;
+
+   return VK_SUCCESS;
+}
+
 VKAPI_ATTR VkResult VKAPI_CALL
 ta5_AllocateCommandBuffers(
    VkDevice _device, const VkCommandBufferAllocateInfo *pAllocateInfo,
@@ -198,6 +274,8 @@ ta5_FreeCommandBuffers(VkDevice _device, VkCommandPool _commandPool,
       vk_free(&cmd->device->vk.alloc, cmd->reloc_bos);
       vk_free(&cmd->device->vk.alloc, cmd->relocs);
       vk_free(&cmd->device->vk.alloc, cmd->cs);
+      ta5_cmd_buffer_clear_ibs(cmd);
+      vk_free(&cmd->device->vk.alloc, cmd->ibs);
       vk_free(&cmd->device->vk.alloc, cmd);
    }
 }
@@ -217,6 +295,7 @@ ta5_BeginCommandBuffer(VkCommandBuffer _cmd,
    cmd->cs_count = 0;
    cmd->reloc_count = 0;
    cmd->reloc_bo_count = 0;
+   ta5_cmd_buffer_clear_ibs(cmd);
    cmd->submitted = 0;
    cmd->fence = NULL;
    cmd->state = MESA_VK_COMMAND_BUFFER_STATE_RECORDING;
@@ -268,6 +347,7 @@ ta5_ResetCommandBuffer(VkCommandBuffer _cmd, VkCommandBufferResetFlags flags)
     */
    cmd->reloc_count = 0;
    cmd->reloc_bo_count = 0;
+   ta5_cmd_buffer_clear_ibs(cmd);
    cmd->submitted = 0;
    cmd->fence = NULL;
    cmd->state = MESA_VK_COMMAND_BUFFER_STATE_INITIAL;
@@ -288,7 +368,6 @@ ta5_ResetCommandBuffer(VkCommandBuffer _cmd, VkCommandBufferResetFlags flags)
 #include "ta5_render.h"
 #include "ta5_pipeline.h"
 #include "ta5_descriptor.h"
-#include "ta5_submit.h"
 #include "ta5_memory.h"
 #include "util/format/format_utils.h"
 
@@ -501,36 +580,28 @@ ta5_next_regid(uint32_t reg, uint32_t increment)
  *
  * Measured on this driver's own shaders: the vertex stage reports sizedwords
  * 64 with instrlen 2, the fragment stage sizedwords 32 with instrlen 1.  So
- * sizedwords == instrlen * 32, and the divisor below is 16 -- twice the true
- * value, counting instructions as though they were dwords.
+ * sizedwords == instrlen * 32 exactly.  fd5_program.c passes v->instrlen
+ * directly to CP_LOAD_STATE4_0_NUM_UNIT, so for IR3 variants the equivalent
+ * size-derived expression is sizedwords / 32, not / 16.
  *
- * That is known-wrong arithmetic, and it is being kept deliberately because
- * the two configurations were measured on the device and the wrong one is the
- * one that works:
- *
- *   divisor 16 (VS 4 units, FS 2 units)   0 faults, every run
- *   divisor 32 (VS 2 units, FS 1 unit)    2 faults, every run
- *   TA5_SHADER_UNITS=2 on both stages     0 faults, every run
- *
- * The third line isolates it: divisor 32 differs from units=2 only in the
- * fragment stage, so FS NUM_UNIT=1 is what faults.  Our FS is exactly 32
- * dwords -- precisely one unit, with no second unit behind it for the fetch to
- * land in.  GL's own stream does load its FS program with NUM_UNIT=1 and works
- * (glsys.cs.0.bo5 [178]), so 1 is a length GL genuinely uses, but GL's shader
- * is a different one and that is not a like-for-like comparison.
- *
- * Neither configuration renders the triangle, so this is not that bug.  It is
- * left alone because a deterministic fault is the worse outcome while the
- * reason is unknown.  The divisor becomes 32 once it is clear why a one-unit
- * fragment load faults.
+ * The old /16 calculation loaded twice the program -- VS 4 units instead of
+ * 2, FS 2 instead of 1.  A previous sweep found unmapped reads with the smaller
+ * values while the draw state and draw packet lived in different command
+ * buffers.  With the complete draw state now in an IB_TARGET_BUF, the
+ * stage-specific VS=2/FS=1 values make the VS execute (confirmed with the
+ * long-loop hangcheck probe), and match the GL program-load convention.
  */
 static uint32_t
 ta5_shader_units(const struct ta5_compiled_shader *shader)
 {
    const struct ir3_shader_variant *v =
       (const struct ir3_shader_variant *)shader->variant;
-   uint32_t units = MAX2(shader->instrlen, DIV_ROUND_UP(v->info.sizedwords, 16));
-   const char *ov = getenv("TA5_SHADER_UNITS");
+   uint32_t units = MAX2(shader->instrlen, DIV_ROUND_UP(v->info.sizedwords, 32));
+   const char *ov = getenv(v->type == MESA_SHADER_VERTEX ? "TA5_VS_UNITS"
+                                                          : "TA5_FS_UNITS");
+
+   if (!ov)
+      ov = getenv("TA5_SHADER_UNITS");
 
    if (ov) {
       uint32_t o = (uint32_t)atoi(ov);
@@ -887,8 +958,14 @@ ta5_emit_program_state(struct ta5_cmd_buffer *cmd, struct ta5_pipeline *pipe)
    ta5_cs_push(cmd, A5XX_PC_PRIMITIVE_CNTL_STRIDE_IN_VPC(l.max_loc) |
                      A5XX_PC_PRIMITIVE_CNTL_PROVOKING_VTX_LAST);
 
-   ta5_pkt4(cmd, REG_A5XX_VFD_CONTROL_0, 1);
-   ta5_cs_push(cmd, 0x00000000);
+   /*
+    * VFD_CONTROL_0.VTXCNT belongs to the vertex-fetch program, not to the draw
+    * state: GL emits it last in fd5_emit_vertex_bufs() as the number of fetch
+    * instructions it just programmed (fd5_emit.c:501) and never clears it.
+    * Zeroing it here instead leaves the VFD fetching nothing, every vertex
+    * attribute reads as zero, and all the vertices land on (0,0,0,1) -- a
+    * zero-area triangle that rasterises no fragments and raises no fault.
+    */
 
    ta5_pkt4(cmd, REG_A5XX_VFD_INDEX_OFFSET, 2);
    ta5_cs_push(cmd, 0x00000000);
@@ -1536,6 +1613,17 @@ ta5_emit_draw_state(struct ta5_cmd_buffer *cmd)
    ta5_pkt4(cmd, REG_A5XX_GRAS_CL_CNTL, 1);
    ta5_cs_push(cmd, 0x00000000);
 
+   /*
+    * Low-resolution Z.  GL leaves LRZ off for the whole draw
+    * (fd5_draw.c:179), and enabling it without an LRZ clear discards every
+    * fragment before the shader sees it.  There is no depth attachment here
+    * for the fast path to depend on, so this is unconditional and matches the
+    * GL stream; a pipeline that does have depth/stencil state to preserve has
+    * to restore LRZ_CNTL from it instead (see fd5_zsa.c:32).
+    */
+   ta5_pkt4(cmd, REG_A5XX_GRAS_LRZ_CNTL, 1);
+   ta5_cs_push(cmd, 0x00000000);
+
    ta5_pkt4(cmd, REG_A5XX_RB_ALPHA_CONTROL, 1);
    ta5_cs_push(cmd, 0x00000000);
 
@@ -1663,10 +1751,11 @@ ta5_emit_draw_state(struct ta5_cmd_buffer *cmd)
    /* Both PTYPE fields select triangles for a filled primitive; PTYPE 0 is
     * points, so a zero here quietly turns the triangle into three dots. */
    ta5_pkt4(cmd, REG_A5XX_PC_RASTER_CNTL, 1);
-   ta5_cs_push(cmd, A5XX_PC_RASTER_CNTL_POLYMODE_FRONT_PTYPE(
-                      PC_DRAW_TRIANGLES) |
-                     A5XX_PC_RASTER_CNTL_POLYMODE_BACK_PTYPE(
-                        PC_DRAW_TRIANGLES));
+   enum adreno_pa_su_sc_draw probe_ptype = getenv("TA5_POINTS")
+                                               ? PC_DRAW_POINTS
+                                               : PC_DRAW_TRIANGLES;
+   ta5_cs_push(cmd, A5XX_PC_RASTER_CNTL_POLYMODE_FRONT_PTYPE(probe_ptype) |
+                      A5XX_PC_RASTER_CNTL_POLYMODE_BACK_PTYPE(probe_ptype));
 
    /* Depth range: Vulkan's default is 0..1 with clip_halfz off, which makes
     * the clamped range -1..1. */
@@ -2099,6 +2188,9 @@ ta5_CmdDraw(VkCommandBuffer _cmd, uint32_t vertexCount, uint32_t instanceCount,
 {
    struct ta5_cmd_buffer *cmd = ta5_cmd_buffer_from_handle(_cmd);
    struct ta5_pipeline *pipe = cmd->bound_pipeline;
+   struct ta5_cmd_buffer ib_cmd;
+   struct ta5_cmd_buffer *draw = cmd;
+   bool use_ib = !getenv("TA5_NO_INDIRECT_DRAW");
    VkResult ret;
 
    /*
@@ -2115,7 +2207,7 @@ ta5_CmdDraw(VkCommandBuffer _cmd, uint32_t vertexCount, uint32_t instanceCount,
    if (getenv("TA5_SKIP_DRAW"))
       return;
 
-   ret = ta5_cmd_buffer_alloc_cs(cmd, cmd->cs_count + 8192);
+   ret = ta5_cmd_buffer_alloc_cs(cmd, cmd->cs_count + (use_ib ? 4096 : 8192));
    if (ret != VK_SUCCESS)
       return;
 
@@ -2131,7 +2223,35 @@ ta5_CmdDraw(VkCommandBuffer _cmd, uint32_t vertexCount, uint32_t instanceCount,
       probe.u32[1] = 0x00;
       probe.u32[2] = 0xff;
       probe.u32[3] = 0xff;
-      ta5_emit_clear(cmd, cmd->device, &probe);
+       ret = ta5_emit_clear(cmd, cmd->device, &probe);
+       if (ret != VK_SUCCESS)
+          return;
+   }
+
+   if (use_ib) {
+      /*
+       * fd5 submits the draw state and the draw itself as an
+       * MSM_SUBMIT_CMD_IB_TARGET_BUF.  Build that stream independently so its
+       * relocations can be attached to the IB-target command in the submit
+       * ioctl; the outer stream keeps the clear/prep and a relocated
+       * CP_INDIRECT_BUFFER that enters it.
+       */
+      ib_cmd = *cmd;
+      ib_cmd.cs = NULL;
+      ib_cmd.cs_size = 0;
+      ib_cmd.cs_count = 0;
+      ib_cmd.relocs = NULL;
+      ib_cmd.reloc_size = 0;
+      ib_cmd.reloc_count = 0;
+      ib_cmd.reloc_bos = NULL;
+      ib_cmd.reloc_bo_count = 0;
+      draw = &ib_cmd;
+
+      ret = ta5_cmd_buffer_alloc_cs(draw, 8192);
+      if (ret != VK_SUCCESS) {
+         vk_free(&cmd->device->vk.alloc, draw->cs);
+         return;
+      }
    }
 
    /*
@@ -2145,16 +2265,16 @@ ta5_CmdDraw(VkCommandBuffer _cmd, uint32_t vertexCount, uint32_t instanceCount,
       uint32_t w = cmd->bound_framebuffer->width;
       uint32_t h = cmd->bound_framebuffer->height;
 
-      ta5_pkt4(cmd, REG_A5XX_GRAS_SC_SCREEN_SCISSOR_TL_0, 2);
-      ta5_cs_push(cmd, A5XX_GRAS_SC_SCREEN_SCISSOR_TL_0_X(0) |
+      ta5_pkt4(draw, REG_A5XX_GRAS_SC_SCREEN_SCISSOR_TL_0, 2);
+      ta5_cs_push(draw, A5XX_GRAS_SC_SCREEN_SCISSOR_TL_0_X(0) |
                         A5XX_GRAS_SC_SCREEN_SCISSOR_TL_0_Y(0));
-      ta5_cs_push(cmd, A5XX_GRAS_SC_SCREEN_SCISSOR_BR_0_X(w - 1) |
+      ta5_cs_push(draw, A5XX_GRAS_SC_SCREEN_SCISSOR_BR_0_X(w - 1) |
                         A5XX_GRAS_SC_SCREEN_SCISSOR_BR_0_Y(h - 1));
 
-      ta5_pkt4(cmd, REG_A5XX_GRAS_SC_VIEWPORT_SCISSOR_TL_0, 2);
-      ta5_cs_push(cmd, A5XX_GRAS_SC_VIEWPORT_SCISSOR_TL_0_X(0) |
+      ta5_pkt4(draw, REG_A5XX_GRAS_SC_VIEWPORT_SCISSOR_TL_0, 2);
+      ta5_cs_push(draw, A5XX_GRAS_SC_VIEWPORT_SCISSOR_TL_0_X(0) |
                         A5XX_GRAS_SC_VIEWPORT_SCISSOR_TL_0_Y(0));
-      ta5_cs_push(cmd, A5XX_GRAS_SC_VIEWPORT_SCISSOR_BR_0_X(w - 1) |
+      ta5_cs_push(draw, A5XX_GRAS_SC_VIEWPORT_SCISSOR_BR_0_X(w - 1) |
                         A5XX_GRAS_SC_VIEWPORT_SCISSOR_BR_0_Y(h - 1));
    }
 
@@ -2179,54 +2299,73 @@ ta5_CmdDraw(VkCommandBuffer _cmd, uint32_t vertexCount, uint32_t instanceCount,
       VkDeviceSize off = cmd->bound_vb_offset;
       VkDeviceSize size = cmd->bound_vb->size - off;
 
-      /* Location 0, and not a system value -- that is the vertex attribute. */
-      for (unsigned j = 0; j < vs->inputs_count; j++)
-         if (!vs->inputs[j].sysval && vs->inputs[j].slot == 0)
+      /*
+       * Vertex attribute locations use VERT_ATTRIB_GENERIC0 as their base in
+       * IR3's input table (location 0 was observed as slot 15), unlike
+       * fragment varying slots which start at VARYING_SLOT_VAR0.  System
+       * values are kept in the same table but have sysval set and must not be
+       * wired to a fetch slot.
+       */
+      for (unsigned j = 0; j < vs->inputs_count; j++) {
+         if (getenv("TA5_TRACE_NULL"))
+            fprintf(stderr, "ta5[vfd]: input %u slot=%u sysval=%u regid=%u\n",
+                    j, vs->inputs[j].slot, vs->inputs[j].sysval,
+                    vs->inputs[j].regid);
+         if (!vs->inputs[j].sysval &&
+             vs->inputs[j].slot == VERT_ATTRIB_GENERIC0)
             vregid = vs->inputs[j].regid;
+      }
+
+      if (getenv("TA5_TRACE_NULL"))
+         fprintf(stderr, "ta5[vfd]: uses_vb=%u bound=%p off=%llu size=%llu regid=%u\n",
+                 pipe->uses_vertex_buffers, (void *)cmd->bound_vb,
+                 (unsigned long long)off, (unsigned long long)size, vregid);
 
       if (vregid != regid(63, 0) && size >= 8) {
-         ret = ta5_cmd_buffer_alloc_cs(cmd, cmd->cs_count + 64);
+         ret = ta5_cmd_buffer_alloc_cs(draw, draw->cs_count + 64);
          if (ret != VK_SUCCESS)
-            return;
+            goto draw_error;
 
-         ta5_pkt4(cmd, REG_A5XX_VFD_FETCH(0), 4);
-         ret = ta5_cs_reloc(cmd, bo, off, 0);
+         ta5_pkt4(draw, REG_A5XX_VFD_FETCH(0), 4);
+         ret = ta5_cs_reloc(draw, bo, off, 0);
          if (ret != VK_SUCCESS)
-            return;
-         ta5_cs_push(cmd, (uint32_t)size); /* VFD_FETCH[0].SIZE */
-         ta5_cs_push(cmd, 8);              /* VFD_FETCH[0].STRIDE */
+            goto draw_error;
+         ta5_cs_push(draw, (uint32_t)size); /* VFD_FETCH[0].SIZE */
+         ta5_cs_push(draw, 8);              /* VFD_FETCH[0].STRIDE */
 
-         ta5_pkt4(cmd, REG_A5XX_VFD_DECODE(0), 2);
-         ta5_cs_push(cmd, A5XX_VFD_DECODE_INSTR_IDX(0) |
+         ta5_pkt4(draw, REG_A5XX_VFD_DECODE(0), 2);
+         ta5_cs_push(draw, A5XX_VFD_DECODE_INSTR_IDX(0) |
                               A5XX_VFD_DECODE_INSTR_FORMAT(
                                  VFMT5_32_32_FLOAT) |
                               A5XX_VFD_DECODE_INSTR_UNK30 |
                               A5XX_VFD_DECODE_INSTR_FLOAT);
-         ta5_cs_push(cmd, 1); /* VFD_DECODE[0].STEP_RATE */
+         ta5_cs_push(draw, 1); /* VFD_DECODE[0].STEP_RATE */
 
-         ta5_pkt4(cmd, REG_A5XX_VFD_DEST_CNTL(0), 1);
-         ta5_cs_push(cmd,
+         ta5_pkt4(draw, REG_A5XX_VFD_DEST_CNTL(0), 1);
+         ta5_cs_push(draw,
                      A5XX_VFD_DEST_CNTL_INSTR_WRITEMASK(0x3) |
                         A5XX_VFD_DEST_CNTL_INSTR_REGID(vregid));
 
-         ta5_pkt4(cmd, REG_A5XX_VFD_CONTROL_0, 1);
-         ta5_cs_push(cmd, A5XX_VFD_CONTROL_0_VTXCNT(1));
+         ta5_pkt4(draw, REG_A5XX_VFD_CONTROL_0, 1);
+         ta5_cs_push(draw, A5XX_VFD_CONTROL_0_VTXCNT(1));
       }
    }
 
-   ta5_pkt4(cmd, REG_A5XX_GRAS_CL_VPORT_XOFFSET_0, 6);
-   ta5_cs_push(cmd, A5XX_GRAS_CL_VPORT_XOFFSET_0(cmd->bound_framebuffer->width
-                                                 / 2.0f));
-   ta5_cs_push(cmd, A5XX_GRAS_CL_VPORT_XSCALE_0(cmd->bound_framebuffer->width
-                                                / 2.0f));
-   ta5_cs_push(cmd, A5XX_GRAS_CL_VPORT_YOFFSET_0(cmd->bound_framebuffer->height
-                                                 / 2.0f));
-   ta5_cs_push(cmd, A5XX_GRAS_CL_VPORT_YSCALE_0(cmd->bound_framebuffer->height
-                                                / 2.0f));
-   ta5_cs_push(cmd, A5XX_GRAS_CL_VPORT_ZOFFSET_0(0.5f));
-   ta5_cs_push(cmd, A5XX_GRAS_CL_VPORT_ZSCALE_0(0.5f));
+   ta5_emit_draw_state(draw);
 
-   ta5_emit_program_state(cmd, pipe);
+   ta5_pkt4(draw, REG_A5XX_GRAS_CL_VPORT_XOFFSET_0, 6);
+   ta5_cs_push(draw, A5XX_GRAS_CL_VPORT_XOFFSET_0(draw->bound_framebuffer->width
+                                                  / 2.0f));
+   ta5_cs_push(draw, A5XX_GRAS_CL_VPORT_XSCALE_0(draw->bound_framebuffer->width
+                                                / 2.0f));
+   ta5_cs_push(draw, A5XX_GRAS_CL_VPORT_YOFFSET_0(draw->bound_framebuffer->height
+                                                  / 2.0f));
+   ta5_cs_push(draw, A5XX_GRAS_CL_VPORT_YSCALE_0(draw->bound_framebuffer->height
+                                                 / 2.0f));
+   ta5_cs_push(draw, A5XX_GRAS_CL_VPORT_ZOFFSET_0(0.5f));
+   ta5_cs_push(draw, A5XX_GRAS_CL_VPORT_ZSCALE_0(0.5f));
+
+   ta5_emit_program_state(draw, pipe);
 
    /*
     * Both programs are loaded before either stage's constants, which is the
@@ -2236,37 +2375,20 @@ ta5_CmdDraw(VkCommandBuffer _cmd, uint32_t vertexCount, uint32_t instanceCount,
     * program load instead reorders them, and the fragment stage faults on
     * the very first shaded fragment -- see the plan doc.
     */
-   ret = ta5_emit_shader(cmd, pipe, &pipe->vertex, SB4_VS_SHADER,
-                         REG_A5XX_SP_VS_OBJ_START, pipe->vs_bo);
+    ret = ta5_emit_shader(draw, pipe, &pipe->vertex, SB4_VS_SHADER,
+                          REG_A5XX_SP_VS_OBJ_START, pipe->vs_bo);
    if (ret != VK_SUCCESS)
-      return;
+      goto draw_error;
    if (pipe->has_fragment) {
-      ret = ta5_emit_shader(cmd, pipe, &pipe->fragment, SB4_FS_SHADER,
+      ret = ta5_emit_shader(draw, pipe, &pipe->fragment, SB4_FS_SHADER,
                             REG_A5XX_SP_FS_OBJ_START, pipe->fs_bo);
       if (ret != VK_SUCCESS)
-         return;
+         goto draw_error;
    }
 
-   ta5_emit_consts(cmd, pipe, &pipe->vertex, SB4_VS_SHADER, pipe->vs_bo);
+   ta5_emit_consts(draw, pipe, &pipe->vertex, SB4_VS_SHADER, pipe->vs_bo);
    if (pipe->has_fragment)
-      ta5_emit_consts(cmd, pipe, &pipe->fragment, SB4_FS_SHADER, pipe->fs_bo);
-
-   /*
-    * The prep enables LRZ and fd5 leaves it enabled across the draw, turning
-    * it off only in the fini.  That has never been varied here, and LRZ gates
-    * the depth path, so TA5_LRZ_OFF turns it off before the draw to see
-    * whether it is what is swallowing the fragments.
-    *
-    * The fini disables LRZ only after an LRZ_FLUSH_INVALIDATE; this does not.
-    * That is sound here because ta5_emit_draw_state programs DEPTH5_NONE and
-    * RB_DEPTH_CNTL = 0, so the LRZ holds nothing to invalidate.  It would not
-    * be on a pipeline with a depth attachment, which is why this stays a probe
-    * and not a general "disable LRZ" path.
-    */
-   if (getenv("TA5_LRZ_OFF")) {
-      ta5_pkt4(cmd, REG_A5XX_GRAS_LRZ_CNTL, 1);
-      ta5_cs_push(cmd, 0x00000000);
-   }
+      ta5_emit_consts(draw, pipe, &pipe->fragment, SB4_FS_SHADER, pipe->fs_bo);
 
    /*
     * GL's sysmem pass emits the draw state, the program state and both
@@ -2280,24 +2402,24 @@ ta5_CmdDraw(VkCommandBuffer _cmd, uint32_t vertexCount, uint32_t instanceCount,
     * draw packet against a half-loaded program.
     */
    if (getenv("TA5_DOUBLE_STATE")) {
-      ret = ta5_cmd_buffer_alloc_cs(cmd, cmd->cs_count + 4096);
+      ret = ta5_cmd_buffer_alloc_cs(draw, draw->cs_count + 4096);
       if (ret != VK_SUCCESS)
-         return;
-      ta5_emit_draw_state(cmd);
-      ta5_emit_program_state(cmd, pipe);
-      ret = ta5_emit_shader(cmd, pipe, &pipe->vertex, SB4_VS_SHADER,
+         goto draw_error;
+      ta5_emit_draw_state(draw);
+      ta5_emit_program_state(draw, pipe);
+      ret = ta5_emit_shader(draw, pipe, &pipe->vertex, SB4_VS_SHADER,
                             REG_A5XX_SP_VS_OBJ_START, pipe->vs_bo);
       if (ret != VK_SUCCESS)
-         return;
+         goto draw_error;
       if (pipe->has_fragment) {
-         ret = ta5_emit_shader(cmd, pipe, &pipe->fragment, SB4_FS_SHADER,
+         ret = ta5_emit_shader(draw, pipe, &pipe->fragment, SB4_FS_SHADER,
                                REG_A5XX_SP_FS_OBJ_START, pipe->fs_bo);
          if (ret != VK_SUCCESS)
-            return;
+            goto draw_error;
       }
-      ta5_emit_consts(cmd, pipe, &pipe->vertex, SB4_VS_SHADER, pipe->vs_bo);
+      ta5_emit_consts(draw, pipe, &pipe->vertex, SB4_VS_SHADER, pipe->vs_bo);
       if (pipe->has_fragment)
-         ta5_emit_consts(cmd, pipe, &pipe->fragment, SB4_FS_SHADER, pipe->fs_bo);
+         ta5_emit_consts(draw, pipe, &pipe->fragment, SB4_FS_SHADER, pipe->fs_bo);
    }
 
    /*
@@ -2306,13 +2428,14 @@ ta5_CmdDraw(VkCommandBuffer _cmd, uint32_t vertexCount, uint32_t instanceCount,
     * buffer fd5 still programs INDEX_SIZE as 32-bit (fd5_draw.h:114) rather
     * than leaving it at the 8-bit reset value.
     */
-   ta5_pkt7(cmd, CP_DRAW_INDX_OFFSET, 3);
-   ta5_cs_push(cmd, CP_DRAW_INDX_OFFSET_0_PRIM_TYPE(DI_PT_TRILIST) |
+   ta5_pkt7(draw, CP_DRAW_INDX_OFFSET, 3);
+   ta5_cs_push(draw, CP_DRAW_INDX_OFFSET_0_PRIM_TYPE(
+                        getenv("TA5_POINTS") ? DI_PT_POINTLIST : DI_PT_TRILIST) |
                      CP_DRAW_INDX_OFFSET_0_SOURCE_SELECT(DI_SRC_SEL_AUTO_INDEX) |
                      CP_DRAW_INDX_OFFSET_0_INDEX_SIZE(INDEX4_SIZE_32_BIT) |
                      CP_DRAW_INDX_OFFSET_0_VIS_CULL(IGNORE_VISIBILITY));
-   ta5_cs_push(cmd, instanceCount);
-   ta5_cs_push(cmd, vertexCount);
+   ta5_cs_push(draw, instanceCount);
+   ta5_cs_push(draw, vertexCount);
 
    /*
     * Stage the draw into its own object and reach it with CP_INDIRECT_BUFFER,
@@ -2324,23 +2447,30 @@ ta5_CmdDraw(VkCommandBuffer _cmd, uint32_t vertexCount, uint32_t instanceCount,
     * only reaches the submitted command buffer -- so this is not yet the
     * whole of GL's arrangement, but it isolates the one packet.
     */
-   if (cmd->device->draw_bo && !getenv("TA5_NO_INDIRECT_DRAW")) {
-      uint32_t off = cmd->cs_count - 4;
-      void *map = ta5_bo_map(cmd->device->draw_bo);
+   if (use_ib) {
+      ret = ta5_cmd_buffer_add_ib(cmd, draw);
+      if (ret != VK_SUCCESS)
+         goto draw_error;
 
-      if (map != NULL) {
-         memcpy(map, &cmd->cs[off], 4 * sizeof(uint32_t));
-         __sync_synchronize();
+      struct ta5_ib *ib = &cmd->ibs[cmd->ib_count - 1];
+      ta5_pkt7(cmd, CP_INDIRECT_BUFFER, 3);
+      ret = ta5_cs_reloc(cmd, ib->bo, 0, 0);
+      if (ret != VK_SUCCESS)
+         goto draw_error;
+      ta5_cs_push(cmd, ib->size); /* IB_SIZE, in dwords */
 
-         cmd->cs_count = off;
-         ta5_pkt7(cmd, CP_INDIRECT_BUFFER, 3);
-         ret = ta5_cs_reloc(cmd, cmd->device->draw_bo, 0, 0);
-         if (ret != VK_SUCCESS)
-            return;
-         ta5_cs_push(cmd, 4); /* IB_SIZE, in dwords */
+      ta5_pkt7(cmd, CP_SKIP_IB2_ENABLE_GLOBAL, 1);
+      ta5_cs_push(cmd, 0);
+   }
 
-         ta5_pkt7(cmd, CP_SKIP_IB2_ENABLE_GLOBAL, 1);
-         ta5_cs_push(cmd, 0);
-      }
+   if (use_ib)
+      vk_free(&cmd->device->vk.alloc, draw->cs);
+   return;
+
+draw_error:
+   if (use_ib) {
+      vk_free(&cmd->device->vk.alloc, draw->relocs);
+      vk_free(&cmd->device->vk.alloc, draw->reloc_bos);
+      vk_free(&cmd->device->vk.alloc, draw->cs);
    }
 }
