@@ -476,6 +476,57 @@ ta5_next_regid(uint32_t reg, uint32_t increment)
       return regid(63, 0);
 }
 
+/**
+ * Length of a shader program in CP_LOAD_STATE4 units of 16 instructions.
+ *
+ * IR3's v->instrlen is DIV_ROUND_UP(instr_count, instr_align), an alignment
+ * artifact rather than the size of the program.  A trivial fragment shader
+ * here reports instrlen == 1 while carrying 32 dwords of microcode, which
+ * under-reports the program by half.  Both places that carry the length --
+ * NUM_UNIT on the program load and INSTRLEN in HLSQ_xS_CNTL -- have to agree
+ * with what is actually in the object, so derive it from the dword count.
+ */
+static uint32_t
+ta5_shader_units(const struct ta5_compiled_shader *shader)
+{
+   const struct ir3_shader_variant *v =
+      (const struct ir3_shader_variant *)shader->variant;
+   uint32_t units = MAX2(shader->instrlen, DIV_ROUND_UP(v->info.sizedwords, 16));
+   const char *ov = getenv("TA5_SHADER_UNITS");
+
+   if (ov) {
+      uint32_t o = (uint32_t)atoi(ov);
+      if (o > units)
+         units = o;
+   }
+
+   return units;
+}
+
+/**
+ * The length HLSQ_xS_CNTL.INSTRLEN is given for a stage.
+ *
+ * Kept separate from ta5_shader_units() because the two do not want the same
+ * answer: raising NUM_UNIT without raising INSTRLEN takes the fragment fault
+ * from two unmapped reads down to one, while raising both puts the second
+ * back.  The two fields are not obviously the same unit, and which one is
+ * right is settled by measurement, so the override exists to sweep them.
+ */
+static uint32_t
+ta5_instrlen(const struct ta5_compiled_shader *shader)
+{
+   uint32_t units = shader->instrlen;
+   const char *ov = getenv("TA5_INSTRLEN");
+
+   if (ov) {
+      uint32_t o = (uint32_t)atoi(ov);
+      if (o > units)
+         units = o;
+   }
+
+   return units;
+}
+
 static void
 ta5_emit_program_state(struct ta5_cmd_buffer *cmd, struct ta5_pipeline *pipe)
 {
@@ -489,8 +540,8 @@ ta5_emit_program_state(struct ta5_cmd_buffer *cmd, struct ta5_pipeline *pipe)
    uint32_t fs_constlen = pipe->fragment.constlen / 4;
    uint32_t vs_constoff = 0;
    uint32_t fs_constoff = vs_constlen;
-   uint32_t vs_instrlen = pipe->vertex.instrlen;
-   uint32_t fs_instrlen = pipe->fragment.instrlen;
+   uint32_t vs_instrlen = ta5_instrlen(&pipe->vertex);
+   uint32_t fs_instrlen = ta5_instrlen(&pipe->fragment);
    uint32_t fs_instroff = 64 - fs_instrlen;
 
    struct ir3_shader_linkage l = {0};
@@ -1056,36 +1107,10 @@ ta5_emit_shader(struct ta5_cmd_buffer *cmd, struct ta5_pipeline *pipe,
       return VK_SUCCESS;
 
    ta5_pkt7(cmd, CP_LOAD_STATE4, 3);
-   {
-      /*
-       * NUM_UNIT counts units of 16 instructions.  IR3 reports instrlen in
-       * those units, but our variants report instrlen == 1 while carrying
-       * 32-34 dwords of program, so the load copies a quarter of the shader
-       * and the HLSQ runs off the end of what it was given.  Round the
-       * instruction count up to whole units ourselves; over-reading into the
-       * padding is harmless, under-reading is not.
-       */
-      const struct ir3_shader_variant *v =
-         (const struct ir3_shader_variant *)shader->variant;
-      uint32_t units = shader->instrlen;
-      uint32_t need = DIV_ROUND_UP(v->info.sizedwords, 16);
-
-      if (need > units)
-         units = need;
-      {
-         const char *ov = getenv("TA5_SHADER_UNITS");
-         if (ov) {
-            uint32_t o = (uint32_t)atoi(ov);
-            if (o > units)
-               units = o;
-         }
-      }
-
-      ta5_cs_push(cmd, CP_LOAD_STATE4_0_DST_OFF(0) |
-                        CP_LOAD_STATE4_0_STATE_SRC(SS4_INDIRECT) |
-                        CP_LOAD_STATE4_0_STATE_BLOCK(state_block) |
-                        CP_LOAD_STATE4_0_NUM_UNIT(units));
-   }
+   ta5_cs_push(cmd, CP_LOAD_STATE4_0_DST_OFF(0) |
+                     CP_LOAD_STATE4_0_STATE_SRC(SS4_INDIRECT) |
+                     CP_LOAD_STATE4_0_STATE_BLOCK(state_block) |
+                     CP_LOAD_STATE4_0_NUM_UNIT(ta5_shader_units(shader)));
    ret = ta5_cs_reloc(cmd, bo, 0, CP_LOAD_STATE4_1_STATE_TYPE(ST4_SHADER));
    if (ret != VK_SUCCESS)
       return ret;
@@ -1111,6 +1136,8 @@ ta5_emit_shader(struct ta5_cmd_buffer *cmd, struct ta5_pipeline *pipe,
  *   TA5_SKIP_DRAW          record no draw state, shaders or CP_DRAW_INDX_OFFSET
  *   TA5_SKIP_FS            load no fragment program at all
  *   TA5_FS_NO_DEPTH_OUT    leave DEPTH_REGID out of SP_FS_OUTPUT_CNTL
+ *   TA5_SHADER_UNITS=N     raise the CP_LOAD_STATE4 program-load length
+ *   TA5_INSTRLEN=N         raise HLSQ_xS_CNTL.INSTRLEN
  *   TA5_PREAMBLE_ROWS=N    emit only the first N state-restore register rows
  *
  * TA5_TRACE_NULL additionally dumps the recorded stream, its relocations and
