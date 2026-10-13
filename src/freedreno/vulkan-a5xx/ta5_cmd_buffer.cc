@@ -551,7 +551,8 @@ ta5_emit_program_state(struct ta5_cmd_buffer *cmd, struct ta5_pipeline *pipe)
    uint8_t clip_mask = vs->clip_mask, cull_mask = vs->cull_mask;
    uint8_t clip_cull_mask = clip_mask | cull_mask;
    enum a3xx_threadsize fssz =
-      fs->info.double_threadsize ? FOUR_QUADS : TWO_QUADS;
+      (fs->info.double_threadsize || getenv("TA5_FS_FOUR_QUADS")) ? FOUR_QUADS
+                                                                   : TWO_QUADS;
 
    pos_regid = ir3_find_output_regid(vs, VARYING_SLOT_POS);
    psize_regid = ir3_find_output_regid(vs, VARYING_SLOT_PSIZ);
@@ -566,6 +567,12 @@ ta5_emit_program_state(struct ta5_cmd_buffer *cmd, struct ta5_pipeline *pipe)
                      : ir3_find_output_regid(fs, FRAG_RESULT_DATA0);
 
    ir3_link_shaders(&l, vs, fs, true);
+
+   if (getenv("TA5_TRACE_NULL"))
+      fprintf(stderr,
+              "ta5[link]: pre  pos_regid=0x%x cnt=%u max_loc=%u "
+              "varmask0=0x%x\n",
+              pos_regid, l.cnt, l.max_loc, l.varmask[0]);
 
    /*
     * VPC_VAR_DISABLE is programmed from the *inter-stage* linkage alone.
@@ -600,6 +607,14 @@ ta5_emit_program_state(struct ta5_cmd_buffer *cmd, struct ta5_pipeline *pipe)
       ir3_link_add(&l, VARYING_SLOT_CLIP_DIST1, clip1_regid,
                    clip_cull_mask >> 4, l.max_loc);
    }
+
+   if (getenv("TA5_TRACE_NULL"))
+      fprintf(stderr,
+              "ta5[link]: post pos_regid=0x%x cnt=%u var0.regid=0x%x "
+              "var0.loc=%u var0.compmask=0x%x pos_loc=%u\n",
+              pos_regid, l.cnt, l.cnt ? l.var[0].regid : 0,
+              l.cnt ? l.var[0].loc : 0, l.cnt ? l.var[0].compmask : 0,
+              pos_loc);
 
    /* HLSQ_xS_CONFIG: constant-object offset, shader-object offset, enable. */
    ta5_pkt4(cmd, REG_A5XX_HLSQ_VS_CONFIG, 5);
