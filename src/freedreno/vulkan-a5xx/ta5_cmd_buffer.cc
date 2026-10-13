@@ -492,12 +492,37 @@ ta5_next_regid(uint32_t reg, uint32_t increment)
 /**
  * Length of a shader program in CP_LOAD_STATE4 units of 16 instructions.
  *
- * IR3's v->instrlen is DIV_ROUND_UP(instr_count, instr_align), an alignment
- * artifact rather than the size of the program.  A trivial fragment shader
- * here reports instrlen == 1 while carrying 32 dwords of microcode, which
- * under-reports the program by half.  Both places that carry the length --
- * NUM_UNIT on the program load and INSTRLEN in HLSQ_xS_CNTL -- have to agree
- * with what is actually in the object, so derive it from the dword count.
+ * One unit is 16 *instructions* and an instruction is a 64-bit qword, so a unit
+ * is 32 dwords.  ir3_compiler.c:361 sets instr_align = 16 for a5xx,
+ * ir3.c:394 computes v->instrlen = DIV_ROUND_UP(instr_count, instr_align), and
+ * ir3.c:400 computes info->size = instrlen * instr_align * 8 bytes.  8 bytes
+ * per instruction is the "each instruction is 64bits (qword)" rule, so
+ * info->size == instrlen * 128 bytes == instrlen * 32 dwords exactly.
+ *
+ * Measured on this driver's own shaders: the vertex stage reports sizedwords
+ * 64 with instrlen 2, the fragment stage sizedwords 32 with instrlen 1.  So
+ * sizedwords == instrlen * 32, and the divisor below is 16 -- twice the true
+ * value, counting instructions as though they were dwords.
+ *
+ * That is known-wrong arithmetic, and it is being kept deliberately because
+ * the two configurations were measured on the device and the wrong one is the
+ * one that works:
+ *
+ *   divisor 16 (VS 4 units, FS 2 units)   0 faults, every run
+ *   divisor 32 (VS 2 units, FS 1 unit)    2 faults, every run
+ *   TA5_SHADER_UNITS=2 on both stages     0 faults, every run
+ *
+ * The third line isolates it: divisor 32 differs from units=2 only in the
+ * fragment stage, so FS NUM_UNIT=1 is what faults.  Our FS is exactly 32
+ * dwords -- precisely one unit, with no second unit behind it for the fetch to
+ * land in.  GL's own stream does load its FS program with NUM_UNIT=1 and works
+ * (glsys.cs.0.bo5 [178]), so 1 is a length GL genuinely uses, but GL's shader
+ * is a different one and that is not a like-for-like comparison.
+ *
+ * Neither configuration renders the triangle, so this is not that bug.  It is
+ * left alone because a deterministic fault is the worse outcome while the
+ * reason is unknown.  The divisor becomes 32 once it is clear why a one-unit
+ * fragment load faults.
  */
 static uint32_t
 ta5_shader_units(const struct ta5_compiled_shader *shader)
@@ -509,8 +534,8 @@ ta5_shader_units(const struct ta5_compiled_shader *shader)
 
    if (ov) {
       uint32_t o = (uint32_t)atoi(ov);
-      if (o > units)
-         units = o;
+      /* Settable in both directions so this can be swept down as well as up. */
+      units = o ? o : units;
    }
 
    return units;
