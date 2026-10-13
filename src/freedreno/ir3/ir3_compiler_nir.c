@@ -6219,9 +6219,29 @@ ir3_compile_shader_nir(struct ir3_compiler *compiler,
 
    struct ir3_instruction *end = ir3_find_end(so->ir);
 
+   /*
+    * ir3_find_end() also matches OPC_CHMASK, because in the GS/tessellation
+    * path the CHMASK is what chains to the next shader and so stands in for
+    * the END there.  That is fine for the caller that only wants "the
+    * terminator", but not here: a CHMASK has no end.srcs/end.outidxs to
+    * walk, so end->srcs_count and end->end.outidxs are whatever was left in
+    * the instruction.
+    *
+    * A fragment shader that writes an output from inside a loop reaches this
+    * with such an instruction and walked 65535 entries off a null outidxs,
+    * which segfaulted the compiler inside vkCreateGraphicsPipelines.  Fail
+    * cleanly instead; compile_assert() is how the rest of this function
+    * reports a shader it cannot compile.
+    */
+   compile_assert(ctx, end->opc == OPC_END);
+
    for (unsigned i = 0; i < end->srcs_count; i++) {
       unsigned outidx = end->end.outidxs[i];
       struct ir3_register *reg = end->srcs[i];
+
+      /* outidx is written straight into so->outputs[] unchecked. */
+      compile_assert(ctx, outidx < so->outputs_count);
+      compile_assert(ctx, reg != NULL);
 
       so->outputs[outidx].regid = reg->num;
       so->outputs[outidx].half = !!(reg->flags & IR3_REG_HALF);
