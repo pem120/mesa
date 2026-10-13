@@ -1767,6 +1767,17 @@ ta5_CmdEndRenderPass(VkCommandBuffer _cmd)
    if (cmd->state != MESA_VK_COMMAND_BUFFER_STATE_RECORDING)
       return;
 
+   /*
+    * Grow before emitting.  ta5_cs_push() writes unconditionally, and the
+    * only two sites that reserved space were BeginRenderPass and the draw
+    * path, so the CCU flushes and the trailing CACHE_FLUSH_TS this emits
+    * were being written into whatever the draw path happened to leave
+    * spare.  That worked only because BeginRenderPass happens to run first
+    * in a frame; it is an accident of ordering, not a bound.
+    */
+   if (ta5_cmd_buffer_alloc_cs(cmd, cmd->cs_count + 1024) != VK_SUCCESS)
+      return;
+
    if (ta5_emit_sysmem_fini(cmd) != VK_SUCCESS)
       return;
    ta5_wfi(cmd);
