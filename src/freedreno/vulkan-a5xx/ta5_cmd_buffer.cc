@@ -879,11 +879,26 @@ ta5_emit_program_state(struct ta5_cmd_buffer *cmd, struct ta5_pipeline *pipe)
    ta5_pkt4(cmd, REG_A5XX_SP_SP_CNTL, 1);
    ta5_cs_push(cmd, 0x00000010);   /* XXX */
 
+   /*
+    * Rasterizer and RB render mode.  Bit 0 is the gmem/sysmem select on
+    * both registers; this is the sysmem path (the stream opens with
+    * CP_SET_RENDER_MODE(BYPASS) and there is no binning pass), so it has to
+    * be 1.
+    *
+    * fd5 writes 0 here in both its program state (fd5_program.c:574) and its
+    * gmem draw state (fd5_draw.c:173), but neither of those is the path a
+    * sysmem draw takes: a capture of a working fd5 sysmem draw
+    * (FD_MESA_DEBUG=sysmem) has 0x00000001 in both, and with them at 0 the
+    * rasterizer runs in gmem mode -- geometry still reaches memory through
+    * the bypass, but the fragment stage is handed one vertex's barycentrics
+    * for the whole primitive and every interpolated varying collapses to a
+    * constant.
+    */
    ta5_pkt4(cmd, REG_A5XX_GRAS_CNTL, 1);
-   ta5_cs_push(cmd, 0x00000000);
+   ta5_cs_push(cmd, 0x00000001);
 
    ta5_pkt4(cmd, REG_A5XX_RB_RENDER_CONTROL0, 2);
-   ta5_cs_push(cmd, 0x00000000);
+   ta5_cs_push(cmd, 0x00000001);
    ta5_cs_push(cmd, 0x00000000);
 
    /*
