@@ -369,17 +369,24 @@ ta5_CreateGraphicsPipelines(VkDevice _device, VkPipelineCache pipelineCache,
          &device->vk, &pipe->graphics_state, ci, &mv_state, &rp_state, 0,
          &pipe->all_state, NULL, VK_SYSTEM_ALLOCATION_SCOPE_OBJECT, NULL);
 
-      pipe->raster = ci->pRasterizationState;
-      pipe->blend = ci->pColorBlendState;
-      pipe->depth_stencil = ci->pDepthStencilState;
-      pipe->multisample = ci->pMultisampleState;
+      /*
+       * Fixed-function state is read from graphics_state at draw time, never
+       * from the create info: those structures are borrowed for the duration of
+       * this call only.  See the note on graphics_state in ta5_pipeline.h.
+       */
 
       /*
        * Vertex input description and viewport state live in the command
        * buffer for Vulkan (they are not baked into the pipeline), so they are
        * recorded at draw time rather than captured here.
+       *
+       * pVertexInputState is optional and graphics_state.vi is NULL when the
+       * application left it out, which is exactly what a shader that derives
+       * everything from gl_VertexIndex does.  The guard is what keeps that
+       * legal case from becoming a NULL dereference.
        */
-      pipe->uses_vertex_buffers = ci->pVertexInputState->vertexBindingDescriptionCount > 0;
+      pipe->uses_vertex_buffers =
+         pipe->graphics_state.vi && pipe->graphics_state.vi->bindings_valid;
 
       pPipelines[i] = ta5_pipeline_to_handle(pipe);
    }

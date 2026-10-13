@@ -54,7 +54,27 @@ struct ta5_pipeline
    struct ta5_render_pass *render_pass;
    uint32_t subpass;
 
-   /** Runtime-owned graphics state, filled from our render pass. */
+   /*
+    * Runtime-owned graphics state, filled from our render pass.
+    *
+    * This is also where the fixed-function pipeline state lives -- rasterizer
+    * (graphics_state.rs), colour blend (.cb), depth stencil (.ds),
+    * multisample (.ms) and vertex input (.vi) -- so nothing in ta5_pipeline
+    * should ever hold a pointer into VkGraphicsPipelineCreateInfo.
+    *
+    * Those pointers would be borrowed, not owned.  The spec states the rule
+    * outright for sibling members of the same structure: renderPass "must not
+    * be accessed by the implementation outside of the duration of the command
+    * this structure is passed to", and layout is held to the same rule from
+    * Vulkan 1.3.  An application is entitled to release the state structures
+    * the moment vkCreateGraphicsPipelines returns, so a pipeline holding
+    * pRasterizationState and friends would be holding dangling pointers by the
+    * time it is handed back.
+    *
+    * vk_graphics_pipeline_state_fill() deep copies all of it into all_state
+    * below, which the pipeline owns and which is therefore valid for the
+    * pipeline's whole life.  Read the state from there.
+    */
    struct vk_graphics_pipeline_state graphics_state;
 
    /*
@@ -85,17 +105,6 @@ struct ta5_pipeline
    /** Shaders were given as gl_Position/gl_FragCoord-only; no vertex buffer
     * fetch is configured yet. */
    bool uses_vertex_buffers;
-
-   /*
-    * Fixed-function state is borrowed from the VkGraphicsPipelineCreateInfo,
-    * not copied: Vulkan 1.1 passes each piece as a pointer to the state
-    * struct itself (there is no enclosing pNext-style state member), and the
-    * create info is guaranteed to outlive pipeline creation.
-    */
-   const VkPipelineRasterizationStateCreateInfo *raster;
-   const VkPipelineColorBlendStateCreateInfo *blend;
-   const VkPipelineDepthStencilStateCreateInfo *depth_stencil;
-   const VkPipelineMultisampleStateCreateInfo *multisample;
 };
 
 VK_DEFINE_NONDISP_HANDLE_CASTS(ta5_pipeline, base, VkPipeline,
