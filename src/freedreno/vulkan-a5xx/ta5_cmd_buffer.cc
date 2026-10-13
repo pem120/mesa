@@ -1075,6 +1075,8 @@ ta5_emit_shader(struct ta5_cmd_buffer *cmd, struct ta5_pipeline *pipe,
  *   TA5_SKIP_WFI           drop every CP_WAIT_FOR_IDLE
  *   TA5_SKIP_PREP          stop after the state restore
  *   TA5_SKIP_DRAW          record no draw state, shaders or CP_DRAW_INDX_OFFSET
+ *   TA5_SKIP_FS            load no fragment program at all
+ *   TA5_FS_NO_DEPTH_OUT    leave DEPTH_REGID out of SP_FS_OUTPUT_CNTL
  *   TA5_PREAMBLE_ROWS=N    emit only the first N state-restore register rows
  *
  * TA5_TRACE_NULL additionally dumps the recorded stream, its relocations and
@@ -1412,9 +1414,12 @@ ta5_emit_draw_state(struct ta5_cmd_buffer *cmd)
    ta5_cs_push(cmd, A5XX_RB_FS_OUTPUT_CNTL_MRT(1));
 
    ta5_pkt4(cmd, REG_A5XX_SP_FS_OUTPUT_CNTL, 1);
-   ta5_cs_push(cmd, A5XX_SP_FS_OUTPUT_CNTL_MRT(1) |
-                     A5XX_SP_FS_OUTPUT_CNTL_DEPTH_REGID(regid(63, 0)) |
-                     A5XX_SP_FS_OUTPUT_CNTL_SAMPLEMASK_REGID(regid(63, 0)));
+   if (getenv("TA5_FS_NO_DEPTH_OUT"))
+      ta5_cs_push(cmd, A5XX_SP_FS_OUTPUT_CNTL_MRT(1));
+   else
+      ta5_cs_push(cmd, A5XX_SP_FS_OUTPUT_CNTL_MRT(1) |
+                        A5XX_SP_FS_OUTPUT_CNTL_DEPTH_REGID(regid(63, 0)) |
+                        A5XX_SP_FS_OUTPUT_CNTL_SAMPLEMASK_REGID(regid(63, 0)));
 
    /*
     * No attachment blends, so both enable masks are zero -- but fd5 still
@@ -1926,7 +1931,7 @@ ta5_CmdDraw(VkCommandBuffer _cmd, uint32_t vertexCount, uint32_t instanceCount,
    if (ta5_emit_shader(cmd, pipe, &pipe->vertex, SB4_VS_SHADER,
                        REG_A5XX_SP_VS_OBJ_START, pipe->vs_bo) != VK_SUCCESS)
       return;
-   if (pipe->has_fragment &&
+   if (pipe->has_fragment && !getenv("TA5_SKIP_FS") &&
        ta5_emit_shader(cmd, pipe, &pipe->fragment, SB4_FS_SHADER,
                        REG_A5XX_SP_FS_OBJ_START, pipe->fs_bo) != VK_SUCCESS)
       return;
