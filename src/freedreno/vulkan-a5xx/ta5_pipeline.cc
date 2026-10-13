@@ -194,16 +194,32 @@ ta5_CreateGraphicsPipelines(VkDevice _device, VkPipelineCache pipelineCache,
        * step the generic implementation could not do for us.
        */
       struct vk_render_pass_state rp_state = {};
+      struct vk_multiview_state mv_state = {};
       ta5_fill_render_pass_state(&rp_state, pipe->render_pass);
 
       /*
+       * mv_state is not optional, even though a single-view render pass needs
+       * no multiview state.  vk_multiview_state_init() has no equivalent of
+       * the driver_rp guard that vk_render_pass_state_init() has, so with
+       * driver_mv == NULL it falls through to
+       * vk_get_pipeline_rendering_create_info(), which does:
+       *
+       *    VK_FROM_HANDLE(vk_render_pass, render_pass, info->renderPass);
+       *    return &render_pass->subpasses[info->subpass].pipeline_info;
+       *
+       * That reads a struct vk_render_pass out of what is really a
+       * struct ta5_render_pass.  subpass_count happens to line up, the
+       * subpasses pointer does not, and the result is a wild pointer that gets
+       * dereferenced for viewMask.  Handing it a real (zeroed) state makes it
+       * take the early return instead.  Turnip always passes one too.
+       *
        * all_state must be a real object.  Passing NULL tells the runtime that
        * it may allocate, and it then writes the result through alloc_ptr_out --
        * which is NULL too, so it dereferences NULL (vk_graphics_state.c:1802).
        * Turnip passes &builder->all_state for the same reason.
        */
       vk_graphics_pipeline_state_fill(
-         &device->vk, &pipe->graphics_state, ci, NULL, &rp_state, 0,
+         &device->vk, &pipe->graphics_state, ci, &mv_state, &rp_state, 0,
          &pipe->all_state, NULL, VK_SYSTEM_ALLOCATION_SCOPE_OBJECT, NULL);
 
       pipe->raster = ci->pRasterizationState;
