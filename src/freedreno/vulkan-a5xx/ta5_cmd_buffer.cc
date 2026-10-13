@@ -1045,6 +1045,16 @@ ta5_emit_shader(struct ta5_cmd_buffer *cmd, struct ta5_pipeline *pipe,
    if (ret != VK_SUCCESS)
       return ret;
 
+   /*
+    * TA5_SKIP_FS suppresses only the program load, not the object address.
+    * Dropping the whole of ta5_emit_shader() would leave SP_FS_OBJ_START at
+    * its reset value of zero, and a fragment-stage fault at IOVA 0x0 is
+    * exactly what a missing program at address zero looks like -- which is
+    * indistinguishable from the thing being investigated.
+    */
+   if (getenv("TA5_SKIP_FS"))
+      return VK_SUCCESS;
+
    ta5_pkt7(cmd, CP_LOAD_STATE4, 3);
    ta5_cs_push(cmd, CP_LOAD_STATE4_0_DST_OFF(0) |
                      CP_LOAD_STATE4_0_STATE_SRC(SS4_INDIRECT) |
@@ -1053,8 +1063,6 @@ ta5_emit_shader(struct ta5_cmd_buffer *cmd, struct ta5_pipeline *pipe,
    ret = ta5_cs_reloc(cmd, bo, 0, CP_LOAD_STATE4_1_STATE_TYPE(ST4_SHADER));
    if (ret != VK_SUCCESS)
       return ret;
-
-   ta5_emit_consts(cmd, pipe, shader, state_block, bo);
 
    return VK_SUCCESS;
 }
@@ -1928,13 +1936,28 @@ ta5_CmdDraw(VkCommandBuffer _cmd, uint32_t vertexCount, uint32_t instanceCount,
 
    ta5_emit_program_state(cmd, pipe);
 
-   if (ta5_emit_shader(cmd, pipe, &pipe->vertex, SB4_VS_SHADER,
-                       REG_A5XX_SP_VS_OBJ_START, pipe->vs_bo) != VK_SUCCESS)
+   /*
+    * Both programs are loaded before either stage's constants, which is the
+    * order fd5 emits them in (fd5_program.c: the SP_xS_OBJ_START and program
+    * loads for both stages come first, and the constant and driver-parameter
+    * uploads follow).  Emitting each stage's constants straight after its own
+    * program load instead reorders them, and the fragment stage faults on
+    * the very first shaded fragment -- see the plan doc.
+    */
+   ret = ta5_emit_shader(cmd, pipe, &pipe->vertex, SB4_VS_SHADER,
+                         REG_A5XX_SP_VS_OBJ_START, pipe->vs_bo);
+   if (ret != VK_SUCCESS)
       return;
-   if (pipe->has_fragment && !getenv("TA5_SKIP_FS") &&
-       ta5_emit_shader(cmd, pipe, &pipe->fragment, SB4_FS_SHADER,
-                       REG_A5XX_SP_FS_OBJ_START, pipe->fs_bo) != VK_SUCCESS)
-      return;
+   if (pipe->has_fragment) {
+      ret = ta5_emit_shader(cmd, pipe, &pipe->fragment, SB4_FS_SHADER,
+                            REG_A5XX_SP_FS_OBJ_START, pipe->fs_bo);
+      if (ret != VK_SUCCESS)
+         return;
+   }
+
+   ta5_emit_consts(cmd, pipe, &pipe->vertex, SB4_VS_SHADER, pipe->vs_bo);
+   if (pipe->has_fragment)
+      ta5_emit_consts(cmd, pipe, &pipe->fragment, SB4_FS_SHADER, pipe->fs_bo);
 
    /*
     * CP_DRAW_INDX_OFFSET, no index buffer.  AUTO_INDEX synthesises vertex ids

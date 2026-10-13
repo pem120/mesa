@@ -113,6 +113,18 @@ ta5_stage_bo_alloc(struct ta5_device *device,
 
    ta5_copy_variant(map, shader, v);
 
+   /*
+    * Make those stores visible before the GPU is told to fetch them.
+    *
+    * The mapping is write-combining, which on ARM still drains through the
+    * store buffer, and this kernel's GEM_CPU_PREP is a no-op ("TODO cache
+    * maintenance"), so nothing else orders them.  The barrier is correct
+    * regardless of the fragment fault -- it was added while chasing that and
+    * did not change it -- but nothing should be relying on the stores being
+    * ordered by luck.
+    */
+   __sync_synchronize();
+
    if (getenv("TA5_DUMP_SHADER_BO")) {
       const uint32_t *d = (const uint32_t *)map;
       fprintf(stderr,
