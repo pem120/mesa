@@ -135,7 +135,48 @@ ta5_MapMemory(VkDevice _device, VkDeviceMemory _memory, VkDeviceSize offset,
    struct ta5_bo *bo = memory->bo;
    void *map;
 
-   if (bo == NULL || (map = ta5_bo_map(bo)) == NULL)
+   /*
+    * Reject a range that falls outside the allocation before handing back a
+    * pointer into it.  Without this an application mapping a sub-range --
+    * offset 0x1000 of a 4 KiB allocation -- gets map + offset, which is past
+    * the end of the mapping, and then reads and writes out of bounds.
+    *
+    * The three checks are the spec's VUIDs for vkMapMemory:
+    *
+    *   VUID-vkMapMemory-offset-00679   offset must be less than the size
+    *   VUID-vkMapMemory-size-00680     size must be greater than 0 unless it
+    *                                   is VK_WHOLE_SIZE
+    *   VUID-vkMapMemory-size-00681     size must be <= size of memory minus
+    *                                   offset, unless it is VK_WHOLE_SIZE
+    *
+    * VK_WHOLE_SIZE means "to the end of the allocation" and is legal, so it
+    * resolves against bo->size.  Violating a VUID is undefined behaviour rather
+    * than a defined error, so rejecting it here is defence in depth rather
+    * than a required behaviour; VK_ERROR_MEMORY_MAP_FAILED is what the spec
+    * names when a map cannot be satisfied.
+    *
+    * Every comparison is done on 64-bit values: offset + size can overflow 32
+    * bits and a wrapped sum would pass the check it is meant to fail.
+    */
+   if (bo == NULL)
+      return vk_error(&memory->device->instance->vk,
+                      VK_ERROR_MEMORY_MAP_FAILED);
+
+   {
+      const VkDeviceSize total = bo->size;
+
+      if (offset >= total)
+         return vk_error(&memory->device->instance->vk,
+                         VK_ERROR_MEMORY_MAP_FAILED);
+
+      if (size == VK_WHOLE_SIZE)
+         size = total - offset;
+      else if (size == 0 || size > total - offset)
+         return vk_error(&memory->device->instance->vk,
+                         VK_ERROR_MEMORY_MAP_FAILED);
+   }
+
+   if ((map = ta5_bo_map(bo)) == NULL)
       return vk_error(&memory->device->instance->vk,
                       VK_ERROR_MEMORY_MAP_FAILED);
 
@@ -159,6 +200,12 @@ ta5_MapMemory(VkDevice _device, VkDeviceMemory _memory, VkDeviceSize offset,
     * only tells us the work was queued.  CPU_PREP is what the kernel says to
     * use before touching a buffer the GPU has seen; without it a read back
     * can run ahead of the render.
+    *
+    * ta5_bo_cpu_prep() always returns VK_SUCCESS today -- the msm kernel on
+    * the a5xx device answers this ioctl with EINVAL and the helper treats that
+    * as advisory -- so the check below never fires.  It is kept because it is
+    * where the real failure belongs once the helper stops swallowing errors,
+    * but it is not currently a guarantee of anything.
     */
    if (ta5_bo_cpu_prep(bo, MSM_PREP_READ) != VK_SUCCESS)
       return vk_error(&memory->device->instance->vk, VK_ERROR_DEVICE_LOST);
@@ -175,7 +222,17 @@ ta5_UnmapMemory(VkDevice _device, VkDeviceMemory _memory)
 VKAPI_ATTR VkResult VKAPI_CALL
 ta5_UnmapMemory2(VkDevice _device, const VkMemoryUnmapInfo *pMemoryUnmapInfo)
 {
-   return VK_ERROR_MEMORY_MAP_FAILED;
+   /*
+    * Nothing is host-mapped, so there is no map to drop and nothing to flush:
+    * vkUnmapMemory() above is empty for the same reason.  With no map there is
+    * nothing that can fail, so VK_SUCCESS is the only correct answer.
+    *
+    * (VK_ERROR_MEMORY_MAP_FAILED is a legal return for this command -- it is
+    * one of the failure codes the spec lists -- but nothing here maps or
+    * unmaps, so returning one would only tell the application its unmap had
+    * failed when it had not.)
+    */
+   return VK_SUCCESS;
 }
 
 VKAPI_ATTR VkResult VKAPI_CALL
