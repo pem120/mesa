@@ -177,9 +177,16 @@ ta5_WaitForFences(VkDevice _device, uint32_t fenceCount, const VkFence *pFences,
    if (fenceCount == 1) {
       struct ta5_fence *fence = ta5_fence_from_handle(pFences[0]);
 
+      /*
+       * VkFence::timeout is in nanoseconds, and so is
+       * os_time_get_absolute_timeout() -- it already maps 0 to an infinite
+       * wait and clamps on overflow.  Scaling here would wait 1000x too
+       * long, and collapsing a zero timeout into UINT64_MAX turned the
+       * usual "poll with a zero timeout" loop into a hang.
+       */
       result = vk_sync_wait(
          &device->vk, fence->sync, 0, VK_SYNC_WAIT_COMPLETE,
-         os_time_get_absolute_timeout(timeout ? timeout * 1000000 : UINT64_MAX));
+         os_time_get_absolute_timeout(timeout));
       if (result == VK_SUCCESS)
          fence->signaled = true;
       return result;
@@ -333,8 +340,13 @@ ta5_WaitSemaphores(VkDevice _device, const VkSemaphoreWaitInfo *pWaitInfo,
       uint64_t want = pWaitInfo->pValues ? pWaitInfo->pValues[i] : 1;
       uint64_t have = p_atomic_read(&sem->counter);
 
+      /*
+       * An unsignalled semaphore is a normal wait outcome, not a device
+       * failure.  Reporting DEVICE_LOST here made the loader tear the
+       * device down for any app that polls with a zero timeout.
+       */
       if (have < want)
-         return timeout ? VK_TIMEOUT : VK_ERROR_DEVICE_LOST;
+         return VK_TIMEOUT;
    }
 
    for (uint32_t i = 0; i < pWaitInfo->semaphoreCount; i++) {

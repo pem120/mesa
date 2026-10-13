@@ -120,17 +120,17 @@ ta5_GetDeviceQueue2(VkDevice _device, const VkDeviceQueueInfo2 *pQueueInfo,
  * MSM_SUBMIT_CMD_BUF per submission.
  */
 static VkResult
-ta5_queue_submit_batch(struct ta5_queue *queue, const VkSubmitInfo *submit,
-                       VkFence fence)
+ta5_queue_submit_batch(struct ta5_queue *queue, const VkCommandBuffer *cmds,
+                       uint32_t cmd_count, VkFence fence)
 {
    struct ta5_device *device = queue->device;
    int fence_fd;
    uint32_t *stream;
    uint32_t total_words = 0, n = 0;
 
-   for (uint32_t i = 0; i < submit->commandBufferCount; i++) {
+   for (uint32_t i = 0; i < cmd_count; i++) {
       struct ta5_cmd_buffer *cmd = ta5_cmd_buffer_from_handle(
-         submit->pCommandBuffers[i]);
+         cmds[i]);
 
       /* Submitting a command buffer that is still recording is undefined
        * behaviour per the Vulkan spec; assert rather than invent a result
@@ -167,9 +167,9 @@ ta5_queue_submit_batch(struct ta5_queue *queue, const VkSubmitInfo *submit,
     * have to be merged and the indices remapped into one table.
     */
    uint32_t total_relocs = 0, total_bo = 0;
-   for (uint32_t i = 0; i < submit->commandBufferCount; i++) {
+   for (uint32_t i = 0; i < cmd_count; i++) {
       struct ta5_cmd_buffer *cmd = ta5_cmd_buffer_from_handle(
-         submit->pCommandBuffers[i]);
+         cmds[i]);
       total_relocs += cmd->reloc_count;
       total_bo += cmd->reloc_bo_count;
    }
@@ -191,9 +191,9 @@ ta5_queue_submit_batch(struct ta5_queue *queue, const VkSubmitInfo *submit,
    }
 
    uint32_t reloc_n = 0;
-   for (uint32_t i = 0; i < submit->commandBufferCount; i++) {
+   for (uint32_t i = 0; i < cmd_count; i++) {
       struct ta5_cmd_buffer *cmd = ta5_cmd_buffer_from_handle(
-         submit->pCommandBuffers[i]);
+         cmds[i]);
 
       /* Remap this buffer's BO indices into the merged table. */
       uint32_t *remap =
@@ -231,9 +231,9 @@ ta5_queue_submit_batch(struct ta5_queue *queue, const VkSubmitInfo *submit,
    }
 
    /* Mark the command buffers pending so they cannot be resubmitted. */
-   for (uint32_t i = 0; i < submit->commandBufferCount; i++) {
+   for (uint32_t i = 0; i < cmd_count; i++) {
       struct ta5_cmd_buffer *cmd = ta5_cmd_buffer_from_handle(
-         submit->pCommandBuffers[i]);
+         cmds[i]);
       cmd->state = MESA_VK_COMMAND_BUFFER_STATE_PENDING;
    }
 
@@ -279,7 +279,9 @@ ta5_QueueSubmit(VkQueue _queue, uint32_t submitCount,
    struct ta5_queue *queue = ta5_queue_from_handle(_queue);
 
    for (uint32_t i = 0; i < submitCount; i++) {
-      VkResult result = ta5_queue_submit_batch(queue, &pSubmits[i],
+      VkResult result = ta5_queue_submit_batch(queue,
+                                               pSubmits[i].pCommandBuffers,
+                                               pSubmits[i].commandBufferCount,
                                                /* only the last batch signals
                                                 * the caller's fence */
                                                (i == submitCount - 1) ? fence
@@ -298,10 +300,31 @@ ta5_QueueSubmit2(VkQueue _queue, uint32_t submitCount,
    struct ta5_queue *queue = ta5_queue_from_handle(_queue);
 
    for (uint32_t i = 0; i < submitCount; i++) {
-      const VkSubmitInfo *info = (const VkSubmitInfo *)&pSubmits[i];
-      VkResult result =
-         ta5_queue_submit_batch(queue, info,
-                                (i == submitCount - 1) ? fence : VK_NULL_HANDLE);
+      /*
+       * VkSubmitInfo2 is not layout-compatible with VkSubmitInfo: casting one
+       * to the other made commandBufferCount read a truncated semaphore
+       * pointer and pCommandBuffers read a pointer to pipeline stage masks,
+       * which then got walked as an array of VkCommandBuffer handles.  Read
+       * the handles out of the per-batch VkCommandBufferInfo instead.
+       */
+      const VkCommandBufferSubmitInfo *cb_info =
+         pSubmits[i].pCommandBufferInfos;
+      uint32_t cb_count = pSubmits[i].commandBufferInfoCount;
+      VkCommandBuffer *cmds = NULL;
+
+      if (cb_count) {
+         cmds = (VkCommandBuffer *)malloc(cb_count * sizeof(*cmds));
+         if (!cmds)
+            return vk_error(&queue->device->instance->vk,
+                            VK_ERROR_OUT_OF_HOST_MEMORY);
+         for (uint32_t j = 0; j < cb_count; j++)
+            cmds[j] = cb_info[j].commandBuffer;
+      }
+
+      VkResult result = ta5_queue_submit_batch(
+         queue, cmds, cb_count,
+         (i == submitCount - 1) ? fence : VK_NULL_HANDLE);
+      free(cmds);
       if (result != VK_SUCCESS)
          return result;
    }

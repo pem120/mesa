@@ -304,6 +304,15 @@ ta5_submit_cmd_relocs(struct ta5_queue *queue, const uint32_t *cs,
       return -1;
 
    /*
+    * A submission that is larger than the ring can never be placed: wrapping
+    * only helps while it still fits in TA5_RING_SIZE.  cmd->cs grows by 8192
+    * words per draw, so a frame with a few dozen draws crosses 64 KB and
+    * would otherwise run off the end of the mapping.
+    */
+   if (size > TA5_RING_SIZE)
+      return -1;
+
+   /*
     * Wrap to the start of the ring when a submission does not fit.  In this
     * phase the queue is always idle before the next submit (we wait below),
     * so overwriting is safe.
