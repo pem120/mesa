@@ -2170,24 +2170,67 @@ ta5_CmdBindPipeline(VkCommandBuffer _cmd, VkPipelineBindPoint pipelineBindPoint,
    cmd->bound_pipeline = ta5_pipeline_from_handle(_pipeline);
 }
 
+/**
+ * Record the dynamic viewport and scissor.
+ *
+ * a5xx has one viewport and one scissor rectangle.  Vulkan says a call naming
+ * an index or count the bound pipeline does not declare is undefined; this
+ * ignores it, which is what the spec permits, rather than corrupting the
+ * rectangle for viewport 0.
+ *
+ * The viewport itself is still derived from the framebuffer at draw time --
+ * see the note on ta5_emit_draw() -- so this only records it for the day that
+ * is fixed.  It is validated and stored now so that fixing it later cannot
+ * turn a rejected call into a silently accepted one.
+ */
 VKAPI_ATTR void VKAPI_CALL
 ta5_CmdSetViewport(VkCommandBuffer _cmd, uint32_t firstViewport,
                    uint32_t viewportCount, const VkViewport *pViewports)
 {
-   (void)_cmd;
-   (void)firstViewport;
-   (void)viewportCount;
-   (void)pViewports;
+   struct ta5_cmd_buffer *cmd = ta5_cmd_buffer_from_handle(_cmd);
+
+   if (cmd->state != MESA_VK_COMMAND_BUFFER_STATE_RECORDING)
+      return;
+
+   if (firstViewport != 0 || viewportCount != 1 || pViewports == NULL)
+      return;
+
+   const VkViewport *vp = &pViewports[0];
+
+   /* Vulkan VUID-vkCmdSetViewport-pViewports-parameter: the width and height
+    * must be positive or both negative (zero is neither), and minDepth must not
+    * exceed maxDepth.  Either is undefined behaviour, so it is dropped rather
+    * than guessed at. */
+   if (!((vp->width > 0.0f && vp->height > 0.0f) ||
+         (vp->width < 0.0f && vp->height < 0.0f)))
+      return;
+   if (vp->minDepth > vp->maxDepth)
+      return;
+
+   cmd->viewport = *vp;
+   cmd->viewport_set = true;
 }
 
 VKAPI_ATTR void VKAPI_CALL
 ta5_CmdSetScissor(VkCommandBuffer _cmd, uint32_t firstScissor,
                   uint32_t scissorCount, const VkRect2D *pScissors)
 {
-   (void)_cmd;
-   (void)firstScissor;
-   (void)scissorCount;
-   (void)pScissors;
+   struct ta5_cmd_buffer *cmd = ta5_cmd_buffer_from_handle(_cmd);
+
+   if (cmd->state != MESA_VK_COMMAND_BUFFER_STATE_RECORDING)
+      return;
+
+   if (firstScissor != 0 || scissorCount != 1 || pScissors == NULL)
+      return;
+
+   /* Vulkan VUID-vkCmdSetScissor-pScissors-parameter: offset must be
+    * non-negative and the extents must not be negative. */
+   if (pScissors->offset.x < 0 || pScissors->offset.y < 0 ||
+       pScissors->extent.width < 0 || pScissors->extent.height < 0)
+      return;
+
+   cmd->scissor = pScissors[0];
+   cmd->scissor_set = true;
 }
 
 /**
@@ -2295,6 +2338,11 @@ ta5_CmdBeginRenderPass(VkCommandBuffer _cmd,
    cmd->bound_render_pass = pass;
    cmd->bound_framebuffer =
       ta5_framebuffer_from_handle(pRenderPassBegin->framebuffer);
+
+   /* The scissor is clipped to the render area, so the area has to be known
+    * before any draw is recorded.  Stored rather than emitted: it only affects
+    * the scissor the draw computes. */
+   cmd->render_area = pRenderPassBegin->renderArea;
 
    if (clear)
       color = ta5_color_from_clear(clear[0].color);
@@ -2562,22 +2610,106 @@ ta5_CmdDraw(VkCommandBuffer _cmd, uint32_t vertexCount, uint32_t instanceCount,
     * NDC -1 at pixel 0.  Without the offset the whole frame lands off the
     * left and bottom edges and the draw rasterises nothing.  GL's stream
     * carries 32/32 offsets and 0.5/0.5 for z on a 64x64 target.
+    *
+    * Derived from the framebuffer rather than from vkCmdSetViewport, which is
+    * a separate, still-open gap: this emits the viewport the whole harness has
+    * always used and nothing depends on the recorded one yet.
     */
    {
       uint32_t w = cmd->bound_framebuffer->width;
       uint32_t h = cmd->bound_framebuffer->height;
+      uint32_t sx0, sy0, sx1, sy1;
+
+      /*
+       * Effective scissor: the rectangle Vulkan specifies, as inclusive
+       * GRAS bounds.
+       *
+       * Precedence, per the dynamic-state rules:
+       *
+       *   - scissor is dynamic and has been set  -> that rectangle
+       *   - scissor is not dynamic              -> the pipeline's pScissors[0],
+       *                                           which the runtime deep
+       *                                           copied into graphics_state
+       *   - dynamic but never set               -> the render area
+       *
+       * and then intersected with the render area, which Vulkan does not leave
+       * optional: a scissor reaching outside the render area is clipped to it
+       * rather than being an error.
+       *
+       * GRAS bounds are inclusive, Vulkan extents are not, hence the -1s.
+       */
+      {
+         VkRect2D r;
+
+         if (BITSET_TEST(pipe->graphics_state.dynamic,
+                         MESA_VK_DYNAMIC_VP_SCISSORS) &&
+             draw->scissor_set) {
+            r = draw->scissor;
+         } else if (!BITSET_TEST(pipe->graphics_state.dynamic,
+                                 MESA_VK_DYNAMIC_VP_SCISSORS) &&
+                    pipe->graphics_state.vp->scissor_count > 0) {
+            r = pipe->graphics_state.vp->scissors[0];
+         } else {
+            r = draw->render_area;
+         }
+
+         int64_t rx0 = MAX2((int64_t)r.offset.x,
+                            (int64_t)draw->render_area.offset.x);
+         int64_t ry0 = MAX2((int64_t)r.offset.y,
+                            (int64_t)draw->render_area.offset.y);
+         int64_t rx1 = MIN2((int64_t)r.offset.x + r.extent.width,
+                            (int64_t)draw->render_area.offset.x +
+                               draw->render_area.extent.width);
+         int64_t ry1 = MIN2((int64_t)r.offset.y + r.extent.height,
+                            (int64_t)draw->render_area.offset.y +
+                               draw->render_area.extent.height);
+
+         /* Also clip to the attachment itself: a render area larger than the
+          * framebuffer would otherwise ask for bounds the 15-bit scissor
+          * fields cannot hold. */
+         rx0 = MAX2(rx0, 0);
+         ry0 = MAX2(ry0, 0);
+         rx1 = MIN2(rx1, (int64_t)w);
+         ry1 = MIN2(ry1, (int64_t)h);
+
+         if (rx1 <= rx0 || ry1 <= ry0) {
+            /*
+             * Empty: every fragment is discarded.  Expressed as top-left past
+             * bottom-right, which is how an empty GL scissor reads.  The
+             * rectangle {1,1}..{0,0} rather than {0,0}..{-1,-1} because the
+             * fields are 15 bits wide and -1 would wrap to 0x7fff, turning the
+             * empty scissor into a full-attachment one.
+             */
+            sx0 = 1;
+            sy0 = 1;
+            sx1 = 0;
+            sy1 = 0;
+         } else {
+            sx0 = (uint32_t)rx0;
+            sy0 = (uint32_t)ry0;
+            sx1 = (uint32_t)(rx1 - 1);
+            sy1 = (uint32_t)(ry1 - 1);
+         }
+      }
 
       ta5_pkt4(draw, REG_A5XX_GRAS_SC_SCREEN_SCISSOR_TL_0, 2);
-      ta5_cs_push(draw, A5XX_GRAS_SC_SCREEN_SCISSOR_TL_0_X(0) |
-                        A5XX_GRAS_SC_SCREEN_SCISSOR_TL_0_Y(0));
-      ta5_cs_push(draw, A5XX_GRAS_SC_SCREEN_SCISSOR_BR_0_X(w - 1) |
-                        A5XX_GRAS_SC_SCREEN_SCISSOR_BR_0_Y(h - 1));
+      ta5_cs_push(draw, A5XX_GRAS_SC_SCREEN_SCISSOR_TL_0_X(sx0) |
+                        A5XX_GRAS_SC_SCREEN_SCISSOR_TL_0_Y(sy0));
+      ta5_cs_push(draw, A5XX_GRAS_SC_SCREEN_SCISSOR_BR_0_X(sx1) |
+                        A5XX_GRAS_SC_SCREEN_SCISSOR_BR_0_Y(sy1));
 
       ta5_pkt4(draw, REG_A5XX_GRAS_SC_VIEWPORT_SCISSOR_TL_0, 2);
-      ta5_cs_push(draw, A5XX_GRAS_SC_VIEWPORT_SCISSOR_TL_0_X(0) |
-                        A5XX_GRAS_SC_VIEWPORT_SCISSOR_TL_0_Y(0));
-      ta5_cs_push(draw, A5XX_GRAS_SC_VIEWPORT_SCISSOR_BR_0_X(w - 1) |
-                        A5XX_GRAS_SC_VIEWPORT_SCISSOR_BR_0_Y(h - 1));
+      ta5_cs_push(draw, A5XX_GRAS_SC_VIEWPORT_SCISSOR_TL_0_X(sx0) |
+                        A5XX_GRAS_SC_VIEWPORT_SCISSOR_TL_0_Y(sy0));
+      ta5_cs_push(draw, A5XX_GRAS_SC_VIEWPORT_SCISSOR_BR_0_X(sx1) |
+                        A5XX_GRAS_SC_VIEWPORT_SCISSOR_BR_0_Y(sy1));
+
+      if (getenv("TA5_TRACE_SCISSOR"))
+         fprintf(stderr,
+                 "ta5[scissor]: fb=%ux%u render=%ux%u+%u+%u effective=%u,%u..%u,%u\n",
+                 w, h, draw->render_area.extent.width,
+                 draw->render_area.extent.height, draw->render_area.offset.x,
+                 draw->render_area.offset.y, sx0, sy0, sx1, sy1);
    }
 
    /*

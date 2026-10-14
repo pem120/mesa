@@ -136,6 +136,35 @@ struct ta5_cmd_buffer
    struct ta5_descriptor_set *bound_sets[4];
 
    /**
+    * Render area of the pass being recorded.
+    *
+    * The effective scissor is the scissor rectangle intersected with this, so
+    * it has to be recorded: a scissor of {0,0,100,100} against a render area
+    * of {0,0,64,64} is the full attachment and not an error.
+    */
+   VkRect2D render_area;
+
+   /**
+    * Dynamic viewport and scissor, as recorded by vkCmdSetViewport and
+    * vkCmdSetScissor.
+    *
+    * a5xx has one viewport, so only index 0 is kept; a call naming a different
+    * index is rejected at record time rather than silently ignored.  The
+    * *_set flags distinguish "never set", which is the case the pipeline's own
+    * static rectangle covers, from "set to an empty rectangle", which is a
+    * legitimate thing to ask for and discards every fragment.
+    *
+    * These are command-buffer state and are deliberately not reset by
+    * vkCmdBeginRenderPass: only the states added by VK_EXT_extended_dynamic_state
+    * are reset there, and this driver does not advertise it.  They do not
+    * survive vkResetCommandPool.
+    */
+   VkViewport viewport;
+   VkRect2D scissor;
+   bool viewport_set;
+   bool scissor_set;
+
+   /**
     * Vertex buffer bindings, as recorded by vkCmdBindVertexBuffers.
     *
     * One entry per binding slot, indexed by binding number, so a pipeline
