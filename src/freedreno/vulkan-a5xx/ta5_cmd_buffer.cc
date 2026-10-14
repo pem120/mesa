@@ -593,29 +593,68 @@ ta5_next_regid(uint32_t reg, uint32_t increment)
  * One unit is 16 *instructions* and an instruction is a 64-bit qword, so a unit
  * is 32 dwords.  ir3_compiler.c:361 sets instr_align = 16 for a5xx,
  * ir3.c:394 computes v->instrlen = DIV_ROUND_UP(instr_count, instr_align), and
- * ir3.c:400 computes info->size = instrlen * instr_align * 8 bytes.  8 bytes
- * per instruction is the "each instruction is 64bits (qword)" rule, so
- * info->size == instrlen * 128 bytes == instrlen * 32 dwords exactly.
+ * fd5_program.c:47 passes v->instrlen straight to CP_LOAD_STATE4_0_NUM_UNIT.
+ * That is the length: instrlen, and nothing derived from info.sizedwords.
  *
- * Measured on this driver's own shaders: the vertex stage reports sizedwords
- * 64 with instrlen 2, the fragment stage sizedwords 32 with instrlen 1.  So
- * sizedwords == instrlen * 32 exactly.  fd5_program.c passes v->instrlen
- * directly to CP_LOAD_STATE4_0_NUM_UNIT, so for IR3 variants the equivalent
- * size-derived expression is sizedwords / 32, not / 16.
+ * This used to compute
  *
- * The old /16 calculation loaded twice the program -- VS 4 units instead of
- * 2, FS 2 instead of 1.  A previous sweep found unmapped reads with the smaller
- * values while the draw state and draw packet lived in different command
- * buffers.  With the complete draw state now in an IB_TARGET_BUF, the
- * stage-specific VS=2/FS=1 values make the VS execute (confirmed with the
- * long-loop hangcheck probe), and match the GL program-load convention.
+ *     MAX2(instrlen, DIV_ROUND_UP(info.sizedwords, 32))
+ *
+ * on the belief -- asserted above until now -- that info.sizedwords is always
+ * instrlen * 32.  It is not.  ir3.c:400 is
+ *
+ *     info->size = MAX2(instrlen * instr_align, instr_count + 4) * 8;
+ *
+ * and the second term is *dump padding*: four NOPs so cffdump does not decode
+ * whatever follows the program as instructions.  For a shader of 13 to 16
+ * instructions instrlen is 1, but instr_count + 4 is 17 to 20, so sizedwords
+ * comes out 34, 36 or 40 rather than 32.  DIV_ROUND_UP then rounds that up to 2
+ * units and the program is loaded a unit too long.
+ *
+ * That reads past the end of the shader BO, which ta5_variant_size() sizes at
+ * info.sizedwords * 4 bytes: 256 bytes asked for against 136 or 160 allocated,
+ * so 96 to 120 bytes of whatever follows.  The draw produces no pixels at all
+ * -- sometimes with a gpu fault, sometimes silently.
+ *
+ * Measured over the 88-case matrix, DIV_ROUND_UP(sizedwords, 32) != instrlen
+ * for exactly 8 cases, and they are exactly the 8 that produce no output:
+ *
+ *     case        sizedwords  instrlen  units   result
+ *     fs:3           34          1        2    no output
+ *     n3to2d:0       34          1        2    no output
+ *     grad:27        34          1        2    no output
+ *     n3to2d:1       36          1        2    no output
+ *     lensplit:0     36          1        2    no output
+ *     grad:24        36          1        2    no output
+ *     grad:26        36          1        2    no output
+ *     lad:3          40          1        2    no output
+ *     all 80 others  32 or 64    1 or 2  ==     correct
+ *
+ * It separates in both directions, which is what makes it the cause and not a
+ * correlate.  TA5_FS_UNITS=1 fixes all 8.  TA5_FS_UNITS=2 breaks grad:0,
+ * layer:0, cube:0, grad:4 and const:0, which otherwise pass.  All thirteen
+ * collapse to the one hash 5f9eb3fedcef8383 -- the attachment still holding the
+ * clear colour -- under the default build.
+ *
+ * It also explains why IR3_SHADER_DEBUG=spillall moved the failure set in both
+ * directions.  Spilling rewrites the program, so it moves shaders into and out
+ * of the 13-to-16 instruction window: the four it fixed left the window, and
+ * grad:25, which has no texture instruction at all, entered it.
+ *
+ * The TA5_*_UNITS overrides stay.  They are what measured this.
+ * TA5_FS_UNITS=2 reproduces the defect on the fixed build -- grad:0, layer:0,
+ * cube:0 and const:0 all collapse to 5f9eb3fedcef8383 again -- but it is a
+ * blunt instrument, not an exact revert: it overrides the length for every
+ * fragment stage, so it also breaks the 72 other one-unit shaders that the old
+ * formula happened to get right (73 WRONG against lavapipe, versus 8 before).
+ * To re-measure the old formula itself, restore the DIV_ROUND_UP term.
  */
 static uint32_t
 ta5_shader_units(const struct ta5_compiled_shader *shader)
 {
    const struct ir3_shader_variant *v =
       (const struct ir3_shader_variant *)shader->variant;
-   uint32_t units = MAX2(shader->instrlen, DIV_ROUND_UP(v->info.sizedwords, 32));
+   uint32_t units = shader->instrlen;
    const char *ov = getenv(v->type == MESA_SHADER_VERTEX ? "TA5_VS_UNITS"
                                                           : "TA5_FS_UNITS");
 
