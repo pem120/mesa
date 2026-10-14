@@ -159,6 +159,13 @@ ta5_pipeline_compile_stage(struct ta5_device *device,
    if (!words || size < 4 || size % 4 != 0)
       return VK_ERROR_INVALID_SHADER_NV;
 
+   /* Before the compile, not after: IR3's error path dies formatting its own
+    * message, so a compile that fails takes this trace line with it and the
+    * only record left is which module was handed to which stage. */
+   if (getenv("TA5_TRACE_NULL"))
+      fprintf(stderr, "ta5[shader]: compiling stage 0x%x, module %p (%zu bytes)\n",
+              stage, (const void *)module, size);
+
    if (!ta5_shader_compile(device, stage, layout, words, size, out)) {
       if (getenv("TA5_TRACE_NULL"))
          fprintf(stderr,
@@ -252,32 +259,56 @@ ta5_CreateGraphicsPipelines(VkDevice _device, VkPipelineCache pipelineCache,
        * Compile the stages the application supplied.  A missing stage is
        * legal in Vulkan and simply means that stage is disabled, so only
        * what was given is compiled.
+       *
+       * Each module is matched to its stage through pStages[i].stage, never
+       * by its position in the array: VkPipelineShaderStageCreateInfo[] has
+       * no ordering requirement, and vkcube supplies fragment before vertex.
+       * Reading positionally compiles the fragment shader as a vertex shader,
+       * which is exactly the sort of mismatch that fails much later and
+       * somewhere else -- measured as "Unhandled intrinsic type: load_output"
+       * inside IR3, on a vertex shader carrying gl_FragCoord.
        */
-      if (ci->stageCount > 0 && ci->pStages[0].module) {
-         struct ta5_compiled_shader vs;
-         result = ta5_pipeline_compile_stage(
-            device, VK_SHADER_STAGE_VERTEX_BIT, pipe->layout,
-            (const struct vk_shader_module *)ci->pStages[0].module, &vs);
-         if (result != VK_SUCCESS) {
-            vk_free(pAllocator, pipe);
-            return vk_error(&device->instance->vk, result);
-         }
-         pipe->vertex = vs;
-         pipe->has_vertex = true;
-      }
+      for (uint32_t i = 0; i < ci->stageCount; i++) {
+         const VkPipelineShaderStageCreateInfo *stage_info = &ci->pStages[i];
+         struct ta5_compiled_shader compiled;
+         struct ta5_compiled_shader *dst;
+         VkShaderStageFlagBits stage;
 
-      if (ci->stageCount > 1 && ci->pStages[1].module) {
-         struct ta5_compiled_shader fs;
+         if (!stage_info->module)
+            continue;
+
+         switch (stage_info->stage) {
+         case VK_SHADER_STAGE_VERTEX_BIT:
+            dst = &pipe->vertex;
+            stage = VK_SHADER_STAGE_VERTEX_BIT;
+            break;
+         case VK_SHADER_STAGE_FRAGMENT_BIT:
+            dst = &pipe->fragment;
+            stage = VK_SHADER_STAGE_FRAGMENT_BIT;
+            break;
+         default:
+            /* No other stage is implemented; see ta5_CreateGraphicsPipelines's
+             * stage validation. */
+            continue;
+         }
+
          result = ta5_pipeline_compile_stage(
-            device, VK_SHADER_STAGE_FRAGMENT_BIT, pipe->layout,
-            (const struct vk_shader_module *)ci->pStages[1].module, &fs);
+            device, stage, pipe->layout,
+            (const struct vk_shader_module *)stage_info->module, &compiled);
          if (result != VK_SUCCESS) {
-            ta5_compiled_shader_free(&pipe->vertex);
+            if (pipe->has_vertex)
+               ta5_compiled_shader_free(&pipe->vertex);
+            if (pipe->has_fragment)
+               ta5_compiled_shader_free(&pipe->fragment);
             vk_free(pAllocator, pipe);
             return vk_error(&device->instance->vk, result);
          }
-         pipe->fragment = fs;
-         pipe->has_fragment = true;
+
+         *dst = compiled;
+         if (dst == &pipe->vertex)
+            pipe->has_vertex = true;
+         else
+            pipe->has_fragment = true;
       }
 
       /* Stage both shader variants into one buffer for indirect upload. */
