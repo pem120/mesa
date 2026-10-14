@@ -569,12 +569,19 @@ ta5_fill_image_subresource_layout(const struct ta5_image *image,
     * `arrayPitch` the distance between array layers; for a 2D array or a 3D
     * image only one of them is non-zero, and reporting level 0's stride for
     * every level made every non-zero mip of a 3D image alias level 0.
+    *
+    * The array layer has to be added here too, and it used to be dropped: all
+    * six faces of a cube map reported offset 0, so filling them through
+    * vkMapMemory wrote every face over the first one and the cube sampled as
+    * a single flat colour.  One linear stride covers both cases -- for a 3D
+    * image `arrayLayer` is the depth slice.
     */
    uint32_t mip = MIN2(subresource->mipLevel,
                        MAX2(image->mip_levels, 1u) - 1);
    const struct ta5_image_level *lvl = &image->levels[mip];
 
-   layout->offset = image->offset + lvl->offset;
+   layout->offset = image->offset + lvl->offset +
+                    (VkDeviceSize)subresource->arrayLayer * lvl->layer_pitch;
    layout->rowPitch = lvl->row_pitch;
    layout->depthPitch = lvl->layer_pitch;
    layout->arrayPitch = lvl->layer_pitch;

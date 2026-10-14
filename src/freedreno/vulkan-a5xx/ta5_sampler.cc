@@ -131,6 +131,13 @@ ta5_CreateSampler(VkDevice _device, const VkSamplerCreateInfo *pCreateInfo,
    struct ta5_device *device = (struct ta5_device *)_device;
    struct ta5_sampler *sampler;
 
+   /*
+    * vk_alloc() dereferences the allocator without checking it, so a NULL one
+    * has to be replaced before any allocation here.
+    */
+   if (pAllocator == NULL)
+      pAllocator = vk_default_allocator();
+
    if (pCreateInfo->mipLodBias > 14.0f || pCreateInfo->mipLodBias < -14.0f)
       return vk_error(&device->instance->vk, VK_ERROR_FEATURE_NOT_PRESENT);
 
