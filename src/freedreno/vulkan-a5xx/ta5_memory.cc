@@ -422,9 +422,17 @@ ta5_CreateImage(VkDevice _device, const VkImageCreateInfo *pCreateInfo,
         pCreateInfo->arrayLayers % 6 != 0))
       return vk_error(&device->instance->vk, VK_ERROR_FORMAT_NOT_SUPPORTED);
 
-   /* Linear tiling only supports 1 mip level and 1 array layer. */
+   /*
+    * Linear tiling: one mip level, no depth, but array layers are fine.  The
+    * fetch unit describes a linear array with the same PITCH it uses for a
+    * 2D image plus an ARRAY_PITCH between layers, so restricting this to one
+    * layer bought nothing -- and it was the only way to upload a cube map,
+    * since a linear image with one mip level can be filled through
+    * vkMapMemory and vkGetImageSubresourceLayout without needing a transfer
+    * command.
+    */
    if (pCreateInfo->tiling == VK_IMAGE_TILING_LINEAR) {
-      if (pCreateInfo->mipLevels != 1 || pCreateInfo->arrayLayers != 1 ||
+      if (pCreateInfo->mipLevels != 1 ||
           pCreateInfo->imageType == VK_IMAGE_TYPE_3D)
          return vk_error(&device->instance->vk, VK_ERROR_FORMAT_NOT_SUPPORTED);
    }
