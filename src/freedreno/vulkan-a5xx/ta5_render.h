@@ -76,7 +76,7 @@ struct ta5_image_view
 VK_DEFINE_NONDISP_HANDLE_CASTS(ta5_image_view, base, VkImageView,
                                VK_OBJECT_TYPE_IMAGE_VIEW)
 
-/** One colour attachment description. */
+/** One attachment description, colour or depth/stencil. */
 struct ta5_render_pass_attachment
 {
    VkFormat format;
@@ -111,6 +111,25 @@ struct ta5_render_pass
 
    VkExtent2D granularity;
 };
+
+/*
+ * The depth/stencil attachment is found by format, not by index.
+ *
+ * Vulkan makes no promise about where it sits in pAttachments -- it only says
+ * the subpass's pDepthStencilAttachment names it -- so "attachment 1" is not a
+ * rule, it is a coincidence of the order one particular application happened
+ * to pass.  ta5_fill_render_pass_state() already classifies the same way, and
+ * two places answering "which attachment is the depth one" differently is how
+ * the clear ends up going to a colour target.
+ */
+static inline int
+ta5_render_pass_depth_attachment(const struct ta5_render_pass *pass)
+{
+   for (uint32_t i = 0; i < pass->attachment_count; i++)
+      if (!pass->attachments[i].used_as_color)
+         return (int)i;
+   return -1;
+}
 
 VK_DEFINE_NONDISP_HANDLE_CASTS(ta5_render_pass, base, VkRenderPass,
                                VK_OBJECT_TYPE_RENDER_PASS)

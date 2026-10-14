@@ -2151,6 +2151,269 @@ ta5_emit_clear(struct ta5_cmd_buffer *cmd, struct ta5_device *device,
    return VK_SUCCESS;
 }
 
+/**
+ * Clear the depth/stencil attachment.
+ *
+ * The same shape as ta5_emit_clear() with two differences, both from
+ * fd5_clear() (fd5_draw.c:291-312): the blit source is BLIT_ZS rather than
+ * BLIT_MRT0, and the clear mask is 0x1 for depth alone.  The packed value
+ * still goes in RB_CLEAR_COLOR_DW0 -- despite the name, that register is the
+ * blit's data source for either kind of buffer.
+ *
+ * Returns VK_ERROR_FORMAT_NOT_SUPPORTED for a depth format with no hardware
+ * code rather than clearing it as DEPTH5_NONE.  ta5_CreateGraphicsPipelines
+ * rejects the same formats, so this is a second line, not the only one.
+ */
+static VkResult
+ta5_emit_clear_depth(struct ta5_cmd_buffer *cmd, struct ta5_device *device,
+                     const struct ta5_render_pass_attachment *att,
+                     const struct ta5_image_view *view, float depth)
+{
+   uint32_t hwfmt = ta5_format_depth_hw(att->format);
+   uint32_t packed;
+   VkResult ret;
+
+   if (hwfmt == 0)
+      return vk_error(&device->instance->vk, VK_ERROR_FORMAT_NOT_SUPPORTED);
+
+   /*
+    * util_pack_z()'s job for the formats that can actually be attached: D16
+    * takes the top 16 bits of the float's 32-bit pattern and D32 takes all
+    * of it.  Written out rather than pulled in, because the alternative is a
+    * dependency on util_pack_z() for four lines.
+    */
+   if (att->format == VK_FORMAT_D16_UNORM) {
+      uint32_t f;
+      memcpy(&f, &depth, sizeof(f));
+      packed = f >> 16;
+   } else {
+      memcpy(&packed, &depth, sizeof(packed));
+   }
+
+   ta5_pkt4(cmd, REG_A5XX_RB_RENDER_CNTL, 1);
+   ta5_cs_push(cmd, 0x00000000);
+
+   ta5_pkt4(cmd, REG_A5XX_GRAS_SC_CNTL, 1);
+   ta5_cs_push(cmd, 0x00000008);
+
+   ta5_pkt4(cmd, REG_A5XX_RB_BLIT_CNTL, 1);
+   ta5_cs_push(cmd, A5XX_RB_BLIT_CNTL_BUF(BLIT_ZS));
+
+   ta5_pkt4(cmd, REG_A5XX_RB_CLEAR_CNTL, 1);
+   ta5_cs_push(cmd, A5XX_RB_CLEAR_CNTL_FAST_CLEAR |
+                     A5XX_RB_CLEAR_CNTL_MASK(0x1));
+
+   ta5_pkt4(cmd, REG_A5XX_RB_CLEAR_COLOR_DW0, 4);
+   ta5_cs_push(cmd, packed);
+   ta5_cs_push(cmd, 0x00000000);
+   ta5_cs_push(cmd, 0x00000000);
+   ta5_cs_push(cmd, 0x00000000);
+
+   /*
+    * The blit reaches the buffer through DEPTH_BUFFER_BASE, so a clear with no
+    * base programmed clears address 0.  This is the one place that mattered
+    * most to get right: a clear to the wrong address still leaves the CCU a
+    * timestamp to wait for, so it reports success while doing nothing.
+    */
+   /*
+    * The same five registers as ta5_emit_depth_state() writes, and for the same
+    * reason: a blit that does not know the pitch clears a buffer of zeroes.
+    * A single-layer attachment makes ARRAY_PITCH irrelevant, but PITCH is the
+    * one that decides which rows get cleared.
+    */
+   {
+      const struct ta5_image_level *lvl =
+         &view->image->levels[MIN2(view->base_mip_level,
+                                    view->image->mip_levels - 1)];
+
+      ta5_pkt4(cmd, REG_A5XX_RB_DEPTH_BUFFER_INFO, 5);
+      ta5_cs_push(cmd, A5XX_RB_DEPTH_BUFFER_INFO_DEPTH_FORMAT(
+                         (enum a5xx_depth_format)hwfmt));
+      ret = ta5_cs_reloc(cmd, view->image->bound_memory->bo, 0, 0);
+      if (ret != VK_SUCCESS)
+         return ret;
+      ta5_cs_push(cmd, A5XX_RB_DEPTH_BUFFER_PITCH((uint32_t)view->row_pitch));
+      ta5_cs_push(cmd, A5XX_RB_DEPTH_BUFFER_ARRAY_PITCH(
+                         (uint32_t)lvl->layer_pitch));
+   }
+
+   if (device->blit_bo == NULL)
+      return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+
+   ret = ta5_event_write_ts(cmd, device->blit_bo, CCU_RESOLVE);
+   if (ret != VK_SUCCESS)
+      return ret;
+
+   ta5_pkt4(cmd, REG_A5XX_RB_CLEAR_CNTL, 1);
+   ta5_cs_push(cmd, 0);
+
+   ta5_pkt4(cmd, REG_A5XX_RB_RENDER_CNTL, 1);
+   ta5_cs_push(cmd, 0x00000008);
+
+   ta5_pkt4(cmd, REG_A5XX_GRAS_SC_CNTL, 1);
+   ta5_cs_push(cmd, 0x00000008);
+
+   return VK_SUCCESS;
+}
+
+/**
+ * Depth test, depth write, and the depth buffer's address.
+ *
+ * Three registers:
+ *
+ *   RB_DEPTH_BUFFER_INFO   the attachment's hardware format
+ *   RB_DEPTH_BUFFER_BASE   its address, as a relocation
+ *   RB_DEPTH_CNTL          Z_TEST_ENABLE, Z_WRITE_ENABLE, ZFUNC
+ *
+ * RB_DEPTH_CNTL is a5xx's whole depth-test state -- there is no separate
+ * compare register -- and ZFUNC takes enum adreno_compare_func values, which
+ * line up with the Vulkan compare ops one for one.  The two enable bits are
+ * independent on both sides: Vulkan has depthTestEnable and depthWriteEnable
+ * as separate booleans, and the hardware has separate bits for the same reason.
+ *
+ * The base is the attachment image's level 0 with no offset, which is the only
+ * case the render pass can currently produce.  A framebuffer may name any
+ * level and the driver does not reject it, so this is correct for the level-0
+ * case an application actually uses and is recorded here as the boundary.
+ */
+static VkResult
+ta5_emit_depth_state(struct ta5_cmd_buffer *cmd,
+                     const struct ta5_pipeline *pipe)
+{
+   const struct ta5_framebuffer *fb = cmd->bound_framebuffer;
+   const struct ta5_render_pass *pass = fb->render_pass;
+   /*
+    * graphics_state.ds is the runtime's own copy: a struct vk_depth_stencil_state
+    * with the flags unpacked into .depth and .stencil, not the
+    * VkPipelineDepthStencilStateCreateInfo the application passed.  Reading it
+    * through the create-info names does not compile, which is a kinder failure
+    * than the alternative -- this state was simply never read before, so there
+    * was nothing to keep in step with.
+    */
+   const struct vk_depth_stencil_state *ds = pipe->graphics_state.ds;
+   bool test = ds && ds->depth.test_enable;
+   bool write = ds && ds->depth.write_enable;
+   enum adreno_compare_func func;
+   struct ta5_image_view *view;
+   uint32_t hwfmt;
+   int idx;
+   VkResult ret;
+
+   idx = ta5_render_pass_depth_attachment(pass);
+   if (idx < 0) {
+      /*
+       * No depth attachment.  Both bits still have to be written as clear: a
+       * draw that inherited the previous draw's register would depth-test
+       * against a buffer it never declared.
+       */
+      ta5_pkt4(cmd, REG_A5XX_RB_DEPTH_CNTL, 1);
+      ta5_cs_push(cmd, 0x00000000);
+      return VK_SUCCESS;
+   }
+
+   hwfmt = ta5_format_depth_hw(pass->attachments[idx].format);
+   if (hwfmt == 0)
+      return vk_error(&cmd->device->instance->vk,
+                      VK_ERROR_FORMAT_NOT_SUPPORTED);
+
+   switch (ds->depth.compare_op) {
+   case VK_COMPARE_OP_NEVER:
+      func = FUNC_NEVER;
+      break;
+   case VK_COMPARE_OP_LESS:
+      func = FUNC_LESS;
+      break;
+   case VK_COMPARE_OP_EQUAL:
+      func = FUNC_EQUAL;
+      break;
+   case VK_COMPARE_OP_LESS_OR_EQUAL:
+      func = FUNC_LEQUAL;
+      break;
+   case VK_COMPARE_OP_GREATER:
+      func = FUNC_GREATER;
+      break;
+   case VK_COMPARE_OP_NOT_EQUAL:
+      func = FUNC_NOTEQUAL;
+      break;
+   case VK_COMPARE_OP_GREATER_OR_EQUAL:
+      func = FUNC_GEQUAL;
+      break;
+   case VK_COMPARE_OP_ALWAYS:
+      func = FUNC_ALWAYS;
+      break;
+   default:
+      return vk_error(&cmd->device->instance->vk,
+                      VK_ERROR_FORMAT_NOT_SUPPORTED);
+   }
+
+   view = fb->attachments[idx];
+
+   /*
+    * The whole depth-buffer block, as fd5_gmem.c:134 writes it:
+    *
+    *     RB_DEPTH_BUFFER_INFO        the format
+    *     RB_DEPTH_BUFFER_BASE        the address, LO/HI
+    *     RB_DEPTH_BUFFER_PITCH       bytes per row
+    *     RB_DEPTH_BUFFER_ARRAY_PITCH bytes per layer
+    *
+    * The first version wrote only the first two, on the reasoning that the
+    * other two are addressing details the unit could work out.  It cannot, and
+    * with both left at zero the unit read every fragment's depth from the same
+    * place: the depth *write* worked, the two-draw cases passed, and every case
+    * whose fragment should have been rejected let it through anyway --
+    * including VK_COMPARE_OP_NEVER, which rejects unconditionally.  That is the
+    * signature of a depth test that is not reading the buffer it was pointed
+    * at, not of a bad compare op.
+    */
+   {
+      const struct ta5_image_level *lvl =
+         &view->image->levels[MIN2(view->base_mip_level,
+                                    view->image->mip_levels - 1)];
+
+      ta5_pkt4(cmd, REG_A5XX_RB_DEPTH_BUFFER_INFO, 5);
+      ta5_cs_push(cmd, A5XX_RB_DEPTH_BUFFER_INFO_DEPTH_FORMAT(
+                         (enum a5xx_depth_format)hwfmt));
+      ret = ta5_cs_reloc(cmd, view->image->bound_memory->bo, 0, 0);
+      if (ret != VK_SUCCESS)
+         return ret;
+      ta5_cs_push(cmd, A5XX_RB_DEPTH_BUFFER_PITCH((uint32_t)view->row_pitch));
+      ta5_cs_push(cmd, A5XX_RB_DEPTH_BUFFER_ARRAY_PITCH(
+                         (uint32_t)lvl->layer_pitch));
+
+      /*
+       * The rasteriser side of the same format.  fd5_gmem.c:147 writes this
+       * alongside RB_DEPTH_BUFFER_INFO, and without it the unit never reads
+       * the buffer the RB pointed at.
+       */
+      ta5_pkt4(cmd, REG_A5XX_GRAS_SU_DEPTH_BUFFER_INFO, 1);
+      ta5_cs_push(cmd, A5XX_GRAS_SU_DEPTH_BUFFER_INFO_DEPTH_FORMAT(
+                         (enum a5xx_depth_format)hwfmt));
+   }
+
+   /*
+    * Z_READ_ENABLE is what makes the unit fetch and compare rather than write
+    * unconditionally.  It goes in only with Z_TEST_ENABLE: with the test off,
+    * leaving it set is a state fd5 never emits.
+    */
+   uint32_t dcntl =
+      (test ? A5XX_RB_DEPTH_CNTL_Z_TEST_ENABLE : 0) |
+      (write ? A5XX_RB_DEPTH_CNTL_Z_WRITE_ENABLE : 0) |
+      A5XX_RB_DEPTH_CNTL_ZFUNC(func) |
+      (test ? A5XX_RB_DEPTH_CNTL_Z_READ_ENABLE : 0);
+   ta5_pkt4(cmd, REG_A5XX_RB_DEPTH_CNTL, 1);
+   ta5_cs_push(cmd, dcntl);
+
+   if (getenv("TA5_TRACE_DEPTH"))
+      fprintf(stderr,
+              "ta5[depth] idx=%d fmt=%d hwfmt=%u test=%d write=%d op=%d "
+              "cntl=%08x bo=%p\n",
+              idx, pass->attachments[idx].format, hwfmt, (int)test, (int)write,
+              (int)ds->depth.compare_op, dcntl,
+              (void *)view->image->bound_memory->bo);
+
+   return VK_SUCCESS;
+}
+
 /** End of the render pass: flush colour out of the CCU. */
 static VkResult
 ta5_emit_sysmem_fini(struct ta5_cmd_buffer *cmd)
@@ -2377,7 +2640,7 @@ ta5_CmdBeginRenderPass(VkCommandBuffer _cmd,
    struct ta5_render_pass *pass =
       ta5_render_pass_from_handle(pRenderPassBegin->renderPass);
    const VkClearValue *clear = pRenderPassBegin->pClearValues;
-   union ta5_color color;
+   uint32_t clear_count = pRenderPassBegin->clearValueCount;
    VkResult ret;
 
    (void)contents;
@@ -2394,8 +2657,13 @@ ta5_CmdBeginRenderPass(VkCommandBuffer _cmd,
     * the scissor the draw computes. */
    cmd->render_area = pRenderPassBegin->renderArea;
 
-   if (clear)
-      color = ta5_color_from_clear(clear[0].color);
+   /*
+    * pClearValues is NULL whenever no attachment asks to be cleared, so it is
+    * indexed only under `clear`, not under `clear_count`: clearValueCount is
+    * then 0 and every loadOp below is LOAD or DONT_CARE, so the loop never
+    * reaches the array.  Reading clear[i] on the strength of clear_count alone
+    * would be the bug, not the guard.
+    */
 
    /* Make room for the worst case before emitting, so the grow cannot move
     * the stream underneath a relocation we have already recorded. */
@@ -2407,9 +2675,45 @@ ta5_CmdBeginRenderPass(VkCommandBuffer _cmd,
    if (ret != VK_SUCCESS)
       return;
 
-   if (pass->attachments[0].load_op == VK_ATTACHMENT_LOAD_OP_CLEAR &&
-       ta5_emit_clear(cmd, cmd->device, &color) != VK_SUCCESS)
-      return;
+   /*
+    * Attachments are cleared in the order pAttachments lists them, which is
+    * not "colour first".  The old code looked only at attachments[0] and
+    * assumed it was colour, which is what made a depth-only or depth-first
+    * attachment clear go to a colour target.
+    */
+   for (uint32_t i = 0; i < pass->attachment_count; i++) {
+      const struct ta5_render_pass_attachment *att = &pass->attachments[i];
+      const struct ta5_framebuffer *fb = cmd->bound_framebuffer;
+
+      if (att->load_op != VK_ATTACHMENT_LOAD_OP_CLEAR)
+         continue;
+
+      /*
+       * An attachment with loadOp CLEAR always has an entry in pClearValues
+       * (VkRenderPassBeginInfo's VUID), so this is a bounds check on the
+       * application's promise rather than a fallback.  pClearValues is NULL
+       * when nothing is cleared, which is the case that matters: without this
+       * the loop would dereference NULL for every non-clearing attachment that
+       * had a stale load_op.
+       */
+      if (i >= clear_count || clear == NULL)
+         return;
+
+      if (att->used_as_color) {
+         /*
+          * One RB_BLIT_CNTL_BUF(BLIT_MRT0) clears the whole colour buffer, so
+          * a second colour attachment would be cleared with the first one's
+          * value.  Only one colour attachment is supported.
+          */
+         union ta5_color c = ta5_color_from_clear(clear[i].color);
+         if (ta5_emit_clear(cmd, cmd->device, &c) != VK_SUCCESS)
+            return;
+      } else {
+         if (ta5_emit_clear_depth(cmd, cmd->device, att, fb->attachments[i],
+                                  clear[i].depthStencil.depth) != VK_SUCCESS)
+            return;
+      }
+   }
 }
 
 VKAPI_ATTR void VKAPI_CALL
@@ -3075,6 +3379,25 @@ ta5_CmdDraw(VkCommandBuffer _cmd, uint32_t vertexCount, uint32_t instanceCount,
 
    ta5_emit_draw_state(draw, vs_tex_count, fs_tex_count);
 
+   /*
+    * Depth state goes in *after* the draw state, not before it.
+    *
+    * ta5_emit_draw_state() zeroes the whole depth block -- INFO to NONE, BASE
+    * to 0, CNTL to 0 -- on the reasoning that a draw with no depth attachment
+    * must not inherit the previous draw's buffer.  Emitting depth first meant
+    * the draw state then cleared it again, so the unit tested against nothing:
+    * every fragment passed, including VK_COMPARE_OP_NEVER, and no depth write
+    * ever landed (measured: depth[0,0] stayed at the clear value on all nine
+    * depth cases while the colour said "passed").  After the draw state the
+    * depth registers hold what this draw asked for.
+    *
+    * It has to be emitted on every draw rather than only when the test is on:
+    * RB_DEPTH_CNTL persists, and a second draw with the test disabled would
+    * otherwise keep testing.
+    */
+   if (ta5_emit_depth_state(draw, pipe) != VK_SUCCESS)
+      return;
+
    ta5_pkt4(draw, REG_A5XX_GRAS_CL_VPORT_XOFFSET_0, 6);
    ta5_cs_push(draw, A5XX_GRAS_CL_VPORT_XOFFSET_0(draw->bound_framebuffer->width
                                                   / 2.0f));
@@ -3084,8 +3407,27 @@ ta5_CmdDraw(VkCommandBuffer _cmd, uint32_t vertexCount, uint32_t instanceCount,
                                                   / 2.0f));
    ta5_cs_push(draw, A5XX_GRAS_CL_VPORT_YSCALE_0(draw->bound_framebuffer->height
                                                  / 2.0f));
-   ta5_cs_push(draw, A5XX_GRAS_CL_VPORT_ZOFFSET_0(0.5f));
-   ta5_cs_push(draw, A5XX_GRAS_CL_VPORT_ZSCALE_0(0.5f));
+   /*
+    * Vulkan NDC z is 0..1, not -1..1.
+    *
+    * The 0.5/0.5 here was GL's depth-range mapping: NDC -1..1 to window 0..1
+    * via z*0.5+0.5.  With a Vulkan NDC that mapping turns a fragment at 0.25
+    * into 0.625 (measured: depth[0,0] read back 0.625 after drawing at 0.25,
+    * and 0.875 after 0.75).  The test still passed -- both the clear and the
+    * fragment went through the same wrong transform -- but the buffer held a
+    * value no Vulkan operation would have written.
+    *
+    * For Vulkan the window mapping is z*scale+offset with scale =
+    * maxDepth-minDepth and offset = minDepth, taken from the dynamic viewport
+    * when the application set one.  The default viewport is 0..1, so the
+    * default here is scale 1, offset 0: the identity.
+    */
+   {
+      float zmin = draw->viewport_set ? draw->viewport.minDepth : 0.0f;
+      float zmax = draw->viewport_set ? draw->viewport.maxDepth : 1.0f;
+      ta5_cs_push(draw, A5XX_GRAS_CL_VPORT_ZOFFSET_0(zmin));
+      ta5_cs_push(draw, A5XX_GRAS_CL_VPORT_ZSCALE_0(zmax - zmin));
+   }
 
    ta5_emit_program_state(draw, pipe);
 

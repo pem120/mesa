@@ -173,11 +173,61 @@ ta5_format_caps_get(VkFormat format)
    return &none;
 }
 
+/*
+ * Formats that have a depth or stencil aspect.
+ *
+ * A separate list rather than a property derived from the format's value.  The
+ * previous version tested bit 0x80000000, on the belief that Vulkan tagged its
+ * depth formats that way.  It does not: no VkFormat has that bit set, so the
+ * test said *colour* for every depth format, including D32_SFLOAT which is
+ * 126.  It went unnoticed because nothing had ever asked the question about a
+ * depth format -- it is used by CreateRenderPass to decide whether an
+ * attachment is a colour target, by ta5_fill_render_pass_state() for the same
+ * reason, and by the image-view aspect check, and all three of those had only
+ * ever been given colour.
+ *
+ * The first depth case measured the consequence: vkCreateImageView on a
+ * D32_SFLOAT image returned VK_ERROR_FORMAT_NOT_SUPPORTED, because the view
+ * check asked for a colour aspect on a colour format and the application had
+ * asked for the depth aspect.
+ */
+static const VkFormat depth_formats[] = {
+   VK_FORMAT_D16_UNORM,         VK_FORMAT_D16_UNORM_S8_UINT,
+   VK_FORMAT_D32_SFLOAT,        VK_FORMAT_D32_SFLOAT_S8_UINT,
+   VK_FORMAT_D24_UNORM_S8_UINT, VK_FORMAT_S8_UINT,
+};
+
 bool
 ta5_format_is_color(VkFormat format)
 {
-   /* Depth/stencil formats carry the 0x80000000 tag. */
-   return (format & 0x80000000u) == 0;
+   for (size_t i = 0; i < ARRAY_SIZE(depth_formats); i++)
+      if (depth_formats[i] == format)
+         return false;
+   return true;
+}
+
+uint32_t
+ta5_format_depth_hw(VkFormat format)
+{
+   /* enum a5xx_depth_format.  The codes are sparse, not an enumeration
+    * order, which is why they cannot be derived from the format's own value
+    * and why a format with no code here has to be rejected rather than
+    * silently treated as DEPTH5_NONE. */
+   switch (format) {
+   case VK_FORMAT_D16_UNORM:
+      return 1; /* DEPTH5_16 */
+   case VK_FORMAT_D24_UNORM_S8_UINT:
+      return 2; /* DEPTH5_24_8 */
+   case VK_FORMAT_D32_SFLOAT:
+      return 4; /* DEPTH5_32 */
+   default:
+      /* D16_S8 and D32_S8 are packed stencil formats.  They are in the format
+       * table because the table is what vkGetPhysicalDeviceFormatProperties
+       * answers from, but nothing can render to them here and reporting a code
+       * for one would let a pipeline be created against a depth buffer that
+       * does not exist. */
+      return 0; /* DEPTH5_NONE */
+   }
 }
 
 uint32_t

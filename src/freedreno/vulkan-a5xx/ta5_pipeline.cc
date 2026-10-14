@@ -45,6 +45,7 @@
 #include "ta5_device.h"
 #include "ta5_shader.h"
 #include "ta5_render.h"
+#include "ta5_formats.h"
 #include "ta5_pipeline.h"
 #include "ta5_entrypoints.h"
 #include "ta5_submit.h"
@@ -369,6 +370,85 @@ ta5_CreateGraphicsPipelines(VkDevice _device, VkPipelineCache pipelineCache,
       vk_graphics_pipeline_state_fill(
          &device->vk, &pipe->graphics_state, ci, &mv_state, &rp_state, 0,
          &pipe->all_state, NULL, VK_SYSTEM_ALLOCATION_SCOPE_OBJECT, NULL);
+
+      /*
+       * Depth and stencil state the draw path cannot honour.
+       *
+       * Checked here rather than at draw time so that the pipeline either
+       * carries a request the hardware will carry out or does not exist.
+       * Silently dropping a stencil test produces a picture that looks
+       * plausible and is wrong, which is worse than a pipeline that fails.
+       *
+       * Depth itself is implemented (ta5_emit_depth_state); what is refused is
+       * everything around it:
+       *
+       *   - a stencil test or write, because RB_STENCIL_CONTROL is written to
+       *     0 on every draw and no stencil path exists yet
+       *   - a depth attachment whose format has no hardware code
+       *   - depthBoundsTest, which needs a second test the unit has no
+       *     register for on this part
+       *   - a pipeline that asks to test depth with no depth attachment, which
+       *     the spec makes undefined rather than a no-op
+       */
+      {
+         const VkPipelineDepthStencilStateCreateInfo *ds =
+            ci->pDepthStencilState;
+         const VkPipelineRasterizationStateCreateInfo *rs =
+            ci->pRasterizationState;
+         int didx = ta5_render_pass_depth_attachment(pipe->render_pass);
+
+         if (ds && (ds->stencilTestEnable == VK_TRUE ||
+                    ds->depthBoundsTestEnable == VK_TRUE)) {
+            fprintf(stderr,
+                    "ta5[pipe] stencil and depthBounds are not implemented "
+                    "(stencilTestEnable=%u depthBoundsTestEnable=%u)\n",
+                    ds->stencilTestEnable, ds->depthBoundsTestEnable);
+            return vk_error(&device->instance->vk,
+                            VK_ERROR_FEATURE_NOT_PRESENT);
+         }
+
+         if (didx >= 0 &&
+             ta5_format_depth_hw(pipe->render_pass->attachments[didx].format)
+                == 0) {
+            fprintf(stderr,
+                    "ta5[pipe] depth format %d has no hardware code\n",
+                    pipe->render_pass->attachments[didx].format);
+            return vk_error(&device->instance->vk,
+                            VK_ERROR_FORMAT_NOT_SUPPORTED);
+         }
+
+         if (ds && ds->depthTestEnable == VK_TRUE && didx < 0) {
+            fprintf(stderr,
+                    "ta5[pipe] depthTestEnable with no depth attachment\n");
+            return vk_error(&device->instance->vk,
+                            VK_ERROR_FEATURE_NOT_PRESENT);
+         }
+
+         /*
+          * Depth writes with no test are legal and common -- a prepass that
+          * only fills z -- but they still need a depth attachment, and they are
+          * the one case where Z_WRITE_ENABLE alone would silently discard
+          * every fragment if the base register were left at zero.
+          */
+         if (ds && ds->depthWriteEnable == VK_TRUE && didx < 0) {
+            fprintf(stderr,
+                    "ta5[pipe] depthWriteEnable with no depth attachment\n");
+            return vk_error(&device->instance->vk,
+                            VK_ERROR_FEATURE_NOT_PRESENT);
+         }
+
+         /*
+          * The rasteriser's depth clamp and the pipeline's are different
+          * things; GRAS/RB depth clamp is emitted unconditionally as off in
+          * ta5_emit_draw_state, so a pipeline that asks for it would get the
+          * opposite of what it asked for.
+          */
+         if (rs && rs->depthClampEnable == VK_TRUE) {
+            fprintf(stderr, "ta5[pipe] depthClampEnable is not implemented\n");
+            return vk_error(&device->instance->vk,
+                            VK_ERROR_FEATURE_NOT_PRESENT);
+         }
+      }
 
       /*
        * Fixed-function state is read from graphics_state at draw time, never

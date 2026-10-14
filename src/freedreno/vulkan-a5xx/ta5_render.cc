@@ -70,7 +70,27 @@ ta5_CreateImageView(VkDevice _device, const VkImageViewCreateInfo *pCreateInfo,
    if (!block_size)
       return vk_error(&device->instance->vk, VK_ERROR_FORMAT_NOT_SUPPORTED);
 
-   if (pCreateInfo->subresourceRange.aspectMask != VK_IMAGE_ASPECT_COLOR_BIT)
+   /*
+    * The aspect has to be one the format actually has.
+    *
+    * This required VK_IMAGE_ASPECT_COLOR_BIT unconditionally, which is what a
+    * depth attachment runs into first: vkCreateImageView on a D32_SFLOAT image
+    * with aspectMask DEPTH came back VK_ERROR_FORMAT_NOT_SUPPORTED before any
+    * depth code had run, so a render pass with a depth attachment could not be
+    * built at all.  Measured, not inferred -- it is the error the first depth
+    * case produced on the device.
+    *
+    * A depth format may be viewed as depth or stencil, because
+    * D24_UNORM_S8_UINT has both and an application is entitled to ask for
+    * either half.  A colour format may not be viewed as either: there is no
+    * depth there to address.
+    */
+   if (pCreateInfo->subresourceRange.aspectMask == 0 ||
+       (pCreateInfo->subresourceRange.aspectMask &
+        (ta5_format_is_color(pCreateInfo->format)
+             ? ~(VkImageAspectFlags)VK_IMAGE_ASPECT_COLOR_BIT
+             : ~(VkImageAspectFlags)(VK_IMAGE_ASPECT_DEPTH_BIT |
+                                     VK_IMAGE_ASPECT_STENCIL_BIT))))
       return vk_error(&device->instance->vk, VK_ERROR_FORMAT_NOT_SUPPORTED);
 
    layers = pCreateInfo->subresourceRange.layerCount;
@@ -225,7 +245,6 @@ ta5_CreateRenderPass(VkDevice _device,
       dst->used_as_color = ta5_format_is_color(a->format);
       dst->load_op = a->loadOp;
    }
-
    /*
     * The render area varies at tile granularity.
     *

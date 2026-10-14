@@ -65,4 +65,17 @@ uint32_t ta5_format_block_size(VkFormat format);
 /** True if a format is a colour (non depth/stencil) format. */
 bool ta5_format_is_color(VkFormat format);
 
+/**
+ * The hardware's depth format code for a depth format, or 0 (DEPTH5_NONE) for
+ * anything that is not one.
+ *
+ * These are the values RB_DEPTH_BUFFER_INFO_DEPTH_FORMAT takes, and they are
+ * not a run of small integers: 16-bit is 1, 24_8 is 2, 32-bit float is 4.
+ * Deriving them here rather than at the call site is because the alternative
+ * is a switch that has to be kept in step with the format table by hand, and a
+ * format added to the table without it programs DEPTH5_NONE and reads the
+ * attachment as uninitialised memory.
+ */
+uint32_t ta5_format_depth_hw(VkFormat format);
+
 #endif /* TA5_FORMATS_H */
