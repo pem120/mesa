@@ -275,6 +275,93 @@ ta5_GetDeviceGroupPeerMemoryFeatures(
 /* Images                                                              */
 /* ------------------------------------------------------------------ */
 
+/**
+ * Fill in the linear layout of every mip level.
+ *
+ * A mip level is `layers` slices for a 1D/2D image and `depth` slices for a
+ * 3D one; a 3D image has exactly one array layer, so the two never multiply.
+ * Each successive level halves width, height and depth, all floor 1, and the
+ * row pitch is re-aligned to 64 bytes per level because that is what the a5xx
+ * linear fetch unit requires -- not merely what makes the arithmetic even.
+ */
+bool
+ta5_image_layout_levels(const struct ta5_image *image,
+                        struct ta5_image_level *out)
+{
+   uint32_t block_size = ta5_format_block_size(image->format);
+   uint32_t w = image->extent.width;
+   uint32_t h = image->extent.height;
+   uint32_t d =
+      image->image_type == VK_IMAGE_TYPE_3D ? image->extent.depth : 1;
+   uint32_t layers = image->image_type == VK_IMAGE_TYPE_3D ? 1 : image->array_layers;
+   VkDeviceSize offset = 0;
+
+   if (!block_size || !w || !h || !d || !layers)
+      return false;
+
+   for (uint32_t i = 0; i < image->mip_levels; i++) {
+      struct ta5_image_level *lvl = &out[i];
+
+      lvl->width = w;
+      lvl->height = h;
+      lvl->depth = d;
+      lvl->layers = layers;
+      lvl->row_pitch = align64((VkDeviceSize)w * block_size, 64);
+      lvl->layer_pitch = lvl->row_pitch * h;
+      lvl->level_size = lvl->layer_pitch * layers * d;
+      lvl->offset = offset;
+      offset += lvl->level_size;
+
+      w = MAX2(w / 2, 1u);
+      h = MAX2(h / 2, 1u);
+      d = MAX2(d / 2, 1u);
+   }
+
+   return true;
+}
+
+/**
+ * Record the derived layout on a real image.
+ */
+static void
+ta5_image_set_layout(struct ta5_image *image)
+{
+   const struct ta5_image_level *last =
+      &image->levels[MAX2(image->mip_levels, 1u) - 1];
+
+   image->row_pitch = image->levels[0].row_pitch;
+   image->array_pitch = image->levels[0].layer_pitch;
+   image->depth_pitch = image->levels[0].layer_pitch;
+   image->data_size = last->offset + last->level_size;
+}
+
+/**
+ * Fill in a throwaway image description for the queries that must report a
+ * layout before any image object exists.
+ *
+ * The temporary goes through exactly the helper vkCreateImage uses, so the
+ * paths cannot drift apart -- which they did while each had its own copy of
+ * the arithmetic, and which is how a 3D image came to be sized as one slice.
+ */
+static void
+ta5_image_layout_from_create_info(struct ta5_image *tmp,
+                                  const VkImageCreateInfo *pCreateInfo)
+{
+   memset(tmp, 0, sizeof(*tmp));
+
+   tmp->format = pCreateInfo->format;
+   tmp->image_type = pCreateInfo->imageType;
+   tmp->extent = pCreateInfo->extent;
+   tmp->mip_levels =
+      MIN2(MAX2(pCreateInfo->mipLevels, 1u), TA5_MAX_IMAGE_MIP_LEVELS);
+   tmp->array_layers = pCreateInfo->arrayLayers;
+   tmp->tiling = pCreateInfo->tiling;
+   tmp->usage = pCreateInfo->usage;
+
+   if (ta5_image_layout_levels(tmp, tmp->levels))
+      ta5_image_set_layout(tmp);
+}
+
 VKAPI_ATTR VkResult VKAPI_CALL
 ta5_CreateImage(VkDevice _device, const VkImageCreateInfo *pCreateInfo,
                 const VkAllocationCallbacks *pAllocator, VkImage *pImage)
@@ -283,7 +370,6 @@ ta5_CreateImage(VkDevice _device, const VkImageCreateInfo *pCreateInfo,
    const struct vk_physical_device *pdev = &device->physical_device->vk;
    struct ta5_image *image;
    uint32_t block_size;
-   VkDeviceSize size;
    VkResult result;
 
    if (pAllocator == NULL)
@@ -311,9 +397,35 @@ ta5_CreateImage(VkDevice _device, const VkImageCreateInfo *pCreateInfo,
    if (!block_size)
       return vk_error(&device->instance->vk, VK_ERROR_FORMAT_NOT_SUPPORTED);
 
+   /*
+    * Vulkan's own shape rules.  They matter here because everything
+    * downstream keys off "3D means depth slices, 2D means array layers":
+    * a 3D image with extra array layers or a 2D image that is 1 slice thick
+    * would silently get the wrong size and the wrong texel descriptor.
+    */
+   switch (pCreateInfo->imageType) {
+   case VK_IMAGE_TYPE_1D:
+      if (pCreateInfo->extent.height != 1 || pCreateInfo->extent.depth != 1 ||
+          pCreateInfo->arrayLayers != 1)
+         return vk_error(&device->instance->vk, VK_ERROR_FORMAT_NOT_SUPPORTED);
+      break;
+   case VK_IMAGE_TYPE_3D:
+      if (pCreateInfo->arrayLayers != 1)
+         return vk_error(&device->instance->vk, VK_ERROR_FORMAT_NOT_SUPPORTED);
+      break;
+   default:
+      break;
+   }
+
+   if ((pCreateInfo->flags & VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT) &&
+       (pCreateInfo->imageType != VK_IMAGE_TYPE_2D || pCreateInfo->mipLevels < 1 ||
+        pCreateInfo->arrayLayers % 6 != 0))
+      return vk_error(&device->instance->vk, VK_ERROR_FORMAT_NOT_SUPPORTED);
+
    /* Linear tiling only supports 1 mip level and 1 array layer. */
    if (pCreateInfo->tiling == VK_IMAGE_TILING_LINEAR) {
-      if (pCreateInfo->mipLevels != 1 || pCreateInfo->arrayLayers != 1)
+      if (pCreateInfo->mipLevels != 1 || pCreateInfo->arrayLayers != 1 ||
+          pCreateInfo->imageType == VK_IMAGE_TYPE_3D)
          return vk_error(&device->instance->vk, VK_ERROR_FORMAT_NOT_SUPPORTED);
    }
 
@@ -337,28 +449,13 @@ ta5_CreateImage(VkDevice _device, const VkImageCreateInfo *pCreateInfo,
    image->usage = pCreateInfo->usage;
    image->offset = 0;
 
-   /* Row pitch is width * block size, rounded up to 64 bytes as a5xx
-    * requires for linear reads. */
-   image->row_pitch = align64((VkDeviceSize)pCreateInfo->extent.width *
-                                 block_size,
-                              64);
-   image->array_pitch = image->row_pitch * pCreateInfo->extent.height;
-   size = image->array_pitch * pCreateInfo->arrayLayers;
+   if (!ta5_image_layout_levels(image, image->levels))
+      return vk_error(&device->instance->vk, VK_ERROR_FORMAT_NOT_SUPPORTED);
 
-   /* Total size across all mip levels (mip i is 1/4 the area of the last). */
-   image->data_size = 0;
-   for (uint32_t i = 0; i < pCreateInfo->mipLevels; i++) {
-      image->data_size += size;
-      size = size ? size / 4 : 0;
-   }
-
-   if (image->data_size > pdev->properties.maxMemoryAllocationCount) {
-      /* not a size check, just keep the value honest below */
-   }
+   ta5_image_set_layout(image);
 
    list_inithead(&image->memory_binding);
    image->bound_memory = NULL;
-
 
    *pImage = ta5_image_to_handle(image);
    return VK_SUCCESS;
@@ -415,21 +512,10 @@ ta5_GetDeviceImageMemoryRequirements(
    VkDevice _device, const VkDeviceImageMemoryRequirements *pInfo,
    VkMemoryRequirements2 *pMemoryRequirements)
 {
-   /* Compute the size the way CreateImage would, without allocating. */
+   /* Compute the layout the way CreateImage would, without allocating. */
    struct ta5_image tmp = {};
-   uint32_t block_size = ta5_format_block_size(pInfo->pCreateInfo->format);
-   VkDeviceSize size;
 
-   tmp.row_pitch =
-      align64((VkDeviceSize)pInfo->pCreateInfo->extent.width * block_size, 64);
-   tmp.array_pitch = tmp.row_pitch * pInfo->pCreateInfo->extent.height;
-
-   size = tmp.array_pitch * pInfo->pCreateInfo->arrayLayers;
-   tmp.data_size = 0;
-   for (uint32_t i = 0; i < pInfo->pCreateInfo->mipLevels; i++) {
-      tmp.data_size += size;
-      size = size ? size / 4 : 0;
-   }
+   ta5_image_layout_from_create_info(&tmp, pInfo->pCreateInfo);
 
    ta5_fill_image_memory_requirements(&tmp,
                                       &pMemoryRequirements->memoryRequirements);
@@ -468,11 +554,23 @@ ta5_fill_image_subresource_layout(const struct ta5_image *image,
                                   const VkImageSubresource *subresource,
                                   VkSubresourceLayout *layout)
 {
-   layout->offset = image->offset;
-   layout->rowPitch = image->row_pitch;
-   layout->depthPitch = image->array_pitch;
-   layout->arrayPitch = image->array_pitch;
-   layout->size = image->data_size;
+   /*
+    * The whole point of the per-level table: a caller asking for mip 3 of a
+    * 3D image gets that level's row pitch and its own slice stride, not
+    * level 0's.  `depthPitch` is the distance between depth slices and
+    * `arrayPitch` the distance between array layers; for a 2D array or a 3D
+    * image only one of them is non-zero, and reporting level 0's stride for
+    * every level made every non-zero mip of a 3D image alias level 0.
+    */
+   uint32_t mip = MIN2(subresource->mipLevel,
+                       MAX2(image->mip_levels, 1u) - 1);
+   const struct ta5_image_level *lvl = &image->levels[mip];
+
+   layout->offset = image->offset + lvl->offset;
+   layout->rowPitch = lvl->row_pitch;
+   layout->depthPitch = lvl->layer_pitch;
+   layout->arrayPitch = lvl->layer_pitch;
+   layout->size = lvl->level_size;
 }
 
 VKAPI_ATTR void VKAPI_CALL
@@ -500,11 +598,8 @@ ta5_GetDeviceImageSubresourceLayout(
    VkSubresourceLayout2 *pLayout)
 {
    struct ta5_image tmp = {};
-   uint32_t block_size = ta5_format_block_size(pInfo->pCreateInfo->format);
 
-   tmp.row_pitch =
-      align64((VkDeviceSize)pInfo->pCreateInfo->extent.width * block_size, 64);
-   tmp.array_pitch = tmp.row_pitch * pInfo->pCreateInfo->extent.height;
+   ta5_image_layout_from_create_info(&tmp, pInfo->pCreateInfo);
 
    ta5_fill_image_subresource_layout(&tmp, &pInfo->pSubresource->imageSubresource,
                                      &pLayout->subresourceLayout);

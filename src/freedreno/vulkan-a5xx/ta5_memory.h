@@ -78,6 +78,44 @@ struct ta5_memory
 VK_DEFINE_NONDISP_HANDLE_CASTS(ta5_memory, base, VkDeviceMemory,
                        VK_OBJECT_TYPE_DEVICE_MEMORY)
 
+/**
+ * Mip levels an image may have.
+ *
+ * The Vulkan specification guarantees an implementation supports at least 16,
+ * so this is the floor rather than a device limit.  Having a fixed bound lets
+ * the per-level layout live inside the image instead of a second allocation.
+ */
+#define TA5_MAX_IMAGE_MIP_LEVELS 16
+
+/**
+ * Linear (non-tiled) layout of one mip level of an image.
+ *
+ * Everything the a5xx texel descriptor needs about a sampled image comes from
+ * here, so the sizing has to live in one place: CreateImage,
+ * vkGetDeviceImageMemoryRequirements, vkGetImageSubresourceLayout and the
+ * descriptor all have to agree, and a 3D image is `depth` times the size of a
+ * 2D one with the same width and height.
+ */
+struct ta5_image_level
+{
+   uint32_t width;      /**< extent at this level */
+   uint32_t height;
+   uint32_t depth;      /**< slices: extent depth for 3D, otherwise 1 */
+   uint32_t layers;     /**< array layers at this level */
+   VkDeviceSize row_pitch;    /**< bytes per row, 64-byte aligned */
+   VkDeviceSize layer_pitch;  /**< bytes per array layer, or per depth slice */
+   VkDeviceSize level_size;   /**< bytes for the whole level */
+   VkDeviceSize offset;       /**< byte offset of the level in the image */
+};
+
+/**
+ * Fill in the linear layout of every mip level of `image`, level 0 first.
+ *
+ * Returns false for an extent degenerate enough not to describe a real image.
+ */
+bool ta5_image_layout_levels(const struct ta5_image *image,
+                             struct ta5_image_level *out);
+
 struct ta5_image
 {
    struct vk_image vk;
@@ -97,7 +135,11 @@ struct ta5_image
    VkDeviceSize offset;
    VkDeviceSize row_pitch;
    VkDeviceSize array_pitch;
+   VkDeviceSize depth_pitch;
    VkDeviceSize data_size;
+
+   /** Per-level linear layout, filled in by ta5_image_layout_levels(). */
+   struct ta5_image_level levels[TA5_MAX_IMAGE_MIP_LEVELS];
 
    struct list_head memory_binding;
    struct ta5_memory *bound_memory;
