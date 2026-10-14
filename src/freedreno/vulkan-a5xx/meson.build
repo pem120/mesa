@@ -29,6 +29,7 @@ libta5_files = files(
   'ta5_shader.cc',
   'ta5_render.cc',
   'ta5_sampler.cc',
+  'ta5_texel.cc',
   'ta5_pipeline.cc',
   'ta5_queue.cc',
   'ta5_submit.cc',
