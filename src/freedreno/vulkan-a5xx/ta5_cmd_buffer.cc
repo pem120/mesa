@@ -606,10 +606,21 @@ ta5_next_regid(uint32_t reg, uint32_t increment)
  *     info->size = MAX2(instrlen * instr_align, instr_count + 4) * 8;
  *
  * and the second term is *dump padding*: four NOPs so cffdump does not decode
- * whatever follows the program as instructions.  For a shader of 13 to 16
+ * whatever follows the program as instructions.  Whenever instr_count exceeds
+ * 16 * instrlen - 4 -- the last four counts of *every* unit -- instr_count + 4
+ * wins, sizedwords stops being a multiple of 32, and DIV_ROUND_UP rounds it to
+ * one unit more than the program occupies.  For a shader of 13 to 16
  * instructions instrlen is 1, but instr_count + 4 is 17 to 20, so sizedwords
- * comes out 34, 36 or 40 rather than 32.  DIV_ROUND_UP then rounds that up to 2
- * units and the program is loaded a unit too long.
+ * comes out 34, 36 or 40 rather than 32, and the program is loaded 2 units long
+ * against 1.  The same thing happens at 29 to 32 instructions with 3 units
+ * instead of 2, and at 45 to 48 with 4 instead of 3.
+ *
+ * The instrlen-only formula below is correct at every one of those, so this is
+ * not a code change; it is recorded because an earlier version of this comment
+ * named only the 13-to-16 window, and a reader taking it at face value would
+ * conclude that a 32-instruction shader was immune.  The 88-case matrix happened
+ * to contain no shader outside that window, which is why the measured failure
+ * set below is all instrlen == 1.
  *
  * That reads past the end of the shader BO, which ta5_variant_size() sizes at
  * info.sizedwords * 4 bytes: 256 bytes asked for against 136 or 160 allocated,

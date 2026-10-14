@@ -68,7 +68,11 @@ struct ta5_compiled_shader
    void *nir_ctx;
    uint32_t *code;     /**< the assembled PM4 microcode */
    uint32_t code_size; /**< in dwords */
-   uint32_t instrlen;  /**< dwords, for CP_LOAD_STATE4_0_NUM_UNIT */
+   /* Units of 16 instructions, which is what CP_LOAD_STATE4_0_NUM_UNIT counts --
+    * not dwords, which is what code_size above is.  The two are related by
+    * code_size == instrlen * 32, so mixing them up loads 32x too much or too
+    * little; see ta5_shader_units().  */
+   uint32_t instrlen;
    uint32_t constlen;  /**< constant bank size in dwords */
 };
 
