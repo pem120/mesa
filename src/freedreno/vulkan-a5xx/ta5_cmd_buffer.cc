@@ -361,7 +361,7 @@ ta5_ResetCommandBuffer(VkCommandBuffer _cmd, VkCommandBufferResetFlags flags)
 #include "util/half_float.h"  /* a5xx.xml.h needs _mesa_float_to_half */
 
 #include "freedreno_pm4.h"   /* pulls in adreno_pm4.xml.h */
-#include "a5xx.xml.h"
+#include "fd5_hw.h"          /* approved wrapper for a5xx.xml.h */
 
 #include "ir3/ir3_shader.h"
 #include "drm/msm_drm.h"
