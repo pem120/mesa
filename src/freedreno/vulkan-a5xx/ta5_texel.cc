@@ -187,22 +187,27 @@ ta5_texel_swizzle(const struct ta5_image_view *view)
 }
 
 /**
- * Byte order of the stored texel, from the format.
+ * Byte order of the stored texel.
  *
- * B8G8R8A8 and A8B8G8R8 store the colour channels in the opposite order from
- * the sampler result, so the hardware is told to swap while sampling.  Without
- * this, a B8G8R8A8 texture reads back with red and blue transposed -- which
- * looks like a shader bug rather than a format one.
+ * a5xx returns the 32-bit texel in WZYX order, and fd5 leaves
+ * TEX_CONST_0.SWAP at that default for every format except
+ * PIPE_FORMAT_X24S8_UINT, where it sets SWAP(XYZW) to shuffle the stencil
+ * component back into place.  Sampling z24s8 as an 8888 uint loses the
+ * correspondence with the swizzle, and that is the only reason GL ever
+ * touches this field.
+ *
+ * Setting SWAP(XYZW) for an ordinary RGBA8 image therefore reverses all four
+ * channels, and it is not obvious: a fully saturated red or blue texel is
+ * symmetric under reversal and still looks right, green becomes magenta, and
+ * with a cube map it looks exactly like the hardware picking the wrong face.
+ * Two of the six cube faces come out correct by accident.
  */
 static enum a3xx_color_swap
 ta5_texel_swap(VkFormat format)
 {
    switch (format) {
-   case VK_FORMAT_B8G8R8A8_UNORM:
-   case VK_FORMAT_B8G8R8A8_SRGB:
-      return WZYX;
    default:
-      return XYZW;
+      return WZYX;
    }
 }
 
