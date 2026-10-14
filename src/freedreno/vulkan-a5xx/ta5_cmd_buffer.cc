@@ -1438,20 +1438,47 @@ ta5_emit_textures(struct ta5_cmd_buffer *cmd, enum a4xx_state_block sb,
       if (!desc)
          continue;
 
+      /*
+       * Slot i, not "the next free one".
+       *
+       * ta5_lower_tex_units() numbers a shader's texture_index and
+       * sampler_index with one global index into the same combined order this
+       * loop walks, so slot i here is the slot unit i fetches.  Packing each
+       * array with its own running counter instead is invisible for
+       * COMBINED_IMAGE_SAMPLER-only layouts -- both counters advance together
+       * -- and wrong the moment a layout separates them, because a SAMPLER
+       * occupying order index 0 leaves tex_desc[0] holding the descriptor from
+       * index 1, and the shader asking for unit 1 reads tex_desc[1], which was
+       * never written.
+       *
+       * So the index is the order index, a descriptor of the other kind leaves
+       * its slot NULL, and the write loops below emit zeros for those.  The
+       * counts are the highest index written plus one, because the load is
+       * contiguous from slot 0.
+       *
+       * Past TA5_MAX_TEX_UNITS the hardware cannot address the unit at all,
+       * so the descriptor is dropped rather than silently aliased onto a unit
+       * that is in use.
+       */
+      if (i >= TA5_MAX_TEX_UNITS)
+         break;
+
       if (order[i].type == VK_DESCRIPTOR_TYPE_SAMPLER) {
-         if (num_samplers < TA5_MAX_TEX_UNITS)
-            samp_desc[num_samplers++] = desc;
+         samp_desc[i] = desc;
+         if (num_samplers < i + 1)
+            num_samplers = i + 1;
          continue;
       }
 
-      if (num_textures >= TA5_MAX_TEX_UNITS)
-         break;
+      tex_desc[i] = desc;
+      if (num_textures < i + 1)
+         num_textures = i + 1;
 
-      tex_desc[num_textures++] = desc;
-
-      if (order[i].type == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER &&
-          num_samplers < TA5_MAX_TEX_UNITS)
-         samp_desc[num_samplers++] = desc;
+      if (order[i].type == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER) {
+         samp_desc[i] = desc;
+         if (num_samplers < i + 1)
+            num_samplers = i + 1;
+      }
    }
 
    if (getenv("TA5_TRACE_TEX"))
@@ -1484,8 +1511,15 @@ ta5_emit_textures(struct ta5_cmd_buffer *cmd, enum a4xx_state_block sb,
       ta5_cs_push(cmd, CP_LOAD_STATE4_2_EXT_SRC_ADDR_HI(0));
 
       for (uint32_t i = 0; i < num_samplers; i++) {
+         /* A NULL slot is a unit whose descriptor is a texture and not a
+          * sampler, and is written as zeros so the units above it keep their
+          * places.  Without this the deref is of NULL + the sampler offset:
+          * measured as a segfault at address 0x10 on MODE=septex, the first
+          * layout with a SAMPLED_IMAGE at a lower order index than a
+          * SAMPLER. */
          struct ta5_sampler *samp =
-            ta5_sampler_from_handle(samp_desc[i]->data.image.sampler);
+            samp_desc[i] ? ta5_sampler_from_handle(samp_desc[i]->data.image.sampler)
+                         : NULL;
 
          for (uint32_t w = 0; w < 4; w++)
             ta5_cs_push(cmd, samp ? samp->desc[w] : 0);
@@ -1503,12 +1537,16 @@ ta5_emit_textures(struct ta5_cmd_buffer *cmd, enum a4xx_state_block sb,
    ta5_cs_push(cmd, CP_LOAD_STATE4_2_EXT_SRC_ADDR_HI(0));
 
    for (uint32_t i = 0; i < num_textures; i++) {
+      struct ta5_descriptor *d = tex_desc[i];
       struct ta5_image_view *view =
-         ta5_image_view_from_handle(tex_desc[i]->data.image.image_view);
+         d ? ta5_image_view_from_handle(d->data.image.image_view) : NULL;
       uint32_t words[TA5_TEXEL_DESC_DWORDS];
       uint64_t address = 0;
 
-      if (!view || !view->image->bound_memory ||
+      /* A NULL slot is a unit whose descriptor is of the other kind -- a
+       * SAMPLER in a layout that also separates the two -- and it is written as
+       * zeros so that the units above it keep their places. */
+      if (!d || !view || !view->image->bound_memory ||
           !view->image->bound_memory->bo) {
          for (uint32_t w = 0; w < TA5_TEXEL_DESC_DWORDS; w++)
             ta5_cs_push(cmd, 0);
