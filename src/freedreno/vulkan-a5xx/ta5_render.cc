@@ -59,6 +59,7 @@ ta5_CreateImageView(VkDevice _device, const VkImageViewCreateInfo *pCreateInfo,
    struct ta5_image_view *view;
    struct ta5_image *image;
    uint32_t block_size;
+   uint32_t layers;
 
    if (pAllocator == NULL)
       pAllocator = vk_default_allocator();
@@ -69,6 +70,65 @@ ta5_CreateImageView(VkDevice _device, const VkImageViewCreateInfo *pCreateInfo,
    if (!block_size)
       return vk_error(&device->instance->vk, VK_ERROR_FORMAT_NOT_SUPPORTED);
 
+   if (pCreateInfo->subresourceRange.aspectMask != VK_IMAGE_ASPECT_COLOR_BIT)
+      return vk_error(&device->instance->vk, VK_ERROR_FORMAT_NOT_SUPPORTED);
+
+   layers = pCreateInfo->subresourceRange.layerCount;
+
+   /*
+    * The view type has to agree with the image, and the mismatches are the
+    * ones that produce plausible-looking garbage rather than an error later:
+    * a CUBE view over six layers is addressed with a direction vector and
+    * picks the layer by sign of the dominant component, while a 2D_ARRAY view
+    * is addressed by an index. Get this wrong and sampling returns the wrong
+    * face of the wrong image rather than failing.
+    */
+   switch (pCreateInfo->viewType) {
+   case VK_IMAGE_VIEW_TYPE_1D:
+      if (image->image_type != VK_IMAGE_TYPE_1D)
+         return vk_error(&device->instance->vk, VK_ERROR_FORMAT_NOT_SUPPORTED);
+      break;
+
+   case VK_IMAGE_VIEW_TYPE_2D:
+      if (image->image_type != VK_IMAGE_TYPE_2D)
+         return vk_error(&device->instance->vk, VK_ERROR_FORMAT_NOT_SUPPORTED);
+      break;
+
+   case VK_IMAGE_VIEW_TYPE_3D:
+      if (image->image_type != VK_IMAGE_TYPE_3D || layers != 1)
+         return vk_error(&device->instance->vk, VK_ERROR_FORMAT_NOT_SUPPORTED);
+      break;
+
+   case VK_IMAGE_VIEW_TYPE_CUBE:
+      if (image->image_type != VK_IMAGE_TYPE_2D || layers != 6 ||
+          !(image->flags & VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT) ||
+          pCreateInfo->subresourceRange.baseArrayLayer % 6 != 0)
+         return vk_error(&device->instance->vk, VK_ERROR_FORMAT_NOT_SUPPORTED);
+      break;
+
+   case VK_IMAGE_VIEW_TYPE_CUBE_ARRAY:
+      if (image->image_type != VK_IMAGE_TYPE_2D || layers == 0 || layers % 6 != 0 ||
+          !(image->flags & VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT) ||
+          pCreateInfo->subresourceRange.baseArrayLayer % 6 != 0)
+         return vk_error(&device->instance->vk, VK_ERROR_FORMAT_NOT_SUPPORTED);
+      break;
+
+   case VK_IMAGE_VIEW_TYPE_2D_ARRAY:
+      if (image->image_type != VK_IMAGE_TYPE_2D || layers <= 1)
+         return vk_error(&device->instance->vk, VK_ERROR_FORMAT_NOT_SUPPORTED);
+      break;
+
+   default:
+      return vk_error(&device->instance->vk, VK_ERROR_FORMAT_NOT_SUPPORTED);
+   }
+
+   if (pCreateInfo->subresourceRange.baseMipLevel +
+          pCreateInfo->subresourceRange.levelCount >
+      image->mip_levels ||
+       pCreateInfo->subresourceRange.baseArrayLayer + layers >
+          image->array_layers)
+      return vk_error(&device->instance->vk, VK_ERROR_FORMAT_NOT_SUPPORTED);
+
    view = (struct ta5_image_view *)vk_zalloc(pAllocator, sizeof(*view), 8,
                                              VK_SYSTEM_ALLOCATION_SCOPE_DEVICE);
    if (!view)
@@ -77,14 +137,20 @@ ta5_CreateImageView(VkDevice _device, const VkImageViewCreateInfo *pCreateInfo,
    vk_object_base_init(&device->vk, &view->base, VK_OBJECT_TYPE_IMAGE_VIEW);
    view->device = device;
    view->image = image;
+   view->view_type = pCreateInfo->viewType;
    view->format = pCreateInfo->format;
    view->aspect = pCreateInfo->subresourceRange.aspectMask;
    view->base_mip_level = pCreateInfo->subresourceRange.baseMipLevel;
    view->level_count = pCreateInfo->subresourceRange.levelCount;
    view->base_array_layer = pCreateInfo->subresourceRange.baseArrayLayer;
-   view->layer_count = pCreateInfo->subresourceRange.layerCount;
-   view->row_pitch = image->tiling == VK_IMAGE_TILING_LINEAR ? image->row_pitch
-                                                             : 0;
+   view->layer_count = layers;
+   view->comp[0] = pCreateInfo->components.r;
+   view->comp[1] = pCreateInfo->components.g;
+   view->comp[2] = pCreateInfo->components.b;
+   view->comp[3] = pCreateInfo->components.a;
+   view->row_pitch = image->tiling == VK_IMAGE_TILING_LINEAR
+                        ? image->row_pitch
+                        : 0;
 
    *pView = ta5_image_view_to_handle(view);
    return VK_SUCCESS;

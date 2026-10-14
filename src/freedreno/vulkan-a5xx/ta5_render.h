@@ -53,12 +53,21 @@ struct ta5_image_view
    struct ta5_device *device;
 
    struct ta5_image *image;
+   VkImageViewType view_type;
    VkFormat format;
    VkImageAspectFlags aspect;
    uint32_t base_mip_level;
    uint32_t level_count;
    uint32_t base_array_layer;
    uint32_t layer_count;
+
+   /**
+    * Component swizzle, VkComponentSwizzle in G, B, R, A order.
+    *
+    * a5xx has this in the texel descriptor (A5XX_TEX_CONST_0_SWAP), so unlike
+    * the image types it is not something the hardware infers from the view.
+    */
+   uint8_t comp[4];
 
    /** Linear row pitch when the view is linear-tiled, else 0. */
    uint32_t row_pitch;
