@@ -271,20 +271,47 @@ ta5_GetPhysicalDeviceImageFormatProperties2(
    if (feats == 0)
       return VK_ERROR_FORMAT_NOT_SUPPORTED;
 
-   /* Reject usages the chosen tiling cannot provide. */
-#define CHECK_USAGE(bit)                                                  \
-   if ((pImageFormatInfo->usage & (bit)) && !(feats & (bit)))             \
+   /*
+    * Reject usages the chosen tiling cannot provide.
+    *
+    * The two sides are NOT the same enumeration and their bits do not line up:
+    * VkImageUsageFlags has TRANSFER_DST at 0x2 and COLOR_ATTACHMENT at 0x10,
+    * while VkFormatFeatureFlags has TRANSFER_DST at 0x8000 and
+    * COLOR_ATTACHMENT at 0x200.  The macro used to compare a usage bit
+    * against a feature bit of the same name, so almost every usage was tested
+    * against an unrelated feature flag.
+    *
+    * Measured: a 2D R8G8B8A8_UNORM linear image -- the exact image this whole
+    * harness samples, and the format vkcube's cubemap is -- was rejected with
+    * VK_ERROR_FORMAT_NOT_SUPPORTED for *every* usage that included
+    * TRANSFER_DST, at every mip level, because 0x8000 happened to be clear in
+    * the feature set.  The same image with SAMPLED alone succeeded, which is
+    * why nothing noticed: no case asked for TRANSFER_DST before now.
+    *
+    * Each pair is written out in full rather than through a same-named macro,
+    * because the names being different is the whole point.
+    */
+#define REJECT_USAGE(usage_bit, feature_bit)                                \
+   if ((pImageFormatInfo->usage & (usage_bit)) && !(feats & (feature_bit))) \
       return VK_ERROR_FORMAT_NOT_SUPPORTED
 
-   CHECK_USAGE(VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT);
-   CHECK_USAGE(VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT);
-   CHECK_USAGE(VK_FORMAT_FEATURE_TRANSFER_SRC_BIT);
-   CHECK_USAGE(VK_FORMAT_FEATURE_TRANSFER_DST_BIT);
-   CHECK_USAGE(VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT);
-   CHECK_USAGE(VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BLEND_BIT);
-   CHECK_USAGE(VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT);
-   CHECK_USAGE(VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT);
-#undef CHECK_USAGE
+   REJECT_USAGE(VK_IMAGE_USAGE_SAMPLED_BIT,
+                VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT);
+   REJECT_USAGE(VK_IMAGE_USAGE_STORAGE_BIT,
+                VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT);
+   REJECT_USAGE(VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
+                VK_FORMAT_FEATURE_TRANSFER_SRC_BIT);
+   REJECT_USAGE(VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+                VK_FORMAT_FEATURE_TRANSFER_DST_BIT);
+   REJECT_USAGE(VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT,
+                VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT);
+   REJECT_USAGE(VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT,
+                VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BLEND_BIT);
+   REJECT_USAGE(VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT,
+                VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT);
+   REJECT_USAGE(VK_IMAGE_USAGE_SAMPLED_BIT,
+                VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT);
+#undef REJECT_USAGE
 
    /*
     * a5xx tiler render targets support 1x/2x/4x MSAA; everything else is

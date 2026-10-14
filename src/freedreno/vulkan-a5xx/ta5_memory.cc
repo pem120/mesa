@@ -473,12 +473,20 @@ ta5_CreateImage(VkDevice _device, const VkImageCreateInfo *pCreateInfo,
     * since a linear image with one mip level can be filled through
     * vkMapMemory and vkGetImageSubresourceLayout without needing a transfer
     * command.
+    *
+    * mipLevels > 1 used to be rejected here as well.  It was not a
+    * layout problem -- ta5_image_layout_levels() already sizes every level and
+    * a linear mip chain is just consecutive level_size blocks -- it was that
+    * nothing could fill one: with no transfer command, a mipped image could
+    * only be written through a host mapping, and that covers one level.  With
+    * ta5_CmdCopyBufferToImage there is a way, so the restriction is gone.
+    *
+    * 3D stays rejected: its slices are addressed through MIN_LAYERSZ rather
+    * than a layer pitch, and nothing has exercised that path here.
     */
-   if (pCreateInfo->tiling == VK_IMAGE_TILING_LINEAR) {
-      if (pCreateInfo->mipLevels != 1 ||
-          pCreateInfo->imageType == VK_IMAGE_TYPE_3D)
-         return vk_error(&device->instance->vk, VK_ERROR_FORMAT_NOT_SUPPORTED);
-   }
+   if (pCreateInfo->tiling == VK_IMAGE_TILING_LINEAR &&
+       pCreateInfo->imageType == VK_IMAGE_TYPE_3D)
+      return vk_error(&device->instance->vk, VK_ERROR_FORMAT_NOT_SUPPORTED);
 
    if (pCreateInfo->samples > 1 && block_size != 4)
       return vk_error(&device->instance->vk, VK_ERROR_FEATURE_NOT_PRESENT);
@@ -499,6 +507,24 @@ ta5_CreateImage(VkDevice _device, const VkImageCreateInfo *pCreateInfo,
    image->tiling = pCreateInfo->tiling;
    image->usage = pCreateInfo->usage;
    image->offset = 0;
+
+   /*
+    * Clamp the level count before the layout loop, not after.
+    *
+    * ta5_image_layout_levels() writes image->mip_levels entries into a
+    * levels[] array of TA5_MAX_IMAGE_MIP_LEVELS, and it had only ever been
+    * handed 1, so the bound was never exercised.  The query path
+    * (ta5_image_layout_from_create_info) clamps; this one did not, so a caller
+    * asking for 17 levels wrote past the end of the array into the rest of
+    * struct ta5_image and the allocation behind it.
+    *
+    * Vulkan requires mipLevels to be at most the extent's largest dimension
+    * down to 1, so anything larger is invalid usage and the clamp here is a
+    * guard, not a silent reinterpretation: the view below still reports the
+    * count the caller asked for and the layout has to cover it.
+    */
+   if (image->mip_levels > TA5_MAX_IMAGE_MIP_LEVELS)
+      return vk_error(&device->instance->vk, VK_ERROR_FORMAT_NOT_SUPPORTED);
 
    if (!ta5_image_layout_levels(image, image->levels))
       return vk_error(&device->instance->vk, VK_ERROR_FORMAT_NOT_SUPPORTED);

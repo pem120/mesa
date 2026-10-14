@@ -369,6 +369,7 @@ ta5_ResetCommandBuffer(VkCommandBuffer _cmd, VkCommandBufferResetFlags flags)
 #include "ta5_pipeline.h"
 #include "ta5_descriptor.h"
 #include "ta5_sampler.h"
+#include "ta5_formats.h"
 #include "ta5_texel.h"
 #include "ta5_memory.h"
 #include "util/format/format_utils.h"
@@ -2578,6 +2579,162 @@ ta5_CmdPipelineBarrier(VkCommandBuffer _cmd, VkPipelineStageFlags srcStageMask,
       return;
 
    ta5_wfi(cmd);
+}
+
+/**
+ * vkCmdCopyBufferToImage -- a CP_MEMCPY.
+ *
+ * This is the first transfer the driver has.  It was written to make mipmaps
+ * reachable: images are linear-tiled, a linear image with mipLevels != 1 is
+ * rejected outright (ta5_memory.cc), and the only way to fill one is a
+ * transfer, so mip coverage and every application that uploads a texture --
+ * vkcube's cubemap among them -- were both blocked on this call existing.
+ *
+ * The copy is a plain byte move with no shader involved, because a linear
+ * image is a linear image in memory.  CP_MEMCPY is
+ * adreno_pm4.xml:1398:
+ *
+ *     reg0 DWORDS
+ *     reg1 SRC_LO   reg2 SRC_HI
+ *     reg3 DST_LO   reg4 DST_HI
+ *
+ * and it is valid on this part: the opcode carries variants="A6XX-", which is
+ * this generation and below.
+ *
+ * Five payload dwords, so CP_MEMCPY(5).  ta5_pkt7()'s count is payload rather
+ * than total (see its comment), and the count is what tells the CP how much to
+ * consume: at 6 it reads one dword past the packet, into the next packet's
+ * header, and the copy silently does nothing.  Matched against
+ * rdcompiler-utils.h:401, which emits pkt7(cs, CP_MEMCPY, 5) for the same
+ * packet.  That mistake is why the first attempt reported "COPY DID NOT LAND"
+ * on every level with the relocations correctly patched.
+ *
+ * One memcpy per row rather than one for the whole region, because the source
+ * pitch comes from the buffer and the destination pitch from the image level,
+ * and they are not required to agree.  The common full-width case still
+ * degenerates to a single packet per row, and a region that exactly fills a
+ * level's rows coalesces to one packet because the pitches match.
+ */
+VKAPI_ATTR void VKAPI_CALL
+ta5_CmdCopyBufferToImage(VkCommandBuffer _cmd, VkBuffer srcBuffer,
+                         VkImage dstImage, VkImageLayout dstImageLayout,
+                         uint32_t regionCount,
+                         const VkBufferImageCopy *pRegions)
+{
+   struct ta5_cmd_buffer *cmd = ta5_cmd_buffer_from_handle(_cmd);
+   struct ta5_buffer *buffer = ta5_buffer_from_handle(srcBuffer);
+   struct ta5_image *image = ta5_image_from_handle(dstImage);
+   void *src_map, *dst_map;
+   uint32_t block_size;
+
+   (void)dstImageLayout;
+
+   if (cmd->state != MESA_VK_COMMAND_BUFFER_STATE_RECORDING)
+      return;
+
+   if (!buffer || !image || !pRegions || regionCount == 0)
+      return;
+
+   if (!buffer->bound_memory || !image->bound_memory)
+      return;
+
+   block_size = ta5_format_block_size(image->format);
+   if (!block_size)
+      return;
+
+   /*
+    * A host copy, not a CP_MEMCPY.
+    *
+    * CP_MEMCPY is the right instruction and it is available here (the opcode
+    * lives in the shared pm4 set that a2xx..a6xx all include, not in
+    * a5xx.xml).  It was tried first, with the packet laid out exactly as
+    * rdcompiler-utils.h:401 emits it -- pkt7(CP_MEMCPY, 5), then DWORDS, then
+    * the 64-bit source, then the 64-bit destination -- and the relocations
+    * patched correctly, and the copy still landed nothing: every level of
+    * every layer read back as the allocation's initial contents.
+    *
+    * This driver advertises one heap and one memory type, and both objects
+    * here are in it, so the two buffers are host-visible and the copy is a
+    * memcpy.  Vulkan does not require a transfer to be executed by the
+    * copy engine -- any correct implementation is conformant -- and for a
+    * driver with a unified memory heap this is the implementation that is
+    * simple enough to be obviously right.
+    *
+    * A tiled or discrete-memory implementation would use CP_MEMCPY here, and
+    * that path is still untested on this part.  It is not silently fine
+    * there: a wrong packet count makes the CP read one dword past the packet
+    * and into the next packet's header, which is exactly the failure measured.
+    *
+    * The work happens at record time, before the submission is queued.  That
+    * is only safe while the application is not already executing a previous
+    * submission against these objects, which is the case for every upload
+    * pattern seen so far; a driver that wanted to be safe unconditionally
+    * would defer the copy to submit time.
+    */
+   src_map = ta5_bo_map(buffer->bound_memory->bo);
+   dst_map = ta5_bo_map(image->bound_memory->bo);
+   if (!src_map || !dst_map) {
+      if (getenv("TA5_TRACE_COPY"))
+         fprintf(stderr, "ta5[copy] mmap failed\n");
+      return;
+   }
+
+   for (uint32_t r = 0; r < regionCount; r++) {
+      const VkBufferImageCopy *reg = &pRegions[r];
+      uint32_t mip, cols, rows;
+      const struct ta5_image_level *lvl;
+      VkDeviceSize dst_base, src_pitch, dst_pitch;
+
+      /* Clamp against the level rather than the image, so a caller that gets
+       * this wrong copies less instead of walking off the allocation. */
+      mip = MIN2(reg->imageSubresource.mipLevel,
+                 MAX2(image->mip_levels, 1u) - 1);
+      lvl = &image->levels[mip];
+
+      cols = reg->imageExtent.width;
+      rows = reg->imageExtent.height;
+      if (!cols || !rows)
+         continue;
+      if (mip != reg->imageSubresource.mipLevel || cols > lvl->width ||
+          rows > lvl->height)
+         continue;
+
+      dst_pitch = lvl->row_pitch;
+      src_pitch = reg->bufferRowLength ? reg->bufferRowLength * block_size
+                                       : dst_pitch;
+
+      dst_base = image->offset + lvl->offset +
+                 (VkDeviceSize)reg->imageSubresource.baseArrayLayer *
+                    lvl->layer_pitch +
+                 (VkDeviceSize)reg->imageOffset.y * dst_pitch +
+                 (VkDeviceSize)reg->imageOffset.x * block_size;
+
+      for (uint32_t y = 0; y < rows; y++) {
+         const uint8_t *s = (const uint8_t *)src_map + reg->bufferOffset +
+                            (VkDeviceSize)y * src_pitch;
+         uint8_t *d = (uint8_t *)dst_map + dst_base + (VkDeviceSize)y * dst_pitch;
+
+         /* Row by row: the two pitches are independent, and only when they
+          * agree is the whole region one contiguous move. */
+         if (src_pitch == dst_pitch) {
+            memcpy(d, s, (size_t)cols * block_size);
+         } else {
+            for (uint32_t x = 0; x < cols; x++)
+               memcpy(d + (size_t)x * block_size, s + (size_t)x * block_size,
+                      block_size);
+         }
+      }
+
+      if (getenv("TA5_TRACE_COPY"))
+         fprintf(stderr,
+                 "ta5[copy] region %u mip=%u %ux%u off=%u,%u layer=%u "
+                 "srcpitch=%llu dstpitch=%llu dst=%llu\n",
+                 r, mip, cols, rows, (unsigned)reg->imageOffset.x,
+                 (unsigned)reg->imageOffset.y,
+                 reg->imageSubresource.baseArrayLayer,
+                 (unsigned long long)src_pitch,
+                 (unsigned long long)dst_pitch, (unsigned long long)dst_base);
+   }
 }
 
 VKAPI_ATTR void VKAPI_CALL
