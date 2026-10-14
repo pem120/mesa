@@ -173,5 +173,20 @@ ta5_DestroySampler(VkDevice _device, VkSampler _sampler,
    if (!sampler)
       return;
 
+   /*
+    * pAllocator may legitimately be NULL -- the spec permits it on every
+    * entry point -- and vk_free() dereferences it unconditionally
+    * (vk_alloc.h:78), so it has to be normalised here.
+    *
+    * ta5_CreateSampler() does this, which is why create-then-destroy worked
+    * as long as the caller happened to pass an allocator both times.  Every
+    * other destroy path in this driver normalises too; this one did not, and
+    * vkDestroySampler(dev, sampler, NULL) segfaulted in vk_free.  Found by
+    * valgrind once the harness was given a teardown -- before that, nothing
+    * in the matrix ever called a destroy at all.
+    */
+   if (pAllocator == NULL)
+      pAllocator = vk_default_allocator();
+
    vk_free(pAllocator, sampler);
 }

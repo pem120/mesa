@@ -172,6 +172,7 @@ ta5_bo_from_handle(struct ta5_device *device, uint32_t handle, uint32_t size)
    bo->size = size;
    bo->refcount = 1;
 
+
    return bo;
 }
 
@@ -184,8 +185,39 @@ ta5_bo_ref(struct ta5_bo *bo)
 void
 ta5_bo_unref(struct ta5_bo *bo)
 {
-   if (!p_atomic_dec_return(&bo->refcount))
+   /*
+    * Drop a reference, freeing the object when it was the last one.
+    *
+    * p_atomic_dec_return() is __atomic_sub_fetch(), so it returns the value
+    * *after* the subtraction: dropping the last reference of an object at
+    * refcount 1 yields 0.  Free on that, i.e. free when the new count is 0.
+    *
+    * The original read
+    *
+    *     if (!p_atomic_dec_return(&bo->refcount))
+    *         return;
+    *
+    * with the free below it, which is the same test the wrong way round: it
+    * returned early on exactly the one transition that should have freed, and
+    * fell through to free on every transition that left references outstanding.
+    * No BO was ever actually freed.
+    *
+    * Note "!=" 1 is wrong too, and not by accident of style: at refcount 1 the
+    * new count is 0, which is != 1, so that also returns early and also never
+    * frees.  Measured, with the old code and with that version, both through
+    * the full matrix and under valgrind: 7 ta5_bo_unref calls, 0 frees, and
+    * byte-identical leak reports from the two.  The condition has to test
+    * against 0.
+    *
+    * drm-shim/device.c:386 tests the same way, and panvk_priv_bo.c:176 uses
+    * "if (!priv_bo || p_atomic_dec_return(...))" with the free in the body.
+    */
+   if (!bo)
       return;
+
+   if (p_atomic_dec_return(&bo->refcount) != 0)
+      return;
+
 
    if (bo->map)
       munmap(bo->map, bo->size);
