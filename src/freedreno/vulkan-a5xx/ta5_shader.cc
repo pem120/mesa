@@ -33,6 +33,7 @@
 
 #include "util/u_math.h"
 #include "util/u_atomic.h"
+#include "compiler/list.h"   /* nir_foreach_function */
 #include "vk_util.h"
 #include "vk_object.h"
 #include "vk_alloc.h"
@@ -40,6 +41,8 @@
 #include "vk_nir.h"
 #include "vk_shader_module.h"
 #include "vk_common_entrypoints.h"
+#include "ta5_descriptor.h"   /* ta5_tex_binding, TA5_MAX_TEX_UNITS */
+#include "ta5_render.h"       /* ta5_pipeline_layout */
 
 #include "compiler/shader_enums.h"
 #include "compiler/nir/nir.h"
@@ -175,8 +178,139 @@ ta5_spirv_debug(void *private_data, enum nir_spirv_debug_level level,
            names[level < 3 ? level : 2], spirv_offset / 4, message);
 }
 
+/* ------------------------------------------------------------------ */
+/* Texture unit numbering                                              */
+/* ------------------------------------------------------------------ */
+
+struct ta5_tex_unit_ctx
+{
+   const struct ta5_pipeline_layout *layout;
+   VkShaderStageFlags stage;
+};
+
+/** Is this one of the texture instructions whose unit we have to number? */
+static bool
+ta5_is_tex_unit_instr(const nir_instr *instr, const void *data)
+{
+   if (instr->type != nir_instr_type_tex)
+      return false;
+
+   switch (nir_instr_as_tex(instr)->op) {
+   case nir_texop_tex:
+   case nir_texop_txf:
+   case nir_texop_txd:
+   case nir_texop_txb:
+   case nir_texop_txl:
+   case nir_texop_txs:
+      return true;
+   default:
+      return false;
+   }
+}
+
+/**
+ * Replace texture_deref / sampler_deref sources with a texel unit number.
+ *
+ * spirv_to_nir() describes a sampled image as a dereference of a descriptor
+ * variable:
+ *
+ *     %t = (float32)tex %3 (texture_deref), %3 (sampler_deref), coord
+ *
+ * IR3 has no case for that source type and stops with "Unhandled NIR tex src
+ * type: 13", which is nir_tex_src_texture_deref.  What IR3 does have is the
+ * older form, where the unit is an immediate in tex->texture_index and
+ * tex->sampler_index -- and that is exactly a5xx's bindful model and the one
+ * this driver emits into, so nothing is given up by converting to it.
+ *
+ * Turningip avoids the same problem by rewriting these to texture_handle and
+ * sampler_handle, which selects IR3's bindless path.  That path computes an
+ * offset into a descriptor heap, and a5xx has no heap: the descriptors are
+ * written straight into the command stream and addressed by unit number.
+ *
+ * The number is the binding's position in the order returned by
+ * ta5_pipeline_layout_tex_bindings(), which is the same order the draw-time
+ * emitter fills the slots in.  Returns NULL: the instruction is edited in
+ * place and kept, not replaced.
+ */
+static nir_def *
+ta5_lower_tex_units(nir_builder *b, nir_instr *instr, void *data)
+{
+   const struct ta5_tex_unit_ctx *ctx =
+      (const struct ta5_tex_unit_ctx *)data;
+   nir_tex_instr *tex = nir_instr_as_tex(instr);
+   struct ta5_tex_binding order[TA5_MAX_TEX_UNITS * 2];
+   unsigned num_order;
+
+   if (!ta5_is_tex_unit_instr(instr, NULL))
+      return NULL;
+
+   num_order = ta5_pipeline_layout_tex_bindings(ctx->layout, ctx->stage, order,
+                                                ARRAY_SIZE(order));
+
+   if (num_order > TA5_MAX_TEX_UNITS) {
+      TA5_DBG_SHADER("shader wants %u texel units, a5xx addresses %u",
+                     num_order, TA5_MAX_TEX_UNITS);
+      num_order = TA5_MAX_TEX_UNITS;
+   }
+
+   for (int i = 0; i < tex->num_srcs; i++) {
+      bool is_texture = tex->src[i].src_type == nir_tex_src_texture_deref;
+      bool is_sampler = tex->src[i].src_type == nir_tex_src_sampler_deref;
+      const nir_deref_instr *deref;
+      const nir_variable *var;
+      uint32_t set, binding, unit;
+
+      if (!is_texture && !is_sampler)
+         continue;
+
+      if (!nir_src_is_deref(tex->src[i].src))
+         continue;
+
+      deref = nir_src_as_deref(tex->src[i].src);
+      var = nir_deref_instr_get_variable(deref);
+      if (!var)
+         continue;
+
+      set = var->data.location;
+      binding = var->data.binding;
+
+      unit = 0;
+      for (unsigned k = 0; k < num_order; k++) {
+         if (order[k].set == set && order[k].binding == binding) {
+            unit = k;
+            break;
+         }
+      }
+
+      /*
+       * Texture units and sampler units are numbered independently, so a
+       * combined image sampler takes the same number in both spaces.
+       */
+      if (is_texture)
+         tex->texture_index = unit;
+      else
+         tex->sampler_index = unit;
+
+      if (getenv("TA5_TRACE_TEXUNIT"))
+         fprintf(stderr,
+                 "ta5[texunit] set=%u binding=%u op=%d unit=%u (tex=%u samp=%u)\n",
+                 set, binding, (int)tex->op, unit, tex->texture_index,
+                 tex->sampler_index);
+   }
+
+   /* Drop the deref sources; the immediates just set replace them. */
+   for (int i = tex->num_srcs - 1; i >= 0; i--) {
+      if (tex->src[i].src_type == nir_tex_src_texture_deref ||
+          tex->src[i].src_type == nir_tex_src_sampler_deref)
+         nir_tex_instr_remove_src(tex, i);
+   }
+
+   return NULL;
+}
+
 bool
 ta5_shader_compile(struct ta5_device *device, VkShaderStageFlagBits stage,
+                   const struct ta5_pipeline_layout *layout,
                    const uint32_t *code, size_t code_size,
                    struct ta5_compiled_shader *out)
 {
@@ -296,7 +430,36 @@ ta5_shader_compile(struct ta5_device *device, VkShaderStageFlagBits stage,
 
    nir_shader_gather_info(nir, nir_shader_get_entrypoint(nir));
 
+   /*
+    * Number the texture units before ir3_finalize_nir(), which is where the
+    * texture lowering runs; the instruction has to be in the immediate form
+    * by the time IR3 sees it.
+    */
+   {
+      struct ta5_tex_unit_ctx ctx = {
+         .layout = layout,
+         .stage = (stage == VK_SHADER_STAGE_VERTEX_BIT)
+                      ? VK_SHADER_STAGE_VERTEX_BIT
+                      : VK_SHADER_STAGE_FRAGMENT_BIT,
+      };
+
+      if (ctx.stage)
+         nir_shader_lower_instructions(nir, ta5_is_tex_unit_instr,
+                                       ta5_lower_tex_units, &ctx);
+   }
+
    ir3_finalize_nir(compiler, &shader_nir_options, nir);
+   /*
+    * IR3's own disassembly, on a knob.  This is how the compiled texture
+    * instruction gets read back: the descriptor and the sampler are correct
+    * and still not enough, because the unit the shader indexes with lives in
+    * the instruction and nowhere else.
+    */
+   if (getenv("TA5_TRACE_SHADER")) {
+      fprintf(stderr, "--- ta5: NIR after lowering ---\n");
+      nir_log_shaderi(nir);
+   }
+
    ir3_shader = ir3_shader_from_nir(compiler, nir, &shader_options);
    if (!ir3_shader) {
       TA5_DBG_SHADER("ir3_shader_from_nir failed");

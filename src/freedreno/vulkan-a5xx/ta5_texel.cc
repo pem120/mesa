@@ -9,6 +9,9 @@
  * \file ta5_texel.cc
  */
 
+#include <stdlib.h>
+#include <string.h>
+
 #include "ta5_texel.h"
 #include "ta5_memory.h"
 #include "ta5_render.h"
@@ -224,7 +227,6 @@ ta5_texel_descriptor(const struct ta5_image_view *view, uint32_t *desc,
    enum a5xx_tex_fmt fmt =
       (enum a5xx_tex_fmt)ta5_texel_format(view->format);
    VkDeviceSize offset;
-
    memset(desc, 0, TA5_TEXEL_DESC_DWORDS * sizeof(uint32_t));
 
    /* TEX_CONST_0: format, mip count, component swizzle, tiling. */
@@ -241,9 +243,22 @@ ta5_texel_descriptor(const struct ta5_image_view *view, uint32_t *desc,
    desc[1] =
       A5XX_TEX_CONST_1_WIDTH(lvl->width) | A5XX_TEX_CONST_1_HEIGHT(lvl->height);
 
-   /* TEX_CONST_2: pitch, its alignment, and the texel type. */
+   /*
+    * TEX_CONST_2: pitch, its alignment, and the texel type.
+    *
+    * PITCH is a plain shift, so it counts the unit PITCHALIGN selects, and
+    * PITCHALIGN(0) means one byte.  GL programs pitchalign - 6 because it
+    * always emits a tiled layout; for a linear layout the row pitch goes in
+    * as bytes.
+    *
+    * ARRAY_PITCH and MIN_LAYERSZ are different: their generated macros shift
+    * right by 12 and assert the value is a multiple of 4096, so they count
+    * 4 KiB units.  Feeding them bytes -- which is what the field names
+    * suggest -- wraps a 16 KiB face stride down to 4 and makes the fetch
+    * walk inside one face.
+    */
    desc[2] = A5XX_TEX_CONST_2_PITCHALIGN(0) |
-             A5XX_TEX_CONST_2_PITCH(lvl->row_pitch / 64) |
+             A5XX_TEX_CONST_2_PITCH(lvl->row_pitch) |
              A5XX_TEX_CONST_2_TYPE(type);
 
    switch (view->view_type) {
@@ -255,8 +270,8 @@ ta5_texel_descriptor(const struct ta5_image_view *view, uint32_t *desc,
        * size as level 0 of a 2D one, and using the wrong one makes the fetch
        * walk off the end of the image on the last slices.
        */
-      desc[3] = A5XX_TEX_CONST_3_MIN_LAYERSZ(lvl->layer_pitch / 64) |
-                A5XX_TEX_CONST_3_ARRAY_PITCH(lvl->level_size / 64);
+      desc[3] = A5XX_TEX_CONST_3_MIN_LAYERSZ(lvl->layer_pitch) |
+                A5XX_TEX_CONST_3_ARRAY_PITCH(lvl->level_size);
       desc[5] = A5XX_TEX_CONST_5_DEPTH(lvl->depth);
       break;
 
@@ -285,4 +300,14 @@ ta5_texel_descriptor(const struct ta5_image_view *view, uint32_t *desc,
    offset = image->offset + lvl->offset +
             (uint64_t)view->base_array_layer * lvl->layer_pitch;
    *address = offset;
+
+   /*
+    * Override the descriptor's address, to find out whether the fetch that
+    * faults is reading this descriptor at all: if the faulting iova follows
+    * this value, the fetch uses it, and if it stays at zero it is reading a
+    * descriptor slot we never wrote.
+    */
+   const char *fa = getenv("TA5_FORCE_ADDR");
+   if (fa)
+      *address = strtoull(fa, NULL, 0);
 }

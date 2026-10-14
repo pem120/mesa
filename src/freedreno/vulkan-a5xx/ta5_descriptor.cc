@@ -37,6 +37,7 @@
 #include "vk_alloc.h"
 #include "vk_device.h"
 #include "vk_common_entrypoints.h"
+#include "ta5_render.h"   /* ta5_pipeline_layout */
 
 #include "ta5_instance.h"
 #include "ta5_device.h"
@@ -520,4 +521,66 @@ ta5_UpdateDescriptorSets(VkDevice _device, uint32_t descriptorWriteCount,
 
       memcpy(dst, src, c->descriptorCount * sizeof(*dst));
    }
+}
+/* ------------------------------------------------------------------ */
+/* Texture unit ordering                                               */
+/* ------------------------------------------------------------------ */
+
+unsigned
+ta5_pipeline_layout_tex_bindings(const struct ta5_pipeline_layout *layout,
+                                 VkShaderStageFlags stage,
+                                 struct ta5_tex_binding *out, unsigned max)
+{
+   unsigned n = 0;
+
+   if (!layout)
+      return 0;
+
+   for (uint32_t s = 0; s < layout->set_count && n < max; s++) {
+      struct ta5_descriptor_set_layout *sl = layout->set_layouts[s];
+
+      if (!sl)
+         continue;
+
+      for (uint32_t i = 0; i < sl->binding_count && n < max; i++) {
+         const struct ta5_descriptor_layout_binding *b = &sl->bindings[i];
+
+         if (!(b->stage_flags & stage))
+            continue;
+
+         switch (b->type) {
+         case VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER:
+         case VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE:
+         case VK_DESCRIPTOR_TYPE_SAMPLER:
+            break;
+         default:
+            continue;
+         }
+
+         out[n].set = s;
+         out[n].binding = b->binding;
+         out[n].type = b->type;
+         n++;
+      }
+   }
+
+   /*
+    * Insertion sort by (set, binding).  Set layouts are created in binding
+    * order but not sorted by *set*, so walking sets in order alone does not
+    * give a single ascending order, and the caller needs one.
+    */
+   for (unsigned i = 1; i < n; i++) {
+      struct ta5_tex_binding key = out[i];
+      int j = (int)i - 1;
+
+      while (j >= 0 && (out[j].set > key.set ||
+                        (out[j].set == key.set &&
+                         out[j].binding > key.binding))) {
+         out[j + 1] = out[j];
+         j--;
+      }
+      out[j + 1] = key;
+   }
+
+   return n;
 }

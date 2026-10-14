@@ -575,20 +575,28 @@ ta5_GetPhysicalDeviceMemoryProperties2(
    props->memoryHeaps[0].flags = VK_MEMORY_HEAP_DEVICE_LOCAL_BIT;
 
    /*
-    * Four memory types over that one heap.  a5xx has no cache-coherent vs
-    * uncached distinction exposed to Vulkan on this class of part, so the
-    * standard Turnip-style split (device-local vs host-visible) is reported.
+    * Four memory types over that one heap.
+    *
+    * HOST_VISIBLE was missing from every one of them, which is fatal rather
+    * than merely conservative: an application is required to pick a
+    * host-visible type for anything it will map, so with no such type in the
+    * table vkAllocateMemory failed with VK_ERROR_OUT_OF_DEVICE_MEMORY for
+    * every mapped allocation.  Code that avoided this by hardcoding type 0
+    * happened to work and hid it.
+    *
+    * There is one heap, so every allocation is equally device-local and
+    * equally host-visible.  All four types are host coherent because
+    * vkMapMemory and vkUnmapMemory perform no flush or invalidate, so the
+    * cache contents and the mapped view cannot disagree.
     */
    props->memoryTypeCount = 4;
    for (uint32_t i = 0; i < props->memoryTypeCount; i++) {
       props->memoryTypes[i].heapIndex = 0;
-      props->memoryTypes[i].propertyFlags = 0;
-
-      if (i & 1)
-         props->memoryTypes[i].propertyFlags |= VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
-      if (i & 2)
-         props->memoryTypes[i].propertyFlags |=
-            VK_MEMORY_PROPERTY_HOST_CACHED_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+      props->memoryTypes[i].propertyFlags =
+         VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT |
+         VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+         VK_MEMORY_PROPERTY_HOST_CACHED_BIT |
+         VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
    }
 
    vk_foreach_struct(sType, ext, pMemoryProperties->pNext) {

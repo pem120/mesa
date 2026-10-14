@@ -187,4 +187,31 @@ struct ta5_descriptor_pool
 VK_DEFINE_NONDISP_HANDLE_CASTS(ta5_descriptor_pool, base, VkDescriptorPool,
                                VK_OBJECT_TYPE_DESCRIPTOR_POOL)
 
+/** Maximum texture units a5xx can bind per stage. */
+#define TA5_MAX_TEX_UNITS 16
+
+/** One image or sampler binding, in the order it becomes a texel unit. */
+struct ta5_tex_binding
+{
+   uint32_t set;
+   uint32_t binding;
+   VkDescriptorType type;
+};
+
+/**
+ * Collect the image and sampler bindings a stage can see, in the order they
+ * become texture and sampler units: ascending (set, binding).
+ *
+ * a5xx has no descriptor heap, so a shader names a texture unit by number and
+ * the draw has to put the right descriptor in that slot.  Two places need
+ * that number and they must agree exactly: the draw-time emitter, which fills
+ * the slots, and the shader compiler, which numbers the texture instructions.
+ * Both derive it here rather than each sorting its own copy.
+ *
+ * Returns the number of entries written, capped at `max`.
+ */
+unsigned ta5_pipeline_layout_tex_bindings(
+   const struct ta5_pipeline_layout *layout, VkShaderStageFlags stage,
+   struct ta5_tex_binding *out, unsigned max);
+
 #endif /* TA5_DESCRIPTOR_H */

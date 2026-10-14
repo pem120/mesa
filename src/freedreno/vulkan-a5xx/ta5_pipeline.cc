@@ -148,6 +148,7 @@ ta5_module_words(const struct vk_shader_module *module, size_t *out_size)
 static VkResult
 ta5_pipeline_compile_stage(struct ta5_device *device,
                            VkShaderStageFlagBits stage,
+                           const struct ta5_pipeline_layout *layout,
                            const struct vk_shader_module *module,
                            struct ta5_compiled_shader *out)
 {
@@ -157,7 +158,7 @@ ta5_pipeline_compile_stage(struct ta5_device *device,
    if (!words || size < 4 || size % 4 != 0)
       return VK_ERROR_INVALID_SHADER_NV;
 
-   if (!ta5_shader_compile(device, stage, words, size, out)) {
+   if (!ta5_shader_compile(device, stage, layout, words, size, out)) {
       if (getenv("TA5_TRACE_NULL"))
          fprintf(stderr,
                  "ta5[shader]: stage 0x%x failed to compile (%zu bytes SPIR-V)\n",
@@ -254,7 +255,7 @@ ta5_CreateGraphicsPipelines(VkDevice _device, VkPipelineCache pipelineCache,
       if (ci->stageCount > 0 && ci->pStages[0].module) {
          struct ta5_compiled_shader vs;
          result = ta5_pipeline_compile_stage(
-            device, VK_SHADER_STAGE_VERTEX_BIT,
+            device, VK_SHADER_STAGE_VERTEX_BIT, pipe->layout,
             (const struct vk_shader_module *)ci->pStages[0].module, &vs);
          if (result != VK_SUCCESS) {
             vk_free(pAllocator, pipe);
@@ -267,7 +268,7 @@ ta5_CreateGraphicsPipelines(VkDevice _device, VkPipelineCache pipelineCache,
       if (ci->stageCount > 1 && ci->pStages[1].module) {
          struct ta5_compiled_shader fs;
          result = ta5_pipeline_compile_stage(
-            device, VK_SHADER_STAGE_FRAGMENT_BIT,
+            device, VK_SHADER_STAGE_FRAGMENT_BIT, pipe->layout,
             (const struct vk_shader_module *)ci->pStages[1].module, &fs);
          if (result != VK_SUCCESS) {
             ta5_compiled_shader_free(&pipe->vertex);

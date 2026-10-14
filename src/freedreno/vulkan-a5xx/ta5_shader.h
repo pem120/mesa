@@ -89,6 +89,7 @@ VK_DEFINE_NONDISP_HANDLE_CASTS(ta5_shader_module, base, VkShaderModule,
  * creation.
  */
 bool ta5_shader_compile(struct ta5_device *device, VkShaderStageFlagBits stage,
+                        const struct ta5_pipeline_layout *layout,
                         const uint32_t *code, size_t code_size,
                         struct ta5_compiled_shader *out);
 

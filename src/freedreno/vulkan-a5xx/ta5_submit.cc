@@ -407,6 +407,14 @@ ta5_submit_cmd_relocs(struct ta5_queue *queue, const uint32_t *cs,
       struct ta5_bo *bo = reloc_bo[relocs[i].bo_index];
       uint32_t bo_idx = ta5_submit_bo_index(all_bos, bo_count, bo);
 
+      if (getenv("TA5_TRACE_SUBMIT"))
+         fprintf(stderr,
+                 "ta5[submit] reloc %u/%u bo=%p idx=%u -> all_bos idx=%u "
+                 "bo_count=%u size=%u bo_offset=%llu dst_off=%u\n",
+                 i, reloc_count, (void *)bo, relocs[i].bo_index, bo_idx,
+                 bo_count, bo->size,
+                 (unsigned long long)relocs[i].bo_offset, relocs[i].dst_off);
+
       assert(bo_idx != UINT32_MAX);
       krelocs[reloc_n].submit_offset =
          relocs[i].dst_off + queue->ring_offset;

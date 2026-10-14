@@ -454,20 +454,37 @@ ta5_cs_reloc(struct ta5_cmd_buffer *cmd, struct ta5_bo *bo, uint64_t bo_offset,
       cmd->reloc_bo_count++;
    }
 
-   cmd->cs[cmd->cs_count++] = or_mask;
+   /*
+    * The OR mask goes in the *high* dword, not the low one.
+    *
+    * freedreno's OUT_RELOC takes a 64-bit mask and splits it: it shifts the
+    * high half onto the high dword of the relocated pair.  fd5 relies on that
+    * for the texel descriptor, where TEX_CONST_5 shares a dword with the top
+    * half of the image address:
+    *
+    *     OUT_RELOC(ring, rsc->bo, view->offset,
+    *               (uint64_t)view->texconst5 << 32, 0);
+    *
+    * Here the same thing is done with a 32-bit mask attached to the shifted
+    * relocation instead.  Putting it on the low dword instead would OR
+    * TEX_CONST_5 into BASE_LO and leave BASE_HI's own bits empty, which moves
+    * the image base by however much DEPTH happens to be -- for a cube, 128 KB
+    * -- and the fetch then lands outside the allocation.
+    */
    cmd->cs[cmd->cs_count++] = 0;
+   cmd->cs[cmd->cs_count++] = or_mask;
 
    cmd->relocs[cmd->reloc_count].bo_index = i;
    cmd->relocs[cmd->reloc_count].bo_offset = bo_offset;
    cmd->relocs[cmd->reloc_count].dst_off = (cmd->cs_count - 2) * 4;
-   cmd->relocs[cmd->reloc_count].or_mask = or_mask;
+   cmd->relocs[cmd->reloc_count].or_mask = 0;
    cmd->relocs[cmd->reloc_count].shift = 0;
    cmd->reloc_count++;
 
    cmd->relocs[cmd->reloc_count].bo_index = i;
    cmd->relocs[cmd->reloc_count].bo_offset = bo_offset;
    cmd->relocs[cmd->reloc_count].dst_off = (cmd->cs_count - 1) * 4;
-   cmd->relocs[cmd->reloc_count].or_mask = 0;   /* or_mask >> 32 */
+   cmd->relocs[cmd->reloc_count].or_mask = or_mask;   /* or_mask >> 32 */
    cmd->relocs[cmd->reloc_count].shift = -32;
    cmd->reloc_count++;
 
@@ -1308,20 +1325,6 @@ ta5_set_render_mode(struct ta5_cmd_buffer *cmd)
    ta5_cs_push(cmd, 0x00000000);
 }
 
-/** Texture units a5xx can bind per stage. */
-#define TA5_MAX_TEX_UNITS 16
-
-/** Descriptor bindings considered when building the texture units. */
-#define TA5_MAX_TEX_CANDIDATES 64
-
-/** One image or sampler binding, before it is sorted into unit order. */
-struct ta5_tex_candidate
-{
-   uint32_t set;
-   uint32_t binding;
-   struct ta5_descriptor *desc;
-};
-
 /**
  * Emit the texture and sampler descriptor state for one stage.
  *
@@ -1333,92 +1336,79 @@ struct ta5_tex_candidate
  *
  * The two halves go into the same state block at the same offset and are told
  * apart by STATE_TYPE -- the sampler words are ST4_SHADER, the texture words
- * ST4_CONSTANTS.  Sampler units and texture units are numbered independently,
- * both in ascending (set, binding) order, which is the order GL assigns them
- * by and the order IR3 expects for the samplers a shader declares.
+ * ST4_CONSTANTS.
+ *
+ * Which descriptor lands in which slot is not decided here: the unit order
+ * comes from ta5_pipeline_layout_tex_bindings(), the same function the shader
+ * compiler numbers its texture instructions with.  Deciding it twice is how
+ * the two halves drift apart.
  *
  * `sb` is SB4_VS_TEX or SB4_FS_TEX.  Returns the number of texture units bound.
  */
 static unsigned
 ta5_emit_textures(struct ta5_cmd_buffer *cmd, enum a4xx_state_block sb,
-                  VkShaderStageFlags stage)
+                  struct ta5_pipeline *pipe, VkShaderStageFlags stage)
 {
    struct ta5_descriptor *tex_desc[TA5_MAX_TEX_UNITS] = {0};
    struct ta5_descriptor *samp_desc[TA5_MAX_TEX_UNITS] = {0};
-   struct ta5_tex_candidate cand[TA5_MAX_TEX_CANDIDATES];
-   uint32_t num_cand = 0;
+   struct ta5_tex_binding order[TA5_MAX_TEX_UNITS * 2];
    uint32_t num_textures = 0, num_samplers = 0;
+   unsigned num_order;
+
+   if (!pipe || !pipe->layout)
+      return 0;
+
+   num_order = ta5_pipeline_layout_tex_bindings(
+      pipe->layout, stage, order, ARRAY_SIZE(order));
 
    /*
-    * Gather every binding this stage can see, then sort by (set, binding).
-    * That ordering is what becomes texture unit and sampler unit order: the
-    * same order the GL backend assigns them by, and the order IR3 expects for
-    * the samplers a shader declares.
-    *
-    * Collecting first rather than scanning for "the next lowest untaken
-    * binding" each round is deliberate -- the latter picks the same binding
-    * every time unless the descriptor set is mutated to mark it consumed, and
-    * a command buffer normally records several draws that each re-emit the
-    * same descriptor state.
+    * A shader names a texel unit by number and the hardware fetches unit N
+    * from the Nth descriptor written above, so the two counts have to agree
+    * as well as the order does.  Past 16 units the hardware cannot address
+    * them, so the extra units are dropped rather than silently aliased onto
+    * a unit that is in use.
     */
-   for (uint32_t s = 0; s < ARRAY_SIZE(cmd->bound_sets); s++) {
-      struct ta5_descriptor_set *set = cmd->bound_sets[s];
-      struct ta5_descriptor_set_layout *layout;
+   for (unsigned i = 0; i < num_order; i++) {
+      struct ta5_descriptor_set *set = cmd->bound_sets[order[i].set];
+      struct ta5_descriptor_set_layout *sl = set ? set->layout : NULL;
+      struct ta5_descriptor *desc = NULL;
 
-      if (!set)
+      if (!sl)
          continue;
 
-      layout = set->layout;
+      for (uint32_t j = 0; j < sl->binding_count; j++) {
+         const struct ta5_descriptor_layout_binding *b = &sl->bindings[j];
 
-      for (uint32_t i = 0; i < layout->binding_count && num_cand <
-                                                 TA5_MAX_TEX_CANDIDATES;
-           i++) {
-         struct ta5_descriptor_layout_binding *b = &layout->bindings[i];
-         struct ta5_descriptor *desc = &set->descriptors[b->offset];
-
-         if (!(b->stage_flags & stage))
-            continue;
-         if (desc->type != VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER &&
-             desc->type != VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE &&
-             desc->type != VK_DESCRIPTOR_TYPE_SAMPLER)
-            continue;
-
-         cand[num_cand].set = s;
-         cand[num_cand].binding = b->binding;
-         cand[num_cand].desc = desc;
-         num_cand++;
+         if (b->binding == order[i].binding) {
+            desc = &set->descriptors[b->offset];
+            break;
+         }
       }
-   }
 
-   for (uint32_t i = 1; i < num_cand; i++) {
-      struct ta5_tex_candidate key = cand[i];
-      int32_t j = (int32_t)i - 1;
+      if (!desc)
+         continue;
 
-      while (j >= 0 && (cand[j].set > key.set ||
-                        (cand[j].set == key.set &&
-                         cand[j].binding > key.binding))) {
-         cand[j + 1] = cand[j];
-         j--;
-      }
-      cand[j + 1] = key;
-   }
-
-   for (uint32_t i = 0; i < num_cand; i++) {
-      if (cand[i].desc->type == VK_DESCRIPTOR_TYPE_SAMPLER) {
+      if (order[i].type == VK_DESCRIPTOR_TYPE_SAMPLER) {
          if (num_samplers < TA5_MAX_TEX_UNITS)
-            samp_desc[num_samplers++] = cand[i].desc;
+            samp_desc[num_samplers++] = desc;
          continue;
       }
 
       if (num_textures >= TA5_MAX_TEX_UNITS)
          break;
 
-      tex_desc[num_textures++] = cand[i].desc;
+      tex_desc[num_textures++] = desc;
 
-      if (cand[i].desc->type == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER &&
+      if (order[i].type == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER &&
           num_samplers < TA5_MAX_TEX_UNITS)
-         samp_desc[num_samplers++] = cand[i].desc;
+         samp_desc[num_samplers++] = desc;
    }
+
+   if (getenv("TA5_TRACE_TEX"))
+      fprintf(stderr,
+              "ta5[tex] sb=%u order=%u tex=%u samp=%u bound_sets=%u\n",
+              sb, num_order, num_textures, num_samplers,
+              (unsigned)ARRAY_SIZE(cmd->bound_sets));
 
    if (num_textures == 0)
       return 0;
@@ -1426,8 +1416,11 @@ ta5_emit_textures(struct ta5_cmd_buffer *cmd, enum a4xx_state_block sb,
    if (ta5_cmd_buffer_alloc_cs(cmd, cmd->cs_count +
                                        4 * num_samplers +
                                        TA5_TEXEL_DESC_DWORDS * num_textures +
-                                       32) != VK_SUCCESS)
+                                       32) != VK_SUCCESS) {
+      if (getenv("TA5_TRACE_TEX"))
+         fprintf(stderr, "ta5[tex] alloc_cs failed\n");
       return 0;
+   }
 
    /* Sampler words: 4 dwords per unit, ST4_SHADER. */
    if (num_samplers) {
@@ -1479,8 +1472,27 @@ ta5_emit_textures(struct ta5_cmd_buffer *cmd, enum a4xx_state_block sb,
       ta5_cs_push(cmd, words[2]);
       ta5_cs_push(cmd, words[3]);
 
-      /* words 4 and 5 are the relocated image address */
-      ta5_cs_reloc(cmd, view->image->bound_memory->bo, address, 0);
+      /*
+       * Words 4 and 5 are the image address, and word 5 -- TEX_CONST_5 --
+       * rides in the high half of the high address dword as the relocation's
+       * OR mask.  fd5 does exactly this
+       *
+       *     OUT_RELOC(ring, rsc->bo, view->offset,
+       *               (uint64_t)view->texconst5 << 32, 0);
+       *
+       * so there is no separate TEX_CONST_5 word to push.  Passing 0 for the
+       * mask silently drops it, and TEX_CONST_5 is where DEPTH lives -- the
+       * cube's face count and a 3D image's depth.  Without it the hardware
+       * fetches a single layer, which is not an error, just the wrong pixels.
+       */
+      if (getenv("TA5_TRACE_TEX"))
+         fprintf(stderr,
+                 "ta5[tex] desc: %08x %08x %08x %08x %08x addr=%llx bo=%p\n",
+                 words[0], words[1], words[2], words[3], words[5],
+                 (unsigned long long)address,
+                 (void *)view->image->bound_memory->bo);
+
+      ta5_cs_reloc(cmd, view->image->bound_memory->bo, address, words[5]);
 
       for (uint32_t w = 6; w < TA5_TEXEL_DESC_DWORDS; w++)
          ta5_cs_push(cmd, words[w]);
@@ -2662,8 +2674,15 @@ ta5_CmdDraw(VkCommandBuffer _cmd, uint32_t vertexCount, uint32_t instanceCount,
     * TPL1_xS_TEX_COUNT values from inside the draw state and they have to
     * agree with the descriptors emitted just above.
     */
-   vs_tex_count = ta5_emit_textures(draw, SB4_VS_TEX, VK_SHADER_STAGE_VERTEX_BIT);
-   fs_tex_count = ta5_emit_textures(draw, SB4_FS_TEX, VK_SHADER_STAGE_FRAGMENT_BIT);
+   vs_tex_count = ta5_emit_textures(draw, SB4_VS_TEX, pipe, VK_SHADER_STAGE_VERTEX_BIT);
+   fs_tex_count = ta5_emit_textures(draw, SB4_FS_TEX, pipe, VK_SHADER_STAGE_FRAGMENT_BIT);
+   if (getenv("TA5_TRACE_TEX"))
+      fprintf(stderr, "ta5[tex] after emit: cs_count=%u cs_size=%u\n",
+              draw->cs_count, draw->cs_size);
+   if (getenv("TA5_TRACE_TEX")) {
+      for (uint32_t i = 0; i < MIN2(draw->cs_count, 28u); i++)
+         fprintf(stderr, "  cs[%2u] = %08x\n", i, draw->cs[i]);
+   }
 
    ta5_emit_draw_state(draw, vs_tex_count, fs_tex_count);
 
@@ -2761,6 +2780,8 @@ ta5_CmdDraw(VkCommandBuffer _cmd, uint32_t vertexCount, uint32_t instanceCount,
     * only reaches the submitted command buffer -- so this is not yet the
     * whole of GL's arrangement, but it isolates the one packet.
     */
+   if (getenv("TA5_TRACE_TEX"))
+      fprintf(stderr, "ta5[tex] before add_ib: cs_count=%u\n", draw->cs_count);
    if (use_ib) {
       ret = ta5_cmd_buffer_add_ib(cmd, draw);
       if (ret != VK_SUCCESS)
