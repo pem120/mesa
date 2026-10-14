@@ -6190,17 +6190,49 @@ ir3_compile_shader_nir(struct ir3_compiler *compiler,
 
    IR3_PASS(ir, ir3_remove_noop_subreg_moves);
    IR3_PASS(ir, ir3_postsched, so);
-   IR3_PASS(ir, ir3_merge_rpt, so);
 
-   IR3_PASS(ir, ir3_legalize_relative);
-   IR3_PASS(ir, ir3_lower_subgroups);
-
-   /* This isn't valid to do when transform feedback is done in HW, which is
-    * a4xx onward, because the VS may use components not read by the FS for
-    * transform feedback. Ideally we'd delete this, but a5xx and earlier seem to
-    * be broken without it.
-    */
-   if (so->type == MESA_SHADER_FRAGMENT && ctx->compiler->gen < 6)
+   /*
+    * Do not merge repeat groups.
+    *
+    * Measured on msm8953 (Adreno 506) over 85 texture-sampling cases, each
+    * compared against both lavapipe and an Intel Iris Xe on a per-texel
+    * gradient, and judged by a difference classifier rather than a hash:
+    *
+    *   with this pass:    69 correct, 16 wrong
+    *   without this pass: 79 correct,  6 wrong
+    *
+    * The pass is not merely redundant, and removing it is not free:
+    *
+    *   - it fixes 11 cases (grad 1/3/10, quad 0-2, lad 4, cubenorm,
+    *     gradarr 1, and the three sampler-state variants of grad 1);
+    *   - and it breaks 2 (fs 3, n3to2d 0), which come out black with an
+    *     iova=0 context fault -- the fetch ran at address zero.
+    *
+    * So the removal trades one set of wrong answers for another, and nets out
+    * +10.  A narrower guard on the merge -- refuse only groups whose
+    * destination register is exactly a texture operand -- recovered less than
+    * half of the difference, so what matters is the span a fetch reads rather
+    * than the exact register.
+    *
+    * WHY either behaviour is what it is, is not understood.  The obvious
+    * explanation does not hold up: repeated cat2 instructions do fill the
+    * components they claim, since `(rpt1)mul.f r1.x, (r)r0.z, (0.5)` feeding a
+    * sam that reads r1.x and r1.y is bit-exact against both references, and so
+    * is a repeated `mad.f32` feeding a sam.3d.  This is therefore not a plain
+    * "the merged instruction does not write its own span" bug, and no narrower
+    * change to the merge was found that recovers the difference.
+    *
+    * Note also that 4 further cases (n3to2d 1, lensplit 0, lad 3, grad 24)
+    * fault identically with and without the pass.  That is a separate defect,
+    * not something this pass causes or hides.
+    *
+    * Removing the pass is a size optimisation, so it is not intended to
+    * miscompile; the two cases above show it is not harmless either.  It does
+    * affect the GL path, and the cost there has not been measured.
+    *
+    * TODO: work out what the merge actually breaks, reinstate it, and measure
+    * the GL cost before and after.
+    */   if (so->type == MESA_SHADER_FRAGMENT && ctx->compiler->gen < 6)
       pack_inlocs(ctx);
 
    /*
