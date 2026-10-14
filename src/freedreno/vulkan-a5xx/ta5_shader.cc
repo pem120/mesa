@@ -339,6 +339,349 @@ ta5_lower_tex_units(nir_builder *b, nir_instr *instr, void *data)
 }
 
 /* ------------------------------------------------------------------ */
+/* Buffer descriptors                                                  */
+/* ------------------------------------------------------------------ */
+
+struct ta5_ubo_ctx
+{
+   const struct ta5_pipeline_layout *layout;
+   VkShaderStageFlags stage;
+};
+
+/**
+ * Is this a buffer descriptor the UBO pointer block can address?
+ *
+ * The type here is a nir_descriptor_type, not a VkDescriptorType: the
+ * intrinsic records the SPIR-V storage class it came from, and
+ * VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC has no representation at all --
+ * its dynamic offset is not known until the draw, and nothing here lowers
+ * that into the shader.
+ */
+static bool
+ta5_is_buffer_descriptor(nir_descriptor_type type)
+{
+   return type == nir_descriptor_type_uniform_buffer ||
+          type == nir_descriptor_type_storage_buffer;
+}
+
+/** Which intrinsics the buffer-descriptor lowering has to look at. */
+static bool
+ta5_is_buffer_descriptor_instr(const nir_instr *instr, const void *data)
+{
+   if (instr->type != nir_instr_type_intrinsic)
+      return false;
+
+   switch (nir_instr_as_intrinsic(instr)->intrinsic) {
+   case nir_intrinsic_vulkan_resource_index:
+   case nir_intrinsic_load_vulkan_descriptor:
+      return true;
+   default:
+      return false;
+   }
+}
+
+/** Block number for one descriptor, or UINT32_MAX if the layout has no slot. */
+static uint32_t
+ta5_ubo_block(struct ta5_ubo_ctx *ctx, uint32_t set, uint32_t binding,
+              uint32_t element)
+{
+   struct ta5_buffer_binding order[TA5_MAX_UBOS];
+   unsigned num = ta5_pipeline_layout_buffer_bindings(ctx->layout, ctx->stage,
+                                                      order, ARRAY_SIZE(order));
+
+   for (unsigned i = 0; i < num; i++) {
+      if (order[i].set == set && order[i].binding == binding &&
+          order[i].element == element)
+         return i;
+   }
+
+   return UINT32_MAX;
+}
+
+/**
+ * Replace vulkan_resource_index / load_vulkan_descriptor with a UBO block number.
+ *
+ * spirv_to_nir() describes a buffer descriptor as
+ *
+ *     %i = @vulkan_resource_index (desc_set=0, binding=0, desc_type=UBO)
+ *     %d = @load_vulkan_descriptor (%i)
+ *     %l = @load_deref (... %d ...)
+ *
+ * and IR3 has no case for either intrinsic ("Unhandled intrinsic type:
+ * vulkan_resource_index", followed by a segfault in the error path because
+ * the message is formatted with the NULL context).
+ *
+ * a5xx is bindful, so both collapse to one thing: the block number, which
+ * indexes the per-stage UBO pointer array in the constant file.  That is what
+ * ta5_emit_ubo_pointers() fills at draw time, and IR3's emit_intrinsic_load_ubo
+ * turns a constant source into uniform(ubo_ptrs_base + block * ptrsz).
+ *
+ * The block number comes from ta5_pipeline_layout_buffer_bindings(), the same
+ * list the draw-time emitter walks, because two halves that each sort their
+ * own copy is how the two drift apart.
+ */
+static nir_def *
+ta5_lower_buffer_descriptors(nir_builder *b, nir_instr *instr, void *data)
+{
+   struct ta5_ubo_ctx *ctx = (struct ta5_ubo_ctx *)data;
+   nir_intrinsic_instr *intrin = nir_instr_as_intrinsic(instr);
+
+   switch (intrin->intrinsic) {
+   case nir_intrinsic_vulkan_resource_index: {
+      if (!ta5_is_buffer_descriptor(nir_intrinsic_desc_type(intrin)))
+         return NULL;
+
+      /* src[0] is the array index, for a binding with descriptor_count > 1. */
+      uint32_t element = 0;
+      if (nir_src_is_const(intrin->src[0]))
+         element = nir_src_as_uint(intrin->src[0]);
+
+      uint32_t block = ta5_ubo_block(ctx, nir_intrinsic_desc_set(intrin),
+                                     nir_intrinsic_binding(intrin), element);
+      if (block == UINT32_MAX) {
+         TA5_DBG_SHADER("buffer descriptor set=%u binding=%u element=%u has "
+                        "no slot in the pipeline layout",
+                        nir_intrinsic_desc_set(intrin),
+                        nir_intrinsic_binding(intrin), element);
+         return NULL;
+      }
+
+      return nir_imm_int(b, block);
+   }
+
+   case nir_intrinsic_load_vulkan_descriptor:
+      /*
+       * The descriptor is the block number and nothing else on this
+       * generation: there is no descriptor heap to offset into and no shift
+       * to fold away, so the load is the index it was given.
+       *
+       * The replacement is returned rather than applied with
+       * nir_def_replace(): nir_function_impl_lower_instructions() detaches
+       * the instruction's use list before calling this and reattaches it
+       * after, and replacing the def in here frees the very list it is
+       * holding -- which is a crash inside the iterator, not a wrong answer.
+       */
+      if (!nir_src_is_const(intrin->src[0]))
+         return NULL;
+      return intrin->src[0].ssa;
+
+   default:
+      return NULL;
+   }
+}
+
+/** Deref chain depth this lowering is willing to walk. */
+#define TA5_MAX_DEREF_DEPTH 16
+
+/**
+ * Turn a load off a buffer descriptor's deref chain into load_ubo.
+ *
+ * After ta5_lower_buffer_descriptors() the descriptor is a plain block number,
+ * and spirv_to_nir()'s deref chain still hangs off it:
+ *
+ *     %b = load_const (0x0)                        <- the block number
+ *     %c = deref_cast (buf *)%b (ubo buf)
+ *     %s = deref_struct &%c->attr (ubo vec4[36])
+ *     %a = deref_array &(*%s)[%2] (ubo vec4)        <- %2 is gl_VertexIndex
+ *     %l = @load_deref (%a)
+ *
+ * Nothing between the Vulkan front end and IR3 does this conversion: there is
+ * no deref-to-load_ubo pass anywhere in this tree, and IR3's emit_instr() has
+ * no case for a deref load ("Unhandled intrinsic type: load_deref", followed
+ * by a segfault while formatting the message).
+ *
+ * So the chain is walked once, here, accumulating a constant part and a list
+ * of scaled dynamic terms.  A dynamic array index is not a problem: load_ubo's
+ * second source is a byte offset and IR3 adds it to the block address itself.
+ *
+ * Only loads are handled.  A store into a buffer descriptor is not lowered,
+ * so a shader that has one still fails to compile rather than silently writing
+ * nowhere.
+ */
+static nir_def *
+ta5_lower_ubo_derefs(nir_builder *b, nir_instr *instr, void *data)
+{
+   const nir_deref_instr *chain[TA5_MAX_DEREF_DEPTH];
+   unsigned depth = 0;
+   const nir_deref_instr *deref;
+   nir_def *block = NULL;
+   nir_def *offset = NULL;
+   uint32_t offset_const = 0;
+   nir_intrinsic_instr *intrin = nir_instr_as_intrinsic(instr);
+
+   if (intrin->intrinsic != nir_intrinsic_load_deref)
+      return NULL;
+
+   deref = nir_src_as_deref(intrin->src[0]);
+
+   /* Leaf to root.  Bail on anything deeper than the walk can hold. */
+   while (deref && depth < TA5_MAX_DEREF_DEPTH) {
+      chain[depth++] = deref;
+      deref = nir_deref_instr_parent(deref);
+   }
+
+   /* Root first: either a cast of the block number or a ubo variable. */
+   deref = chain[depth - 1];
+
+   switch (deref->deref_type) {
+   case nir_deref_type_cast:
+      /*
+       * deref_cast is the buffer-pointer cast spirv_to_nir() emits over a
+       * descriptor: its base is the block number, not another deref.
+       */
+      if (nir_def_is_deref(deref->parent.ssa))
+         return NULL;
+      block = deref->parent.ssa;
+      break;
+
+   case nir_deref_type_var:
+      /*
+       * A bare ubo variable.  Vulkan descriptors never arrive this way --
+       * they come in as the cast above -- so there is no block number to
+       * give it, and guessing one would read a neighbouring block.
+       */
+      return NULL;
+
+   default:
+      return NULL;
+   }
+
+   /* Root to leaf, accumulating the byte offset. */
+   for (int i = (int)depth - 2; i >= 0; i--) {
+      const nir_deref_instr *d = chain[i];
+      const struct glsl_type *parent_type =
+         nir_deref_instr_parent(d)->type;
+
+      switch (d->deref_type) {
+      case nir_deref_type_struct:
+         offset_const += glsl_get_struct_field_offset(parent_type,
+                                                       d->strct.index);
+         break;
+
+      case nir_deref_type_array: {
+         unsigned stride = nir_deref_instr_array_stride((nir_deref_instr *)d);
+
+         if (!stride)
+            return NULL;
+
+         if (nir_src_is_const(d->arr.index)) {
+            offset_const += nir_src_as_uint(d->arr.index) * stride;
+         } else {
+            /* offset = offset + index * stride */
+            if (!offset)
+               offset = nir_imm_int(b, 0);
+            offset = nir_iadd(b, offset,
+                              nir_imul_imm(b, d->arr.index.ssa, stride));
+         }
+         break;
+      }
+
+      case nir_deref_type_ptr_as_array:
+         /*
+          * A pointer used as an array, as variable pointers are spelled.
+          * The stride is the cast's, which is the one the layout gave it.
+          */
+         if (!d->cast.ptr_stride || !nir_src_is_const(d->arr.index))
+            return NULL;
+         offset_const += nir_src_as_uint(d->arr.index) * d->cast.ptr_stride;
+         break;
+
+      case nir_deref_type_cast:
+         /* The root cast is already accounted for; an inner one is a
+          * reinterpret and moves no bytes. */
+         break;
+
+      default:
+         return NULL;
+      }
+   }
+
+   if (!offset)
+      offset = nir_imm_int(b, offset_const);
+   else if (offset_const)
+      offset = nir_iadd(b, offset, nir_imm_int(b, offset_const));
+
+   /*
+    * The indices are set after the build rather than through a designated
+    * initializer: a call that mixes positional and designated arguments is a
+    * C99 extension, and this is C++.
+    *
+    * range = ~0 is not an oversight.  get_ubo_load_range() treats a known
+    * range as permission to read the block at compile time, which is only
+    * true for GL; see ta5_defuse_ubo_ranges() for the other half of this.
+    */
+   nir_def *load = nir_load_ubo(b, intrin->num_components,
+                                intrin->def.bit_size, block, offset);
+   nir_intrinsic_instr *load_intr = nir_def_as_intrinsic(load);
+
+   nir_intrinsic_set_access(load_intr, nir_intrinsic_access(intrin));
+   nir_intrinsic_set_range(load_intr, ~0u);
+   return load;
+}
+
+/** Which instructions the buffer-deref lowering looks at. */
+static bool
+ta5_is_ubo_deref_instr(const nir_instr *instr, const void *data)
+{
+   return instr->type == nir_instr_type_intrinsic &&
+          nir_instr_as_intrinsic(instr)->intrinsic == nir_intrinsic_load_deref;
+}
+
+/**
+ * Stop IR3 from freezing a Vulkan UBO load into the constant file.
+ *
+ * IR3's UBO-to-constant optimisation ("ubo ranges") reads a block's contents
+ * at compile time and bakes them into the shader's constant data.  That is
+ * right for GL, where a uniform block is part of the shader, and wrong for
+ * Vulkan, where the same block is whatever buffer the draw has bound -- and
+ * where the compiler has no constant data to bake from at all.
+ *
+ * The optimisation is keyed off load_ubo's declared range, but only for a
+ * dynamically indexed access: get_ubo_load_range() recomputes a static
+ * access's range from its component count, ignoring what the range says.  So
+ * a second, provably-zero term is added to the offset instead.
+ *
+ * Zero has to be built out of the block number rather than written as a
+ * constant, or the constant folder collapses the whole thing back into a
+ * constant offset and the range is recomputed anyway.  `(block << 31) & 1` is
+ * 0 for every 32-bit input -- the shift can only set bit 31, and the mask
+ * keeps only bit 0 -- and neither half of it is a fold: `(block << 31) << 31`
+ * was the first attempt and *is* folded, because shift-of-shift adds.
+ */
+static void
+ta5_defuse_ubo_ranges(nir_function_impl *impl)
+{
+   nir_foreach_block (block, impl) {
+      nir_foreach_instr_safe (instr, block) {
+         if (instr->type != nir_instr_type_intrinsic)
+            continue;
+
+         nir_intrinsic_instr *intrin = nir_instr_as_intrinsic(instr);
+
+         if (intrin->intrinsic != nir_intrinsic_load_ubo ||
+             !nir_src_is_const(intrin->src[0]) ||
+             !nir_src_is_const(intrin->src[1]))
+            continue;
+
+         nir_builder b = nir_builder_at(nir_before_instr(instr));
+         nir_def *always_zero =
+            nir_iand(&b, nir_ishl_imm(&b, intrin->src[0].ssa, 31),
+                     nir_imm_int(&b, 1));
+
+         /*
+          * nir_src_rewrite(), not an assignment: the source is already in the
+          * old def's use list, and overwriting it without unlinking leaves the
+          * list pointing at an instruction that no longer references it.  That
+          * corruption surfaces much later -- measured as a crash inside
+          * nir_opt_cse's nir_def_rewrite_uses(), well past this pass.
+          */
+         nir_src_rewrite(&intrin->src[1],
+                         nir_iadd(&b, intrin->src[1].ssa, always_zero));
+      }
+   }
+}
+
+/* ------------------------------------------------------------------ */
 /* Reading back an output                                              */
 /* ------------------------------------------------------------------ */
 
@@ -615,12 +958,30 @@ ta5_shader_compile(struct ta5_device *device, VkShaderStageFlagBits stage,
                                        ta5_lower_tex_units, &ctx);
    }
 
-   /* Before ir3_finalize_nir(): the read has to be gone by the time IR3 sees
-    * the shader. */
+   /*
+    * Buffer descriptors next, and before ir3_finalize_nir() for the same
+    * reason: the intrinsics have to be gone by the time IR3 reads the shader.
+    */
    {
+      struct ta5_ubo_ctx ctx = {
+         .layout = layout,
+         .stage = (stage == VK_SHADER_STAGE_VERTEX_BIT)
+                      ? VK_SHADER_STAGE_VERTEX_BIT
+                      : VK_SHADER_STAGE_FRAGMENT_BIT,
+      };
+
+      nir_shader_lower_instructions(nir, ta5_is_buffer_descriptor_instr,
+                                    ta5_lower_buffer_descriptors, &ctx);
+
+      /* Then the deref chain hanging off it, then the range defusal. */
+      nir_shader_lower_instructions(nir, ta5_is_ubo_deref_instr,
+                                    ta5_lower_ubo_derefs, &ctx);
+
       nir_foreach_function (fn, nir) {
-         if (fn->impl)
+         if (fn->impl) {
+            ta5_defuse_ubo_ranges(fn->impl);
             ta5_lower_output_reads(fn->impl);
+         }
       }
    }
 

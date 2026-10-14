@@ -190,6 +190,15 @@ VK_DEFINE_NONDISP_HANDLE_CASTS(ta5_descriptor_pool, base, VkDescriptorPool,
 /** Maximum texture units a5xx can bind per stage. */
 #define TA5_MAX_TEX_UNITS 16
 
+/** One buffer descriptor, in the order it becomes a UBO pointer slot. */
+struct ta5_buffer_binding
+{
+   uint32_t set;
+   uint32_t binding;
+   uint32_t element;   /**< index within a descriptor array binding */
+   VkDescriptorType type;
+};
+
 /** One image or sampler binding, in the order it becomes a texel unit. */
 struct ta5_tex_binding
 {
@@ -213,5 +222,28 @@ struct ta5_tex_binding
 unsigned ta5_pipeline_layout_tex_bindings(
    const struct ta5_pipeline_layout *layout, VkShaderStageFlags stage,
    struct ta5_tex_binding *out, unsigned max);
+
+/**
+ * Collect the uniform and storage buffer bindings a stage can see, in the
+ * order they become UBO pointer slots: ascending (set, binding), then array
+ * element.
+ *
+ * Same contract as ta5_pipeline_layout_tex_bindings() and the same reason for
+ * it: the shader compiler numbers its buffer loads from this list and the
+ * draw-time emitter fills the slots from it, so the two halves have to agree.
+ * The list is also what decides a shader's UBO block count, so both have to
+ * take it from the pipeline layout rather than sorting their own copies.
+ *
+ * UNIFORM_BUFFER_DYNAMIC is deliberately absent: a dynamic offset would have
+ * to be added by the shader, and nothing here lowers that.
+ *
+ * Returns the number of entries written, capped at `max`.
+ */
+unsigned ta5_pipeline_layout_buffer_bindings(
+   const struct ta5_pipeline_layout *layout, VkShaderStageFlags stage,
+   struct ta5_buffer_binding *out, unsigned max);
+
+/** Highest UBO pointer slot count a stage can be given. */
+#define TA5_MAX_UBOS 8
 
 #endif /* TA5_DESCRIPTOR_H */

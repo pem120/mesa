@@ -1262,6 +1262,125 @@ ta5_emit_consts(struct ta5_cmd_buffer *cmd, struct ta5_pipeline *pipe,
 }
 
 /**
+ * Upload the per-stage UBO pointer array.
+ *
+ * Before a6xx a buffer descriptor is not a descriptor at all: it is a 64-bit
+ * address written into the stage's constant file, and IR3's emit_intrinsic_load_ubo
+ * reads that slot through uniform(ubo_ptrs_base + block * ptrsz).  The block
+ * number came from the shader compile (ta5_lower_buffer_descriptors), so this
+ * is where that number finally means something.
+ *
+ * The slot order is ta5_pipeline_layout_buffer_bindings() again, for the same
+ * reason the texture units are: the compiler numbered from that list and the
+ * emitter has to fill the same one.
+ *
+ * Addresses are not known to userspace on this platform, so each slot is
+ * emitted as two zero dwords plus a relocation; the kernel patches the real
+ * address in at submit time, exactly as it does for a texture descriptor.
+ */
+static VkResult
+ta5_emit_ubo_pointers(struct ta5_cmd_buffer *cmd, struct ta5_pipeline *pipe,
+                      const struct ta5_compiled_shader *shader,
+                      enum a4xx_state_block state_block,
+                      VkShaderStageFlags stage)
+{
+   const struct ir3_shader_variant *v =
+      (const struct ir3_shader_variant *)shader->variant;
+   const struct ir3_const_state *const_state = ir3_const_state(v);
+   struct ta5_buffer_binding order[TA5_MAX_UBOS];
+   unsigned num_ubos, num_order;
+   uint32_t regid, sizedwords;
+   VkResult ret;
+
+   if (!v || const_state->num_ubos == 0)
+      return VK_SUCCESS;
+
+   num_ubos = MIN2(const_state->num_ubos, TA5_MAX_UBOS);
+   num_order = ta5_pipeline_layout_buffer_bindings(
+      pipe->layout, stage, order, ARRAY_SIZE(order));
+
+   /*
+    * The IR3 allocation is rounded up to a vec4, and its size is what the
+    * hardware sees: loading fewer dwords than the array occupies leaves the
+    * rest of it holding the previous draw's pointers.  Emitting the whole
+    * allocation, with a zero slot for any block the layout has no descriptor
+    * for, keeps the array and the shader's view of it the same length.
+    */
+   sizedwords =
+      MAX2(const_state->allocs.consts[IR3_CONST_ALLOC_UBO_PTRS].size_vec4 * 4,
+           num_ubos * 2);
+   sizedwords = DIV_ROUND_UP(sizedwords, 4) * 4;
+   regid = ir3_const_reg(const_state, IR3_CONST_ALLOC_UBO_PTRS, 0);
+
+   ret = ta5_cmd_buffer_alloc_cs(cmd, cmd->cs_count + 3 + sizedwords + 16);
+   if (ret != VK_SUCCESS)
+      return ret;
+
+   ta5_pkt7(cmd, CP_LOAD_STATE4, 3 + sizedwords);
+   ta5_cs_push(cmd, CP_LOAD_STATE4_0_DST_OFF(regid / 4) |
+                     CP_LOAD_STATE4_0_STATE_SRC(SS4_DIRECT) |
+                     CP_LOAD_STATE4_0_STATE_BLOCK(state_block) |
+                     CP_LOAD_STATE4_0_NUM_UNIT(sizedwords / 4));
+   ta5_cs_push(cmd, CP_LOAD_STATE4_1_EXT_SRC_ADDR(0) |
+                     CP_LOAD_STATE4_1_STATE_TYPE(ST4_CONSTANTS));
+   ta5_cs_push(cmd, CP_LOAD_STATE4_2_EXT_SRC_ADDR_HI(0));
+
+   for (unsigned i = 0; i < num_ubos; i++) {
+      struct ta5_bo *bo = NULL;
+      uint64_t bo_offset = 0;
+
+      if (i < num_order) {
+         struct ta5_descriptor_set *set = cmd->bound_sets[order[i].set];
+         struct ta5_descriptor_set_layout *sl =
+            set ? set->layout : NULL;
+
+         if (sl) {
+            for (uint32_t j = 0; j < sl->binding_count; j++) {
+               const struct ta5_descriptor_layout_binding *bind =
+                  &sl->bindings[j];
+               struct ta5_descriptor *desc;
+               struct ta5_buffer *buf;
+
+               if (bind->binding != order[i].binding)
+                  continue;
+
+               desc = &set->descriptors[bind->offset + order[i].element];
+               buf = ta5_buffer_from_handle(desc->data.buffer.buffer);
+               if (buf && buf->bound_memory) {
+                  bo = buf->bound_memory->bo;
+                  bo_offset = desc->data.buffer.offset;
+               }
+               break;
+            }
+         }
+      }
+
+      if (getenv("TA5_TRACE_UBO"))
+         fprintf(stderr, "ta5[ubo] %s block %u set=%u binding=%u elem=%u bo=%p\n",
+                 stage == VK_SHADER_STAGE_VERTEX_BIT ? "vs" : "fs", i,
+                 i < num_order ? order[i].set : 0,
+                 i < num_order ? order[i].binding : 0,
+                 i < num_order ? order[i].element : 0, (void *)bo);
+
+      if (bo) {
+         ret = ta5_cs_reloc(cmd, bo, bo_offset, 0);
+         if (ret != VK_SUCCESS)
+            return ret;
+      } else {
+         /* An unbound block reads as a zero address rather than whatever the
+          * previous draw left in the slot. */
+         ta5_cs_push(cmd, 0);
+         ta5_cs_push(cmd, 0);
+      }
+   }
+
+   for (uint32_t w = num_ubos * 2; w < sizedwords; w++)
+      ta5_cs_push(cmd, 0);
+
+   return VK_SUCCESS;
+}
+
+/**
  * Program SP_xS_OBJ_START, the descriptor HLSQ fetches the shader from.
  *
  * CP_LOAD_STATE4 only pushes the microcode into HLSQ's state block; the draw
@@ -3453,6 +3572,22 @@ ta5_CmdDraw(VkCommandBuffer _cmd, uint32_t vertexCount, uint32_t instanceCount,
    ta5_emit_consts(draw, pipe, &pipe->vertex, SB4_VS_SHADER, pipe->vs_bo);
    if (pipe->has_fragment)
       ta5_emit_consts(draw, pipe, &pipe->fragment, SB4_FS_SHADER, pipe->fs_bo);
+
+   /*
+    * UBO pointers live in the same constant file as everything else, so they
+    * are uploaded alongside it and after it: the shader load that precedes
+    * them resets the whole constant page.
+    */
+   ret = ta5_emit_ubo_pointers(draw, pipe, &pipe->vertex, SB4_VS_SHADER,
+                               VK_SHADER_STAGE_VERTEX_BIT);
+   if (ret != VK_SUCCESS)
+      goto draw_error;
+   if (pipe->has_fragment) {
+      ret = ta5_emit_ubo_pointers(draw, pipe, &pipe->fragment, SB4_FS_SHADER,
+                                  VK_SHADER_STAGE_FRAGMENT_BIT);
+      if (ret != VK_SUCCESS)
+         goto draw_error;
+   }
 
    /* Now that the shaders are loaded, put the descriptors back. */
    ta5_emit_textures(draw, SB4_VS_TEX, pipe, VK_SHADER_STAGE_VERTEX_BIT);

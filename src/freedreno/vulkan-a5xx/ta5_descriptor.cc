@@ -584,3 +584,70 @@ ta5_pipeline_layout_tex_bindings(const struct ta5_pipeline_layout *layout,
 
    return n;
 }
+
+/* ------------------------------------------------------------------ */
+/* Buffer descriptor ordering                                          */
+/* ------------------------------------------------------------------ */
+
+unsigned
+ta5_pipeline_layout_buffer_bindings(
+   const struct ta5_pipeline_layout *layout, VkShaderStageFlags stage,
+   struct ta5_buffer_binding *out, unsigned max)
+{
+   unsigned n = 0;
+
+   if (!layout)
+      return 0;
+
+   for (uint32_t s = 0; s < layout->set_count && n < max; s++) {
+      struct ta5_descriptor_set_layout *sl = layout->set_layouts[s];
+
+      if (!sl)
+         continue;
+
+      for (uint32_t i = 0; i < sl->binding_count && n < max; i++) {
+         const struct ta5_descriptor_layout_binding *b = &sl->bindings[i];
+
+         if (!(b->stage_flags & stage))
+            continue;
+
+         switch (b->type) {
+         case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER:
+         case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER:
+            break;
+         default:
+            continue;
+         }
+
+         /*
+          * An array of descriptors is one entry per descriptor_count, not one
+          * entry for the binding.  The shader addresses element i of the
+          * array through the resource index, so element i needs its own
+          * block number.
+          */
+         for (uint32_t e = 0; e < b->descriptor_count && n < max; e++) {
+            out[n].set = s;
+            out[n].binding = b->binding;
+            out[n].element = e;
+            out[n].type = b->type;
+            n++;
+         }
+      }
+   }
+
+   /* Same (set, binding) insertion sort as ta5_pipeline_layout_tex_bindings(). */
+   for (unsigned i = 1; i < n; i++) {
+      struct ta5_buffer_binding key = out[i];
+      int j = (int)i - 1;
+
+      while (j >= 0 && (out[j].set > key.set ||
+                        (out[j].set == key.set &&
+                         out[j].binding > key.binding))) {
+         out[j + 1] = out[j];
+         j--;
+      }
+      out[j + 1] = key;
+   }
+
+   return n;
+}
