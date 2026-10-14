@@ -257,6 +257,19 @@ ta5_texel_descriptor(const struct ta5_image_view *view, uint32_t *desc,
     * suggest -- wraps a 16 KiB face stride down to 4 and makes the fetch
     * walk inside one face.
     */
+   uint32_t array_pitch = lvl->layer_pitch;
+   uint32_t depth = view->layer_count / 6;
+   const char *ap = getenv("TA5_ARRAYP");
+   const char *dp = getenv("TA5_DEPTH");
+   if (ap)
+      array_pitch = (uint32_t)atoi(ap);
+   if (dp)
+      depth = (uint32_t)atoi(dp);
+
+   const char *ft = getenv("TA5_FORCE_TYPE");
+   if (ft)
+      type = (enum a5xx_tex_type)atoi(ft);
+
    desc[2] = A5XX_TEX_CONST_2_PITCHALIGN(0) |
              A5XX_TEX_CONST_2_PITCH(lvl->row_pitch) |
              A5XX_TEX_CONST_2_TYPE(type);
@@ -277,8 +290,8 @@ ta5_texel_descriptor(const struct ta5_image_view *view, uint32_t *desc,
 
    case VK_IMAGE_VIEW_TYPE_CUBE:
    case VK_IMAGE_VIEW_TYPE_CUBE_ARRAY:
-      desc[3] = A5XX_TEX_CONST_3_ARRAY_PITCH(lvl->layer_pitch);
-      desc[5] = A5XX_TEX_CONST_5_DEPTH(view->layer_count / 6);
+      desc[3] = A5XX_TEX_CONST_3_ARRAY_PITCH(array_pitch);
+      desc[5] = A5XX_TEX_CONST_5_DEPTH(depth);
       break;
 
    case VK_IMAGE_VIEW_TYPE_2D_ARRAY:

@@ -2670,15 +2670,15 @@ ta5_CmdDraw(VkCommandBuffer _cmd, uint32_t vertexCount, uint32_t instanceCount,
    }
 
    /*
-    * Texture state goes in before the draw state, because fd5 writes the
-    * TPL1_xS_TEX_COUNT values from inside the draw state and they have to
-    * agree with the descriptors emitted just above.
+    * Texture state is emitted here only so the draw-state emitter has the
+    * unit counts to program.  The descriptors themselves are re-emitted after
+    * the shader loads: loading a shader resets the texel descriptors, so a
+    * descriptor written before it is gone by the time the fetch runs, and the
+    * unit then reads as all zeros -- base address 0, which is what a sampled
+    * image that faults at iova 0 looks like.
     */
    vs_tex_count = ta5_emit_textures(draw, SB4_VS_TEX, pipe, VK_SHADER_STAGE_VERTEX_BIT);
    fs_tex_count = ta5_emit_textures(draw, SB4_FS_TEX, pipe, VK_SHADER_STAGE_FRAGMENT_BIT);
-   if (getenv("TA5_TRACE_TEX"))
-      fprintf(stderr, "ta5[tex] after emit: cs_count=%u cs_size=%u\n",
-              draw->cs_count, draw->cs_size);
    if (getenv("TA5_TRACE_TEX")) {
       for (uint32_t i = 0; i < MIN2(draw->cs_count, 28u); i++)
          fprintf(stderr, "  cs[%2u] = %08x\n", i, draw->cs[i]);
@@ -2722,6 +2722,10 @@ ta5_CmdDraw(VkCommandBuffer _cmd, uint32_t vertexCount, uint32_t instanceCount,
    ta5_emit_consts(draw, pipe, &pipe->vertex, SB4_VS_SHADER, pipe->vs_bo);
    if (pipe->has_fragment)
       ta5_emit_consts(draw, pipe, &pipe->fragment, SB4_FS_SHADER, pipe->fs_bo);
+
+   /* Now that the shaders are loaded, put the descriptors back. */
+   ta5_emit_textures(draw, SB4_VS_TEX, pipe, VK_SHADER_STAGE_VERTEX_BIT);
+   ta5_emit_textures(draw, SB4_FS_TEX, pipe, VK_SHADER_STAGE_FRAGMENT_BIT);
 
    /*
     * GL's sysmem pass emits the draw state, the program state and both
