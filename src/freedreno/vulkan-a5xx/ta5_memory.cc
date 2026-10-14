@@ -89,14 +89,26 @@ ta5_AllocateMemory(VkDevice _device, const VkMemoryAllocateInfo *pAllocateInfo,
    list_inithead(&memory->bound_buffers);
 
    /*
-    * Cacheable sysmem: the GPU renders into it and the host reads the result
-    * back through mmap.  MSM_BO_CACHED is inside MSM_BO_FLAGS' cache mask;
-    * MSM_BO_CACHED_COHERENT (0x080000) is not, and passing it makes
-    * DRM_IOCTL_GEM_NEW fail with EINVAL.
+    * Uncached sysmem, by default.
+    *
+    * Every allocation comes from the one system heap, and the application is
+    * free to map any of it, so an allocation has to stay coherent between the
+    * CPU and the GPU.  MSM_BO_CACHED gives a CPU-cacheable mapping on a
+    * system where the GPU is not coherent with the CPU cache, and no amount
+    * of msync() makes that reliable here: measured over 24 cube samples,
+    * cached gave 3 wrong answers and uncached gave none, and the failures
+    * were not even the same run twice -- a stale read shows up as the
+    * pre-render contents of the target, which reads as a lost submission
+    * rather than as a cache.
+    *
+    * MSM_BO_CACHED_COHERENT (0x080000) is not inside MSM_BO_FLAGS' cache
+    * mask, and passing it makes DRM_IOCTL_GEM_NEW fail with EINVAL.
+    *
+    * TA5_BO_CACHE=c forces the cached mapping back, to reproduce that.
     */
    {
       const char *m = getenv("TA5_BO_CACHE");
-      uint32_t flags = m && m[0] == 'w' ? MSM_BO_WC : MSM_BO_CACHED;
+      uint32_t flags = (m && m[0] == 'c') ? MSM_BO_CACHED : MSM_BO_WC;
       memory->bo = ta5_bo_alloc(device, (uint32_t)memory->size, flags);
    }
    if (!memory->bo) {
@@ -180,6 +192,19 @@ ta5_MapMemory(VkDevice _device, VkDeviceMemory _memory, VkDeviceSize offset,
       return vk_error(&memory->device->instance->vk,
                       VK_ERROR_MEMORY_MAP_FAILED);
 
+   /*
+    * Drop any CPU-cached copies before handing the mapping out.
+    *
+    * The mapping is cached and is reused across map/unmap cycles, so once
+    * the GPU has written an allocation -- a render target read back after
+    * vkQueueWaitIdle -- the CPU's cached lines are stale and the program
+    * reads whatever the allocation held before the draw.  That is not a
+    * wrong answer that stays wrong: it is intermittent, which makes it look
+    * like a race in the submission rather than a cache.
+    */
+   if (ta5_bo_is_cached(bo))
+      msync(map, bo->size, MS_INVALIDATE);
+
    if (getenv("TA5_TRACE_NULL")) {
       for (int round = 0; round < 4; round++) {
          const uint8_t *q = (const uint8_t *)map;
@@ -217,6 +242,24 @@ ta5_MapMemory(VkDevice _device, VkDeviceMemory _memory, VkDeviceSize offset,
 VKAPI_ATTR void VKAPI_CALL
 ta5_UnmapMemory(VkDevice _device, VkDeviceMemory _memory)
 {
+   struct ta5_memory *memory = ta5_memory_from_handle(_memory);
+   struct ta5_bo *bo = memory->bo;
+
+   /*
+    * Write the CPU's dirty lines back before the GPU can read them.
+    *
+    * Allocations are mapped MSM_BO_CACHED, so this is a CPU-cacheable
+    * mapping on a system where the GPU is not coherent with the CPU cache.
+    * Nothing else in the driver does this: the submit path patches the
+    * command stream, it never touches the allocation.  Without the write-out,
+    * the image data a program uploaded through vkMapMemory can still be
+    * sitting in cache when the fetch reads it.
+    *
+    * Unmapping is the point Vulkan gives the driver to do it, and it is the
+    * only point at which every uploaded allocation has been written.
+    */
+   if (bo && bo->map && ta5_bo_is_cached(bo))
+      msync(bo->map, bo->size, MS_SYNC | MS_INVALIDATE);
 }
 
 VKAPI_ATTR VkResult VKAPI_CALL
