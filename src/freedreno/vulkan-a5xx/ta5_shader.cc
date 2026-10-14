@@ -455,10 +455,8 @@ ta5_shader_compile(struct ta5_device *device, VkShaderStageFlagBits stage,
     * and still not enough, because the unit the shader indexes with lives in
     * the instruction and nowhere else.
     */
-   if (getenv("TA5_TRACE_SHADER")) {
-      fprintf(stderr, "--- ta5: NIR after lowering ---\n");
-      nir_log_shaderi(nir);
-   }
+   if (getenv("TA5_TRACE_SHADER"))
+      fprintf(stderr, "--- ta5: NIR after lowering ---\n"), nir_log_shaderi(nir);
 
    ir3_shader = ir3_shader_from_nir(compiler, nir, &shader_options);
    if (!ir3_shader) {
