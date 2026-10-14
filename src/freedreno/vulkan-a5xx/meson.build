@@ -34,6 +34,7 @@ libta5_files = files(
   'ta5_queue.cc',
   'ta5_submit.cc',
   'ta5_instance.cc',
+  'ta5_wsi.cc',
 )
 
 # Generated adreno register/pm4 headers (adreno_pm4.xml.h etc.) are pulled in

@@ -61,15 +61,17 @@
 /* Extension tables                                                     */
 /* ------------------------------------------------------------------ */
 
-/* Instance-level extensions.  Fields must follow declaration order.
- * WSI platform bits arrive with swapchain support in a later phase. */
+/* Instance-level extensions.  Fields must follow declaration order. */
 const struct vk_instance_extension_table ta5_instance_extensions_supported = {
    .table = {
       .KHR_device_group_creation = true,
+      .KHR_display = true,
       .KHR_external_fence_capabilities = true,
       .KHR_external_memory_capabilities = true,
       .KHR_external_semaphore_capabilities = true,
       .KHR_get_physical_device_properties2 = true,
+      .KHR_get_surface_capabilities2 = true,
+      .KHR_surface = true,
    },
 };
 
@@ -115,6 +117,7 @@ const struct vk_device_extension_table ta5_device_extensions_supported = {
       .KHR_shader_float16_int8 = true,
       .KHR_shader_float_controls = true,
       .KHR_storage_buffer_storage_class = true,
+      .KHR_swapchain = true,
       .KHR_variable_pointers = true,
       .KHR_vulkan_memory_model = true,
       .EXT_sampler_filter_minmax = true,
@@ -393,6 +396,9 @@ ta5_physical_device_init(struct ta5_physical_device *device,
 
    device->instance = instance;
    device->dev_fd = dev_fd;
+   device->wsi_display = NULL;
+   device->wsi_mode = NULL;
+   simple_mtx_init(&device->wsi_mtx, mtx_plain);
 
    snprintf(device->device_name, sizeof(device->device_name), "%s",
             ta5_device_name(device->dev_id.gpu_id));

@@ -50,6 +50,7 @@
 
 #include "ta5_instance.h"
 #include "ta5_device.h"
+#include "ta5_wsi.h"
 #include "ta5_entrypoints.h"
 
 #define TA5_DBG(fmt, ...)                                                  \
@@ -193,6 +194,9 @@ ta5_destroy_physical_device(struct vk_physical_device *vk_pdevice)
 {
    struct ta5_physical_device *device =
       container_of(vk_pdevice, struct ta5_physical_device, vk);
+
+   ta5_wsi_display_finish(device);
+   simple_mtx_destroy(&device->wsi_mtx);
 
    if (device->dev_fd >= 0)
       close(device->dev_fd);
