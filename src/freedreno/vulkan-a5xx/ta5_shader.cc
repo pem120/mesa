@@ -338,6 +338,143 @@ ta5_lower_tex_units(nir_builder *b, nir_instr *instr, void *data)
    return NULL;
 }
 
+/* ------------------------------------------------------------------ */
+/* Reading back an output                                              */
+/* ------------------------------------------------------------------ */
+
+/** One remembered output write: (location, array element) -> value. */
+struct ta5_out_store
+{
+   uint32_t location;
+   uint32_t component;
+   nir_def *value;
+};
+
+#define TA5_MAX_TRACKED_STORES 32
+
+/**
+ * Replace a read of an output variable with the value written to it.
+ *
+ * SPIR-V allows a shader to read an Output variable it has already written,
+ * and vkcube's vertex shader does: it stores gl_Position and then writes a
+ * `frag_pos` varying from it.  NIR spells that read as
+ *
+ *     %p = @store_output (%v, location=VARYING_SLOT_POS, wrmask=xyzw)
+ *     %g = @load_output (location=VARYING_SLOT_POS, component=0)
+ *
+ * and IR3 has no case for load_output -- "Unhandled intrinsic type:
+ * load_output", then a segfault while it formats the message.  A store_output
+ * is fine, because writing an output is what outputs are for; it is only the
+ * read-back that has no instruction.
+ *
+ * So the writes are remembered per block and a read becomes the value that
+ * was written.  The table is cleared at every block boundary and only stores
+ * that precede the read in the same block are visible, so a read that no
+ * visible write answers is left alone rather than answered with a value from
+ * somewhere else.
+ */
+static bool
+ta5_lower_output_reads(nir_function_impl *impl)
+{
+   bool progress = false;
+
+   nir_foreach_block (block, impl) {
+      struct ta5_out_store stores[TA5_MAX_TRACKED_STORES];
+      uint32_t num_stores = 0;
+
+      nir_foreach_instr_safe (instr, block) {
+         nir_builder b;
+
+         if (instr->type != nir_instr_type_intrinsic)
+            continue;
+
+         b = nir_builder_at(nir_before_instr(instr));
+
+         nir_intrinsic_instr *intrin = nir_instr_as_intrinsic(instr);
+         nir_io_semantics io;
+
+         if (intrin->intrinsic != nir_intrinsic_store_output &&
+             intrin->intrinsic != nir_intrinsic_load_output)
+            continue;
+
+         io = nir_intrinsic_io_semantics(intrin);
+
+         if (intrin->intrinsic == nir_intrinsic_store_output) {
+            unsigned wrmask = nir_intrinsic_write_mask(intrin);
+            unsigned base = nir_intrinsic_component(intrin);
+            nir_def *value = intrin->src[0].ssa;
+
+            /* A partial write is recorded per component, so a later
+             * single-component read finds the right piece of it. */
+            for (unsigned i = 0; i < 4; i++) {
+               if (!(wrmask & (1u << i)) || num_stores >= TA5_MAX_TRACKED_STORES)
+                  continue;
+
+               stores[num_stores].location = io.location;
+               stores[num_stores].component = base + i;
+               stores[num_stores].value =
+                  (value->num_components == 4 && i < 4)
+                     ? nir_channel(&b, value, i)
+                     : value;
+               num_stores++;
+            }
+            continue;
+         }
+
+         /* load_output */
+         unsigned comp = nir_intrinsic_component(intrin);
+         unsigned ncomp = intrin->def.num_components;
+         nir_def *found[4] = {0};
+
+         if (ncomp > ARRAY_SIZE(found))
+            continue;
+
+         for (unsigned i = 0; i < ncomp; i++) {
+            for (uint32_t j = 0; j < num_stores; j++) {
+               if (stores[j].location == io.location &&
+                   stores[j].component == comp + i) {
+                  found[i] = stores[j].value;
+                  break;
+               }
+            }
+            if (!found[i])
+               break;
+         }
+
+         if (!found[0])
+            continue;
+
+         /* Every component has to be there, or the read stays. */
+         for (unsigned i = 0; i < ncomp; i++) {
+            if (!found[i])
+               break;
+         }
+
+         if (ncomp == 1) {
+            nir_def_replace(&intrin->def,
+                            found[0]->num_components == 1
+                               ? found[0]
+                               : nir_channel(&b, found[0], 0));
+            progress = true;
+         } else if (ncomp == 4) {
+            bool scalar = true;
+
+            for (unsigned i = 0; i < 4; i++)
+               scalar = scalar && found[i]->num_components == 1;
+
+            if (scalar) {
+               nir_def_replace(&intrin->def,
+                               nir_vec4(&b, found[0], found[1], found[2],
+                                        found[3]));
+               progress = true;
+            }
+         }
+      }
+   }
+
+   return progress;
+}
+
 bool
 ta5_shader_compile(struct ta5_device *device, VkShaderStageFlagBits stage,
                    const struct ta5_pipeline_layout *layout,
@@ -476,6 +613,15 @@ ta5_shader_compile(struct ta5_device *device, VkShaderStageFlagBits stage,
       if (ctx.stage)
          nir_shader_lower_instructions(nir, ta5_is_tex_unit_instr,
                                        ta5_lower_tex_units, &ctx);
+   }
+
+   /* Before ir3_finalize_nir(): the read has to be gone by the time IR3 sees
+    * the shader. */
+   {
+      nir_foreach_function (fn, nir) {
+         if (fn->impl)
+            ta5_lower_output_reads(fn->impl);
+      }
    }
 
    ir3_finalize_nir(compiler, &shader_nir_options, nir);
