@@ -49,10 +49,22 @@
 #include "compiler/nir/nir_builder.h"
 #include "compiler/nir/nir_intrinsics.h"
 #include "compiler/spirv/nir_spirv.h"
+#include "compiler/isaspec/isaspec.h"
 
 #include "ir3/ir3_compiler.h"
 #include "ir3/ir3_nir.h"
 #include "ir3/ir3_shader.h"
+
+/*
+ * ir3_shader_disasm() would be nicer, but it walks so->ir, which create_variant()
+ * destroys before it returns -- calling it from here segfaults.  The raw ISA
+ * decoder takes only the assembled binary, so use that.  Its declaration lives
+ * in a generated header, so bind it by assembler name and take the options
+ * struct from its real header.
+ */
+extern "C" void ta5_ir3_isa_disasm(void *bin, int sz, FILE *out,
+                                    const struct isa_decode_options *options)
+   __asm__("ir3_isa_disasm");
 
 #include "ta5_instance.h"
 #include "ta5_device.h"
@@ -469,6 +481,26 @@ ta5_shader_compile(struct ta5_device *device, VkShaderStageFlagBits stage,
       TA5_DBG_SHADER("ir3 variant compile failed");
       ir3_shader_destroy(ir3_shader);
       goto fail;
+   }
+
+   /*
+    * IR3 machine code, on a knob.  Disassemble the assembled binary rather
+    * than the IR: create_variant() destroys the IR before it returns, so the
+    * instruction stream is the only thing still alive here.  This is how the
+    * compiled tex instruction gets read back -- the descriptor and the sampler
+    * can both be correct and still not be enough, because the unit the shader
+    * indexes with lives in the instruction and nowhere else.
+    */
+   if (getenv("TA5_TRACE_DISASM")) {
+      struct isa_decode_options opts = {};
+      opts.gpu_id = (uint32_t)compiler->gen * 100;
+      opts.show_errors = true;
+      opts.branch_labels = true;
+      opts.max_errors = 4;
+      fprintf(stderr, "--- ta5: IR3 for %s shader ---\n",
+              variant->type == MESA_SHADER_VERTEX ? "vertex" : "fragment");
+      ta5_ir3_isa_disasm(variant->bin, variant->info.sizedwords * 4, stderr,
+                         &opts);
    }
 
    /*
