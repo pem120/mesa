@@ -2018,14 +2018,26 @@ ta5_emit_clear(struct ta5_cmd_buffer *cmd, struct ta5_device *device,
 
    /*
     * RB_CLEAR_COLOR_DW0..3 is one packed dword followed by three reserved
-    * ones, not four channel dwords.  The byte order is BGRA, which is only
-    * visible from GL's stream: its clear of rgba(0,0,0,1) lands as
-    * RB_CLEAR_COLOR_DW0 = 0xff000000, i.e. alpha in the high byte.  Writing
-    * the channels as separate dwords clears to (r,0,0,0) instead.
+    * ones, not four channel dwords, and the byte order is ABGR counting down
+    * from the most significant byte -- equivalently R in the low byte.
+    *
+    * The previous comment here claimed BGRA.  That was right about alpha being
+    * in the high byte and wrong about R and B, and it stayed invisible for as
+    * long as every test drew a full-screen triangle over the whole
+    * attachment: black and green hide the transposition, and only a
+    * distinctly coloured clear exposes it.  Measured on msm8953, clearing the
+    * attachment and then leaving it uncovered:
+    *
+    *     requested      rendered
+    *     (255,  0,  0)   (  0,  0,255)     red came out blue
+    *     (  0,  0,255)   (255,  0,  0)     blue came out red
+    *     ( 17, 34, 51)   ( 51, 34, 17)
+    *     (  0,255,  0)   (  0,255,  0)     green is the middle byte
+    *     (  0,  0,  0)   (  0,  0,  0)     all zero
     */
    ta5_pkt4(cmd, REG_A5XX_RB_CLEAR_COLOR_DW0, 4);
-   ta5_cs_push(cmd, (color->u32[3] << 24) | (color->u32[0] << 16) |
-                     (color->u32[1] << 8) | color->u32[2]);
+   ta5_cs_push(cmd, (color->u32[3] << 24) | (color->u32[2] << 16) |
+                      (color->u32[1] << 8) | color->u32[0]);
    ta5_cs_push(cmd, 0x00000000);
    ta5_cs_push(cmd, 0x00000000);
    ta5_cs_push(cmd, 0x00000000);
