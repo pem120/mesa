@@ -244,7 +244,15 @@ ta5_texel_descriptor(const struct ta5_image_view *view, uint32_t *desc,
    if (ta5_texel_is_srgb(view->format))
       desc[0] |= A5XX_TEX_CONST_0_SRGB;
 
-   /* TEX_CONST_1: width and height of the view's base mip level. */
+   /* TEX_CONST_1: width and height of the view's base mip level.
+    *
+    * That is what fd5 emits too -- texconst1 is u_minify(width0, lvl) with lvl
+    * the *first* sampled level, normally 0 -- so the fetch unit is given the
+    * base size and derives the rest.  Passing the smallest level instead was
+    * tried here and rejected: it changed the sampled texel but not the right
+    * one, and it contradicts the GL backend on a point the GL backend is
+    * right about.
+    */
    desc[1] =
       A5XX_TEX_CONST_1_WIDTH(lvl->width) | A5XX_TEX_CONST_1_HEIGHT(lvl->height);
 

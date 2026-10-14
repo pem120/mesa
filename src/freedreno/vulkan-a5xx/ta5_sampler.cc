@@ -86,11 +86,40 @@ ta5_sampler_encode(const VkSamplerCreateInfo *pCreateInfo, uint32_t *desc)
    float min_lod = pCreateInfo->minLod;
    float max_lod = pCreateInfo->maxLod;
 
+   /*
+    * VK_SAMPLER_MIPMAP_MODE_NEAREST, on this hardware's terms.
+    *
+    * a5xx has no "select exactly level N" mode.  The LOD carried in the
+    * instruction is used to interpolate *within* [MIN_LOD, MAX_LOD]: frac =
+    * LOD - floor(LOD) blends levels floor(LOD) and floor(LOD)+1, so the only
+    * way to land on one level is for both ends of the interval to sit inside
+    * [N, N+1).  fd5_texture.c:99 does the same thing for the equivalent GL
+    * case, clamping both ends so the hardware can still choose between mag
+    * and min of level 0.
+    *
+    * Two narrower forms were measured here first, and both left the chain
+    * unreachable:
+    *
+    *   min_lod = MAX2(min_lod, max_lod - 0.125f)      (the previous code)
+    *      Only ever raises MIN_LOD.  With minLod 0 and maxLod 3 -- an ordinary
+    *      four-level chain -- this is a no-op, the interval stayed [0, 3], and
+    *      every level came back as a blend of levels 0 and 1.
+    *
+    *   min_lod = MIN2(min_lod + 0.125f, max_lod)
+    *      Raises MIN_LOD only when it is already at the bottom, so LAYER=0
+    *      produced level 0 and LAYER=1, 2 and 3 all produced level 1.
+    *
+    * So both ends move, each into its own level.  The 0.125 is a quarter of
+    * the value GL uses: a5xx quantises LOD to 1/8, so it has to be small
+    * enough not to reach into the next level and large enough not to quantise
+    * away to nothing.
+    */
    if (pCreateInfo->mipmapMode == VK_SAMPLER_MIPMAP_MODE_NEAREST) {
-      /* The hardware has no "pick one level" mode: it always filters between
-       * MIN_LOD and MAX_LOD.  Collapsing the pair onto the nearer of the two
-       * is what makes a NEAREST mipmap mode behave. */
-      min_lod = MAX2(min_lod, max_lod - 0.125f);
+      float lo = CLAMP(floorf(min_lod), 0.0f, max_lod);
+      float hi = CLAMP(floorf(max_lod), 0.0f, max_lod);
+
+      min_lod = lo + 0.125f;
+      max_lod = hi + 0.125f;
    }
 
    desc[0] = A5XX_TEX_SAMP_0_XY_MAG(mag) | A5XX_TEX_SAMP_0_XY_MIN(min) |
