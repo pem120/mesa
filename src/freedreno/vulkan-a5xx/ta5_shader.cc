@@ -283,7 +283,25 @@ ta5_lower_tex_units(nir_builder *b, nir_instr *instr, void *data)
       if (!var)
          continue;
 
-      set = var->data.location;
+      /*
+       * The set number is data.descriptor_set, not data.location.
+       *
+       * vtn_variables.c:2528 writes the SPIR-V DescriptorSet decoration to
+       * data.descriptor_set and leaves data.location at its -1 initialiser
+       * (vtn_variables.c:2243), so reading location compares 0xFFFFFFFF
+       * against the real set numbers in ta5_pipeline_layout_tex_bindings()
+       * and never matches.  Every texture and sampler instruction therefore
+       * came out as unit 0.
+       *
+       * That is invisible with a single descriptor, which is all the 88-case
+       * matrix had, so it is the same "works by accident" shape as the R/B
+       * transposition.  Confirmed from the trace before the fix:
+       *
+       *     ta5[texunit] set=4294967295 binding=0 op=0 unit=0
+       *
+       * and it is 0 for every binding and every set, not just this one.
+       */
+      set = var->data.descriptor_set;
       binding = var->data.binding;
 
       unit = 0;
