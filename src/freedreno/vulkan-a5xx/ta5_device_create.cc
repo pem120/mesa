@@ -93,8 +93,15 @@ ta5_CreateDevice(VkPhysicalDevice physicalDevice,
     * Scratch buffer for timestamped CP_EVENT_WRITE -- both the CCU_RESOLVE a
     * clear needs and the trailing barrier the host waits on.  Allocated here
     * and mapped up front so it exists before anything can reference it.
+    *
+    * 0x1000, not 16, and that is GL's size deliberately (fd5_context.c:
+    * fd5_ctx->blit_mem = fd_bo_new(screen->dev, 0x1000, 0, "blit")).  The CCU
+    * is not the only writer here: these events also write their timestamp back
+    * at 64-byte granularity, which is exactly the stride the fault storm walks
+    * -- 16 bytes of destination is less than one such granule, so the
+    * write-back runs off the end of the allocation.
     */
-   device->blit_bo = ta5_bo_alloc(device, 16, MSM_BO_CACHED);
+   device->blit_bo = ta5_bo_alloc(device, 0x1000, MSM_BO_CACHED);
    if (device->blit_bo == NULL || ta5_bo_map(device->blit_bo) == NULL)
       return vk_error(&pdevice->instance->vk, VK_ERROR_OUT_OF_DEVICE_MEMORY);
 
