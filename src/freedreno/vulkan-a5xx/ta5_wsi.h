@@ -19,7 +19,24 @@
 #include "vulkan/vulkan_core.h"
 #include "vk_object.h"
 
+#include <stdbool.h>
+#include <stdint.h>
+
 #include <xf86drmMode.h>
+
+#ifdef TA5_HAVE_WAYLAND
+struct wl_display;
+struct wl_registry;
+struct wl_compositor;
+struct wl_surface;
+struct wl_shm;
+struct wl_shm_pool;
+struct wl_buffer;
+struct zwp_linux_dmabuf_v1;
+struct xdg_wm_base;
+struct xdg_surface;
+struct xdg_toplevel;
+#endif
 
 struct ta5_instance;
 struct ta5_physical_device;
@@ -54,15 +71,41 @@ struct ta5_display_mode
    VkDisplayModeParametersKHR params;
 };
 
-/** A display-plane surface vkcube renders into. */
+/**
+ * A surface is either a KMS display plane or a Wayland compositor's window.
+ *
+ * Both are VkSurfaceKHR; the kind decides which query path answers for it and
+ * which present path runs.  A display surface has a mode and a plane; a Wayland
+ * surface has a wl_display, an xdg_toplevel and a size the compositor dictates.
+ */
 struct ta5_surface
 {
    struct vk_object_base base;
    struct ta5_instance *instance;
 
+   /* Display-plane surface (VK_KHR_display).  NULL for a Wayland surface. */
    struct ta5_display *display;
    struct ta5_display_mode *mode;
    uint32_t plane_index;
+
+   /* VK_KHR_wayland_surface.  All NULL for a display surface. */
+   bool wayland;
+   struct wl_display *wl_display;
+   struct wl_registry *wl_registry;
+   struct wl_compositor *wl_compositor;
+   struct zwp_linux_dmabuf_v1 *wl_dmabuf;
+   struct wl_shm *wl_shm;
+   struct xdg_wm_base *wl_xdg_wm_base;
+   struct xdg_surface *wl_xdg_surface;
+   struct xdg_toplevel *wl_toplevel;
+   struct wl_surface *wl_surface;
+
+   /* Size the compositor asked for; valid once wl_configured is set. */
+   uint32_t wl_width;
+   uint32_t wl_height;
+   int32_t wl_pending_serial;
+   bool wl_configured;
+   bool wl_frame_done;
 };
 
 /** One swapchain image: a colour-attachment image plus its GEM state. */
@@ -71,6 +114,11 @@ struct ta5_swapchain_image
    struct ta5_image *image;
    struct ta5_memory *memory;
    uint32_t fb_id; /**< DRM framebuffer, created on first present */
+#ifdef TA5_HAVE_WAYLAND
+   struct wl_buffer *wl_buffer;    /**< created on first present, like fb_id */
+   struct wl_shm_pool *wl_shm_pool; /**< the shm path's backing pool */
+   int wl_shm_fd;                   /**< and its memfd, -1 until created */
+#endif
 };
 
 /** A swapchain over a display-plane surface, presented via drmModeSetCrtc. */
@@ -105,5 +153,16 @@ VK_DEFINE_NONDISP_HANDLE_CASTS(ta5_surface, base, VkSurfaceKHR,
                                VK_OBJECT_TYPE_SURFACE_KHR)
 VK_DEFINE_NONDISP_HANDLE_CASTS(ta5_swapchain, base, VkSwapchainKHR,
                                VK_OBJECT_TYPE_SWAPCHAIN_KHR)
+
+#ifdef TA5_HAVE_WAYLAND
+/* ta5_wayland.cc.  Declared here so ta5_wsi.cc can route without including the
+ * Wayland headers, which the rest of the driver has no reason to see. */
+void ta5_DestroyWaylandSurface(struct ta5_surface *surf,
+                              const VkAllocationCallbacks *pAllocator);
+VkResult ta5_wayland_capabilities(struct ta5_surface *surf,
+                                  VkSurfaceCapabilitiesKHR *pCaps);
+VkResult ta5_wayland_present(struct ta5_swapchain *sc, uint32_t index);
+void ta5_wayland_swapchain_destroy(struct ta5_swapchain *sc);
+#endif
 
 #endif /* TA5_WSI_H */

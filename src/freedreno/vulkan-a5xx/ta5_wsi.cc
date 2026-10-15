@@ -512,6 +512,13 @@ ta5_DestroySurfaceKHR(VkInstance _instance, VkSurfaceKHR _surface,
    if (pAllocator == NULL)
       pAllocator = vk_default_allocator();
 
+#ifdef TA5_HAVE_WAYLAND
+   if (surf->wayland) {
+      ta5_DestroyWaylandSurface(surf, pAllocator);
+      return;
+   }
+#endif
+
    vk_object_base_finish(&surf->base);
    vk_free(pAllocator, surf);
    (void)instance;
@@ -541,6 +548,11 @@ ta5_GetPhysicalDeviceSurfaceCapabilitiesKHR(VkPhysicalDevice physicalDevice,
                                             VkSurfaceCapabilitiesKHR *pCaps)
 {
    struct ta5_surface *surf = ta5_surface_from_handle(surface);
+
+#ifdef TA5_HAVE_WAYLAND
+   if (surf && surf->wayland)
+      return ta5_wayland_capabilities(surf, pCaps);
+#endif
 
    if (!pCaps || !surf || !surf->display)
       return VK_ERROR_INITIALIZATION_FAILED;
@@ -647,14 +659,36 @@ ta5_CreateSwapchainKHR(VkDevice _device,
       return vk_error(&device->instance->vk, VK_ERROR_INITIALIZATION_FAILED);
 
    surf = ta5_surface_from_handle(pCreateInfo->surface);
-   if (!surf || !surf->display)
+   if (!surf)
       return vk_error(&device->instance->vk, VK_ERROR_INITIALIZATION_FAILED);
 
-   /* vkcube creates with the currentExtent; anything else is a request to
-    * scale, which KMS would have to do and this path does not. */
-   if (pCreateInfo->imageExtent.width != surf->display->width ||
-       pCreateInfo->imageExtent.height != surf->display->height)
-      return vk_error(&device->instance->vk, VK_ERROR_INITIALIZATION_FAILED);
+#ifdef TA5_HAVE_WAYLAND
+   /*
+    * A Wayland surface takes its extent from the compositor, so there is no
+    * mode here to compare it against: the application asked for a size and the
+    * size is what it gets.  The KMS branch still insists on an exact match
+    * with the mode, because there the mode *is* the image and any other size
+    * is a request to scale, which this path does not do.
+    */
+   if (surf->wayland) {
+      if (pCreateInfo->imageExtent.width == 0 ||
+          pCreateInfo->imageExtent.height == 0 ||
+          pCreateInfo->imageExtent.width > 4096 ||
+          pCreateInfo->imageExtent.height > 4096)
+         return vk_error(&device->instance->vk, VK_ERROR_INITIALIZATION_FAILED);
+   } else
+#endif
+   {
+      if (!surf->display)
+         return vk_error(&device->instance->vk, VK_ERROR_INITIALIZATION_FAILED);
+
+      /* vkcube creates with the currentExtent; anything else is a request to
+       * scale, which KMS would have to do and this path does not. */
+      if (pCreateInfo->imageExtent.width != surf->display->width ||
+          pCreateInfo->imageExtent.height != surf->display->height)
+         return vk_error(&device->instance->vk,
+                         VK_ERROR_INITIALIZATION_FAILED);
+   }
 
    if (pCreateInfo->imageFormat != VK_FORMAT_R8G8B8A8_UNORM &&
        pCreateInfo->imageFormat != VK_FORMAT_B8G8R8A8_UNORM)
@@ -682,8 +716,10 @@ ta5_CreateSwapchainKHR(VkDevice _device,
    sc->image_count = count;
    sc->next = 0;
    sc->drm_fd = -1;
-   sc->crtc_id = surf->display->crtc_id;
-   sc->connector_id = surf->display->connector_id;
+   /* A Wayland surface never opens the card: its buffers go to the compositor
+    * as dma-bufs, and DRM master belongs to the compositor. */
+   sc->crtc_id = surf->display ? surf->display->crtc_id : 0;
+   sc->connector_id = surf->display ? surf->display->connector_id : 0;
 
    sc->images = (struct ta5_swapchain_image *)vk_zalloc(
       pAllocator, count * sizeof(*sc->images), 8,
@@ -748,6 +784,11 @@ ta5_CreateSwapchainKHR(VkDevice _device,
       sc->images[i].image = ta5_image_from_handle(img);
       sc->images[i].memory = ta5_memory_from_handle(mem);
       sc->images[i].fb_id = 0;
+#ifdef TA5_HAVE_WAYLAND
+      sc->images[i].wl_buffer = NULL;
+      sc->images[i].wl_shm_pool = NULL;
+      sc->images[i].wl_shm_fd = -1;
+#endif
    }
 
    if (i < count) {
@@ -783,6 +824,11 @@ ta5_DestroySwapchainKHR(VkDevice _device, VkSwapchainKHR _swapchain,
 
    if (pAllocator == NULL)
       pAllocator = vk_default_allocator();
+
+#ifdef TA5_HAVE_WAYLAND
+   if (sc->surface->wayland)
+      ta5_wayland_swapchain_destroy(sc);
+#endif
 
    for (uint32_t i = 0; i < sc->image_count; i++) {
       if (sc->images[i].fb_id && sc->drm_fd >= 0)
@@ -892,6 +938,16 @@ ta5_present_image(struct ta5_swapchain *sc, uint32_t index)
    int prime_fd = -1;
    uint32_t kmsgem = 0;
    int ret;
+
+#ifdef TA5_HAVE_WAYLAND
+   /*
+    * A Wayland swapchain is never scanned out by this process: the compositor
+    * reads the same memory, handed over as a dma-buf.  Everything below is
+    * KMS-only and would need DRM master, which is not ours to take.
+    */
+   if (sc->surface->wayland)
+      return ta5_wayland_present(sc, index);
+#endif
 
    if (sc->drm_fd < 0) {
       sc->drm_fd = ta5_drm_open();

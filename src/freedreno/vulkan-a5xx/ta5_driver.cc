@@ -61,7 +61,14 @@
 /* Extension tables                                                     */
 /* ------------------------------------------------------------------ */
 
-/* Instance-level extensions.  Fields must follow declaration order. */
+/*
+ * Instance-level extensions.  Fields must follow declaration order.
+ *
+ * VK_KHR_wayland_surface appears only when the build found wayland-scanner, the
+ * protocol XMLs and a libwayland-client to link: without those the entry points
+ * cannot exist, and advertising the extension would hand an application a
+ * vkCreateWaylandSurfaceKHR that is not there.
+ */
 const struct vk_instance_extension_table ta5_instance_extensions_supported = {
    .table = {
       .KHR_device_group_creation = true,
@@ -72,6 +79,9 @@ const struct vk_instance_extension_table ta5_instance_extensions_supported = {
       .KHR_get_physical_device_properties2 = true,
       .KHR_get_surface_capabilities2 = true,
       .KHR_surface = true,
+#ifdef TA5_HAVE_WAYLAND
+      .KHR_wayland_surface = true,
+#endif
    },
 };
 

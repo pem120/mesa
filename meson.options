@@ -797,6 +797,34 @@ option(
 )
 
 option(
+  'ta5-wayland',
+  type : 'feature',
+  value : 'auto',
+  description : 'Build VK_KHR_wayland_surface into the a5xx Vulkan driver. '
+)
+
+option(
+  'ta5-wayland-include',
+  type : 'string',
+  value : '',
+  description : 'Directory holding wayland-client.h for the a5xx Wayland ' +
+                'surface. The headers are architecture-independent, so a ' +
+                'cross build can use the host ones; empty means ask ' +
+                'pkg-config, and no directory means no Wayland surface.'
+)
+
+option(
+  'ta5-wayland-lib',
+  type : 'string',
+  value : '',
+  description : 'Path to a libwayland-client for the a5xx Wayland surface. ' +
+                'The a5xx cross build is -static and the device ships only ' +
+                'libwayland-client.so.0, so a target library usually has to ' +
+                'be named explicitly; empty means ask the linker, and no ' +
+                'library means no Wayland surface.'
+)
+
+option(
   'nvk-build-id',
   type : 'string',
   value : '',
