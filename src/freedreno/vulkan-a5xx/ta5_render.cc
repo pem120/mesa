@@ -168,9 +168,33 @@ ta5_CreateImageView(VkDevice _device, const VkImageViewCreateInfo *pCreateInfo,
    view->comp[1] = pCreateInfo->components.g;
    view->comp[2] = pCreateInfo->components.b;
    view->comp[3] = pCreateInfo->components.a;
-   view->row_pitch = image->tiling == VK_IMAGE_TILING_LINEAR
-                        ? image->row_pitch
-                        : 0;
+   /*
+    * The row pitch is the image's, whatever the tiling flag says.
+    *
+    * This zeroed the pitch for anything that was not VK_IMAGE_TILING_LINEAR,
+    * on the reasoning that an optimal image is gmem and is addressed by the
+    * tile system rather than by a stride.  That reasoning does not hold here:
+    * ta5_CreateImage lays every image out linearly and computes
+    * image->row_pitch from extent and block size with no reference to tiling
+    * at all, and the RB addresses attachments with RB_DEPTH_BUFFER_PITCH the
+    * same way as any other stride.  So an optimal-tiled attachment got a pitch
+    * of zero, the register was programmed with zero, and the buffer was
+    * addressed as if every row began at the same address.
+    *
+    * vkcube is what found it, because vkcube creates its depth attachment with
+    * VK_IMAGE_TILING_OPTIMAL.  Its depth test then compared fragments against
+    * the wrong rows and rejected about two thirds of the cube: the picture
+    * came out as a few disconnected faces with background between them, and
+    * with no fault, because from the hardware's point of view nothing was
+    * wrong.
+    *
+    * All 115 regression cases create their depth attachment with linear
+    * tiling, which is why this survived every one of them.  The harness hid it
+    * rather than exposing it: with a zero pitch the depth test reads rows that
+    * nothing ever wrote, so nothing is ever rejected, and a single
+    * non-self-occluding draw still comes out complete.
+    */
+   view->row_pitch = image->row_pitch;
 
    *pView = ta5_image_view_to_handle(view);
    return VK_SUCCESS;
