@@ -39,6 +39,7 @@
  */
 
 #include <errno.h>
+#include <poll.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -247,6 +248,7 @@ ta5_bo_map(struct ta5_bo *bo)
       return NULL;
    }
 
+
    bo->map = mmap(NULL, bo->size, PROT_READ | PROT_WRITE, MAP_SHARED,
                   bo->device->fd, offset);
    if (bo->map == MAP_FAILED) {
@@ -293,11 +295,31 @@ ta5_queue_ring(struct ta5_queue *queue)
    return bo;
 }
 
-/** Bytes of headroom left in the ring. */
-static uint32_t
-ta5_ring_space(struct ta5_queue *queue)
+/**
+ * Wait for the outstanding submission, if any.
+ *
+ * The ring has a single slot (see ta5_submit_cmd_relocs()), so the bytes of the
+ * previous submission must not be overwritten until the CP has finished
+ * fetching from them.  A DRM sync fd becomes readable when the work it guards
+ * has completed, so poll() is enough.
+ */
+static void
+ta5_ring_wait_idle(struct ta5_queue *queue)
 {
-   return TA5_RING_SIZE - queue->ring_offset;
+   if (queue->idle_fence_fd < 0)
+      return;
+
+   struct pollfd pfd = {
+      .fd = queue->idle_fence_fd,
+      .events = POLLIN,
+   };
+   int ret;
+   do {
+      ret = poll(&pfd, 1, -1);
+   } while (ret < 0 && errno == EINTR);
+
+   close(queue->idle_fence_fd);
+   queue->idle_fence_fd = -1;
 }
 
 int
@@ -408,8 +430,34 @@ ta5_submit_cmd_relocs(struct ta5_queue *queue, const uint32_t *cs,
     * phase the queue is always idle before the next submit (we wait below),
     * so overwriting is safe.
     */
-   if (size > ta5_ring_space(queue))
-      queue->ring_offset = 0;
+   /*
+    * One slot, always at offset zero.
+    *
+    * This is not tidiness, it is the fix.  Advancing the ring offset handed the
+    * CP a *different* IB1 window on every submission, and re-pointing the CP
+    * after it has gone idle is what wedged the GPU: with byte-identical
+    * streams, advancing the offset faulted every second submission and holding
+    * it at zero gave none.  Measured over 6 frames, interleaved so the driver
+    * binary is the same in both:
+    *
+    *     advancing offset,  6 frames   3 ring faults, 3 hangchecks
+    *     offset held at 0,  6 frames   0, 0
+    *     advancing offset, 16 frames   8 ring faults, 8 hangchecks
+    *     offset held at 0, 16 frames   0, 0
+    *
+    * The same change also removed the depth-clear faults, which had looked
+    * like a separate bug: 1080x2280 with a depth attachment went from 4 ring
+    * faults, 4 hangchecks and 1 IOMMU fault to none, still drawing all
+    * 2,462,400 pixels.  Both bugs were one bug.
+    *
+    * Holding one slot means the CPU must not overwrite it while the CP may
+    * still be fetching, so a submit waits for the previous one first.  The
+    * alternative -- several slots -- puts the address back in motion and brings
+    * the wedge straight back, because the interleaved control above faults
+    * even though the harness waits for the queue between every frame.
+    */
+   ta5_ring_wait_idle(queue);
+   queue->ring_offset = 0;
 
    memcpy((char *)queue->ring_map + queue->ring_offset, cs, size);
 
@@ -543,7 +591,6 @@ ta5_submit_cmd_relocs(struct ta5_queue *queue, const uint32_t *cs,
       }
    }
 
-   queue->ring_offset += size;
    queue->pending++;
 
    TA5_DBG("submitted %u bytes at ring offset %u, fence fd %d", size,
