@@ -403,6 +403,38 @@ ta5_CreateGraphicsPipelines(VkDevice _device, VkPipelineCache pipelineCache,
          &pipe->all_state, NULL, VK_SYSTEM_ALLOCATION_SCOPE_OBJECT, NULL);
 
       /*
+       * Depth and stencil state, which vk_graphics_pipeline_state_fill() does
+       * not fill.
+       *
+       * That function plants pointers into all_state for the states it knows
+       * about -- rs, cb, ms, vi, ia, ts, vp, dr, ial, cal -- and never touches
+       * ds, so graphics_state.ds stayed NULL on every pipeline this driver has
+       * ever created.  ta5_emit_depth_state() reads that pointer, finds NULL,
+       * and concludes that the application asked for no depth test at all.
+       *
+       * Nothing failed.  The pipeline was created with depthTestEnable =
+       * VK_TRUE, checked and accepted, and then rendered with the depth test
+       * and the depth write both off, because RB_DEPTH_CNTL went out as zero.
+       * The state was implemented and unreachable at the same time.
+       *
+       * Copy into all_state.ds, which the pipeline owns, and point at it.  The
+       * pointer has to be ours: the one in VkGraphicsPipelineCreateInfo is
+       * borrowed, and an application may release it the moment
+       * vkCreateGraphicsPipelines returns.
+       */
+      memset(&pipe->all_state.ds, 0, sizeof(pipe->all_state.ds));
+      pipe->all_state.ds.depth.compare_op = VK_COMPARE_OP_ALWAYS;
+      if (ci->pDepthStencilState) {
+         pipe->all_state.ds.depth.test_enable =
+            ci->pDepthStencilState->depthTestEnable == VK_TRUE;
+         pipe->all_state.ds.depth.write_enable =
+            ci->pDepthStencilState->depthWriteEnable == VK_TRUE;
+         pipe->all_state.ds.depth.compare_op =
+            ci->pDepthStencilState->depthCompareOp;
+      }
+      pipe->graphics_state.ds = &pipe->all_state.ds;
+
+      /*
        * Depth and stencil state the draw path cannot honour.
        *
        * Checked here rather than at draw time so that the pipeline either
