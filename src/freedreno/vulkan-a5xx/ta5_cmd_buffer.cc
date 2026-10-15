@@ -2564,9 +2564,34 @@ ta5_emit_sysmem_fini(struct ta5_cmd_buffer *cmd)
    ta5_pkt7(cmd, CP_SKIP_IB2_ENABLE_GLOBAL, 1);
    ta5_cs_push(cmd, 0);
 
-   /* fd5_emit_lrz_flush(): the trailing disable is part of the sequence. */
+   /*
+    * fd5_emit_lrz_flush()'s sequence, MINUS the enable: the trailing disable is
+    * part of that sequence, but the enable cannot go out.
+    *
+    * LRZ needs a flag buffer.  freedreno allocates one per depth resource and
+    * points RB_DEPTH_FLAG_BUFFER_BASE at it; this driver allocates none, and
+    * the register is left at zero -- written as a literal 0 in
+    * ta5_emit_sysmem_prep's depth block and never given a real address.  With
+    * the enable set, the LRZ unit walks the flag buffer from address 0 in
+    * 64-byte strides: thousands of translation faults from iova 0 -- the
+    * "null-IOVA" signature -- and the walk is long enough to leave the first
+    * unmapped page whenever the framebuffer's height is not a multiple of 8.
+    *
+    * Measured at 360x713 with a depth attachment, 120 frames, no wayland and
+    * no compositor involved: depth test off, 10 fault bursts; depth test on,
+    * 0.  The walk scales with the framebuffer, which is why 1080x2280 (both
+    * dimensions multiples of 8) was clean while 1023x1023 and 1025x1025 were
+    * not -- the same sizes that faulted in the original depth-clear
+    * investigation, whose "framebuffer height must be a multiple of 64" rule
+    * this replaces with something that has a cause.
+    *
+    * LRZ is an optimisation.  Until a flag buffer exists the enable stays off;
+    * the invalidate and the trailing zero still go out, so the sequence the
+    * hardware sees is well-formed.
+    */
    ta5_pkt4(cmd, REG_A5XX_GRAS_LRZ_CNTL, 1);
-   ta5_cs_push(cmd, A5XX_GRAS_LRZ_CNTL_ENABLE);
+   ta5_cs_push(cmd, getenv("TA5_LRZ_ENABLE") ? A5XX_GRAS_LRZ_CNTL_ENABLE
+                                             : 0x00000000);
    ta5_event_write(cmd, LRZ_FLUSH_INVALIDATE);
    ta5_pkt4(cmd, REG_A5XX_GRAS_LRZ_CNTL, 1);
    ta5_cs_push(cmd, 0x0);
