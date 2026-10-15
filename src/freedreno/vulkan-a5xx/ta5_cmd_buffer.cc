@@ -2296,17 +2296,39 @@ ta5_emit_clear_depth(struct ta5_cmd_buffer *cmd, struct ta5_device *device,
       return vk_error(&device->instance->vk, VK_ERROR_FORMAT_NOT_SUPPORTED);
 
    /*
-    * util_pack_z()'s job for the formats that can actually be attached: D16
-    * takes the top 16 bits of the float's 32-bit pattern and D32 takes all
-    * of it.  Written out rather than pulled in, because the alternative is a
-    * dependency on util_pack_z() for four lines.
+    * The clear value goes into the buffer in *the buffer's* encoding, not as
+    * the float's bit pattern.  util_pack_z()/util_pack_z_stencil() do exactly
+    * this:
+    *
+    *    Z16_UNORM          float -> 16-bit unorm   (1.0 -> 0xffff)
+    *    Z24_UNORM_S8_UINT  float -> 24-bit unorm in the low bits, stencil in
+    *                       the top 8              (1.0 -> 0x00ffffff)
+    *    Z32_FLOAT          the float's own bits    (1.0 -> 0x3f800000)
+    *
+    * Taking the top 16 bits of the float instead, which is what this did,
+    * writes 0x3f80 -- 0.248 -- into a depth buffer being cleared to 1.0.  Every
+    * fragment then fails a LESS depth test against it, so the frame comes out
+    * as the clear colour with nothing drawn and no fault to explain it.
+    *
+    * vkcube is what found it: it takes a D16 depth attachment, and all 115
+    * matrix cases ask for D32, where the float's bits are the encoding and the
+    * mistake cannot show.
     */
-   if (att->format == VK_FORMAT_D16_UNORM) {
-      uint32_t f;
-      memcpy(&f, &depth, sizeof(f));
-      packed = f >> 16;
-   } else {
-      memcpy(&packed, &depth, sizeof(packed));
+   {
+      float z = depth < 0.0f ? 0.0f : (depth > 1.0f ? 1.0f : depth);
+
+      switch (att->format) {
+      case VK_FORMAT_D16_UNORM:
+         packed = (uint32_t)(z * 65535.0f + 0.5f);
+         break;
+      case VK_FORMAT_D24_UNORM_S8_UINT:
+         /* stencil stays 0: this driver has no stencil state */
+         packed = (uint32_t)(z * 16777215.0f + 0.5f) & 0x00ffffffu;
+         break;
+      default: /* VK_FORMAT_D32_SFLOAT */
+         memcpy(&packed, &depth, sizeof(packed));
+         break;
+      }
    }
 
    ta5_pkt4(cmd, REG_A5XX_RB_RENDER_CNTL, 1);
