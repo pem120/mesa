@@ -131,9 +131,31 @@ ta5_FreeMemory(VkDevice _device, VkDeviceMemory _memory,
    if (pAllocator == NULL)
       pAllocator = vk_default_allocator();
 
-   /* All bound resources must have been destroyed or unbound first. */
-   assert(list_is_empty(&memory->bound_images));
-   assert(list_is_empty(&memory->bound_buffers));
+   /*
+    * FreeMemory with resources still bound is an application bug -- the VUIDs
+    * require unbinding first -- but a crash is not an acceptable answer.
+    * vkmark's scene teardown frees a scene's vertex memory while the buffer
+    * is still bound, and the buffer's later DestroyBuffer walked its list
+    * item into this freed object and died in list_del().  So pull whatever
+    * is still bound off the lists and clear the back pointers: the resources
+    * stay usable (their memory is this process's own allocation either way),
+    * and their Destroy* sees bound_memory == NULL and skips the list_del.
+    */
+   while (!list_is_empty(&memory->bound_buffers)) {
+      struct ta5_buffer *buffer = list_first_entry(&memory->bound_buffers,
+                                                   struct ta5_buffer,
+                                                   memory_binding);
+      list_del(&buffer->memory_binding);
+      buffer->bound_memory = NULL;
+   }
+
+   while (!list_is_empty(&memory->bound_images)) {
+      struct ta5_image *image = list_first_entry(&memory->bound_images,
+                                                 struct ta5_image,
+                                                 memory_binding);
+      list_del(&image->memory_binding);
+      image->bound_memory = NULL;
+   }
 
    ta5_bo_unref(memory->bo);
    vk_free(pAllocator, memory);
@@ -489,7 +511,7 @@ ta5_CreateImage(VkDevice _device, const VkImageCreateInfo *pCreateInfo,
       return vk_error(&device->instance->vk, VK_ERROR_FORMAT_NOT_SUPPORTED);
 
    if (pCreateInfo->samples > 1 && block_size != 4)
-      return vk_error(&device->instance->vk, VK_ERROR_FEATURE_NOT_PRESENT);
+      return vk_error(&device->physical_device->vk, VK_ERROR_FEATURE_NOT_PRESENT);
 
    image = (struct ta5_image *)vk_image_create(&device->vk, pCreateInfo,
                                                pAllocator, sizeof(*image));
@@ -531,7 +553,8 @@ ta5_CreateImage(VkDevice _device, const VkImageCreateInfo *pCreateInfo,
 
    ta5_image_set_layout(image);
 
-   list_inithead(&image->memory_binding);
+   /* memory_binding is a list *item*, not a head -- see the comment at
+    * ta5_CreateBuffer for why initializing it as one corrupted the lists. */
    image->bound_memory = NULL;
 
    *pImage = ta5_image_to_handle(image);
@@ -712,7 +735,12 @@ ta5_CreateBuffer(VkDevice _device, const VkBufferCreateInfo *pCreateInfo,
    buffer->size = pCreateInfo->size;
    buffer->usage = pCreateInfo->usage;
    buffer->flags = pCreateInfo->flags;
-   list_inithead(&buffer->memory_binding);
+   /* memory_binding is a list *item*, not a head: it is only ever linked
+    * into the memory's bound_buffers list by BindBufferMemory().  It used
+    * to be initialized as a head here and then passed to list_del() and
+    * list_addtail() as an item, which wrote through the head's next/prev
+    * and corrupted both lists -- vkmark died in list_del() during its
+    * between-scene buffer teardown. */
 
 
    *pBuffer = ta5_buffer_to_handle(buffer);
