@@ -335,6 +335,38 @@ ta5_GetInstanceProcAddr(VkInstance _instance, const char *pName)
                                     &ta5_instance_entrypoints, pName);
 
    /*
+    * The physical-device half of VK_KHR_wayland_surface.
+    *
+    * vkGetPhysicalDeviceWaylandPresentationSupportKHR belongs to the
+    * physical-device table, not the instance one, and the runtime resolves
+    * physical-device names through a static trampoline table whose entries are
+    * themselves guarded by `#ifdef VK_USE_PLATFORM_WAYLAND_KHR`.  That macro
+    * reaches libvulkan_runtime only from the with_platform_wayland build
+    * option, which is what drives libvulkan_wsi -- and this driver implements
+    * the extension itself rather than through that library, so the option is
+    * off, the trampoline is not compiled, and the loader gets NULL back for a
+    * function the driver plainly advertises and plainly implements.
+    *
+    * That is not cosmetic.  vkgears refuses the surface outright:
+    *
+    *     [Vulkan Loader] ERROR: ICD for selected physical device does not
+    *     export vkGetPhysicalDeviceWaylandPresentationSupportKHR!
+    *     Vulkan not supported on given Wayland surface
+    *
+    * and vulkaninfo segfaults, calling the pointer it was handed.  Both were
+    * the same missing answer.  vkcube never hit it: it does not query
+    * presentation support.
+    *
+    * Answering here is the whole fix.  The alternative -- turning on
+    * with_platform_wayland to get the trampoline -- would build libvulkan_wsi
+    * as well, which is a second Wayland implementation that nothing would call.
+    */
+   if (func == NULL && pName &&
+       !strcmp(pName, "vkGetPhysicalDeviceWaylandPresentationSupportKHR"))
+      return (PFN_vkVoidFunction)
+         ta5_GetPhysicalDeviceWaylandPresentationSupportKHR;
+
+   /*
     * Diagnostic: the Vulkan loader calls the driver entry point for every
     * function it might use and calls whatever it gets back.  A NULL for a
     * function the driver never implemented therefore shows up as a jump to
