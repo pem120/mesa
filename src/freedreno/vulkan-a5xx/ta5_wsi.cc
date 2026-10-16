@@ -717,7 +717,7 @@ ta5_CreateSwapchainKHR(VkDevice _device,
    sc->next = 0;
    sc->drm_fd = -1;
    /* A Wayland surface never opens the card: its buffers go to the compositor
-    * as dma-bufs, and DRM master belongs to the compositor. */
+    * as dma-bufs and are composited by phoc, which owns the display. */
    sc->crtc_id = surf->display ? surf->display->crtc_id : 0;
    sc->connector_id = surf->display ? surf->display->connector_id : 0;
 
@@ -890,9 +890,17 @@ ta5_AcquireNextImageKHR(VkDevice _device, VkSwapchainKHR _swapchain,
       return vk_error(&device->instance->vk, VK_ERROR_INITIALIZATION_FAILED);
 
    /*
-    * Round-robin: with FIFO present the previous image is already on screen
-    * by the time the next acquire runs, so no wait is needed.  timeout is
-    * accepted and ignored for the same reason.
+    * Hand out an image the compositor is not using, and wait -- bounded by the
+    * application's own timeout -- for one to be released if they are all busy.
+    *
+    * This is wsi_common_wayland.c:3021-3052: scan for a non-busy image, and
+    * when there is none, dispatch so that frame callbacks run and free one,
+    * returning VK_TIMEOUT or VK_NOT_READY when the deadline passes.
+    *
+    * The old round-robin was wrong for wayland in the way that matters: it
+    * ignored `busy`, so the compositor could be sampling a buffer we were
+    * rendering into.  It is kept for the KMS path, where present is
+    * synchronous with the scanout and nothing else can be using the buffer.
     *
     * A fence here is signalled immediately through the fence's vk_sync: the
     * image is already available, and vkcube waits on it before drawing.
@@ -900,10 +908,79 @@ ta5_AcquireNextImageKHR(VkDevice _device, VkSwapchainKHR _swapchain,
     * ta5_QueueSubmit ignores wait semaphores entirely, so there is nothing
     * to signal it for.
     */
-   (void)timeout;
    (void)_semaphore;
+
+#ifdef TA5_HAVE_WAYLAND
+   if (sc->surface && sc->surface->wl_surface) {
+      struct timespec start, deadline;
+      uint64_t ns;
+
+      clock_gettime(CLOCK_MONOTONIC, &start);
+      /* Clamp before converting: vkcube asks for UINT64_MAX. */
+      ns = (uint64_t)(timeout > 1000000ull ? 1000000ull : timeout) * 1000000ull;
+      deadline.tv_sec = start.tv_sec + (time_t)(ns / 1000000000ull);
+      deadline.tv_nsec =
+         start.tv_nsec + (long)(ns % 1000000000ull);
+      if (deadline.tv_nsec >= 1000000000L) {
+         deadline.tv_nsec -= 1000000000L;
+         deadline.tv_sec += 1;
+      }
+
+      while (true) {
+         for (uint32_t i = 0; i < sc->image_count; i++) {
+            uint32_t idx = (sc->next + i) % sc->image_count;
+
+            if (!sc->images[idx].busy) {
+               *pImageIndex = idx;
+               sc->images[idx].busy = true;
+               sc->next = (idx + 1) % sc->image_count;
+               goto acquired;
+            }
+         }
+
+         /* All busy: the compositor has to be given the chance to release
+          * one, which happens by dispatching the connection. */
+         {
+            struct timespec now;
+            int64_t left_ms;
+            bool timed_out = false;
+
+            clock_gettime(CLOCK_MONOTONIC, &now);
+            left_ms = (int64_t)(deadline.tv_sec - now.tv_sec) * 1000 +
+                      (deadline.tv_nsec - now.tv_nsec) / 1000000;
+            if (left_ms <= 0)
+               return vk_error(&device->instance->vk,
+                               timeout ? VK_TIMEOUT : VK_NOT_READY);
+
+            /*
+             * Wait a second at a time even when the application asked for
+             * longer.  vkcube passes UINT64_MAX, which overflows the deadline
+             * arithmetic, and a single unbounded dispatch would put the
+             * sixteen-minute hang back inside acquire instead of present.
+             */
+            if (left_ms > 1000)
+               left_ms = 1000;
+
+            if (ta5_wayland_acquire_dispatch(sc->surface, (int)left_ms,
+                                             &timed_out) < 0)
+               return vk_error(&device->instance->vk, VK_ERROR_OUT_OF_DATE_KHR);
+            if (timed_out)
+               return vk_error(&device->instance->vk,
+                               timeout ? VK_TIMEOUT : VK_NOT_READY);
+         }
+      }
+   }
+#endif
+
+   /* KMS: nothing else can be using the scanout buffer, so round-robin. */
+   (void)timeout;
    *pImageIndex = sc->next;
    sc->next = (sc->next + 1) % sc->image_count;
+
+#ifdef TA5_HAVE_WAYLAND
+acquired:
+#endif
+   {
 
    if (_fence != VK_NULL_HANDLE) {
       struct ta5_fence *fence = ta5_fence_from_handle(_fence);
@@ -914,6 +991,100 @@ ta5_AcquireNextImageKHR(VkDevice _device, VkSwapchainKHR _swapchain,
    }
 
    return VK_SUCCESS;
+   }
+}
+
+/**
+ * Write the scanout buffer to a PPM, on a knob.
+ *
+ * Proof that the chain works end to end: this is the buffer whose framebuffer
+ * id was just handed to KMS, read back by the host after the queue went idle,
+ * so what lands in the file is what the panel is being asked to scan out.
+ * DRM has no readback path of its own, so this is the only way to look at it
+ * from userspace.
+ *
+ * TA5_TRACE_PPM=<path> writes one file and only on the first present; the
+ * image is ABGR in memory (R8G8B8A8_UNORM) and RGB in the file.
+ */
+static void
+ta5_dump_ppm(struct ta5_swapchain *sc, uint32_t index)
+{
+   struct ta5_swapchain_image *img = &sc->images[index];
+   const char *path = getenv("TA5_TRACE_PPM");
+   uint8_t *map;
+   FILE *f;
+
+   if (!path || !img->memory || !img->memory->bo)
+      return;
+
+   /*
+    * One file per process by default: unset the knob so the next present is
+    * quiet.  TA5_TRACE_PPM_ALL=1 keeps writing, one file per present with the
+    * index in the name, which is the only way to tell "the first frame is
+    * wrong" from "every frame is wrong" -- two failures that look identical
+    * when only the first frame is ever looked at.
+    */
+   if (!getenv("TA5_TRACE_PPM_ALL"))
+      unsetenv("TA5_TRACE_PPM");
+
+   map = (uint8_t *)ta5_bo_map(img->memory->bo);
+   if (!map) {
+      fprintf(stderr, "ta5[wsi] ppm: map failed\n");
+      return;
+   }
+
+   if (getenv("TA5_TRACE_PPM_ALL")) {
+      static uint32_t frame;
+      char name[600];
+      snprintf(name, sizeof(name), "%s.%u", path, frame++);
+      path = name;
+   }
+
+   f = fopen(path, "wb");
+   if (!f) {
+      fprintf(stderr, "ta5[wsi] ppm: cannot open %s\n", path);
+      return;
+   }
+
+   /*
+    * TA5_TRACE_PPM_SCALE=N writes every Nth pixel in each direction.  The
+    * link to the development host runs at about 1.25 MB/s, so a full
+    * 1080x2280 frame (7.4 MB) takes six seconds to pull and a live preview
+    * is impossible; at N=4 the frame is 460 KB and streams at a few fps.
+    * Nearest-neighbour, which for a downscaled preview is the right choice
+    * anyway -- it cannot invent a pixel that was not rendered.
+    */
+   uint32_t scale = 1;
+   const char *scale_env = getenv("TA5_TRACE_PPM_SCALE");
+   uint32_t out_w, out_h;
+
+   if (scale_env)
+      scale = (uint32_t)atoi(scale_env);
+   if (scale < 1)
+      scale = 1;
+   if (scale > sc->extent.width || scale > sc->extent.height)
+      scale = 1;
+
+   out_w = (sc->extent.width + scale - 1) / scale;
+   out_h = (sc->extent.height + scale - 1) / scale;
+
+   fprintf(f, "P6\n%u %u\n255\n", out_w, out_h);
+
+   for (uint32_t y = 0; y < out_h; y++) {
+      const uint8_t *row = map + (size_t)(y * scale) * img->image->row_pitch;
+
+      for (uint32_t x = 0; x < out_w; x++) {
+         const uint8_t *px = row + (size_t)(x * scale) * 4;
+
+         fputc(px[0], f);   /* R */
+         fputc(px[1], f);   /* G */
+         fputc(px[2], f);   /* B */
+      }
+   }
+
+   fclose(f);
+   fprintf(stderr, "ta5[wsi] ppm: wrote %s (%ux%u)\n", path,
+           sc->extent.width, sc->extent.height);
 }
 
 /**
@@ -995,6 +1166,15 @@ ta5_present_image(struct ta5_swapchain *sc, uint32_t index)
       }
       img->fb_id = fb;
    }
+
+   /*
+    * Dumped before the scanout is programmed, not after: what this file shows
+    * is what the driver rendered, and it stays measurable while another client
+    * holds DRM master -- which is most of the time on this device, where phoc
+    * and systemd-logind between them own card0 and the only way to get it is
+    * to kill the compositor.  Iterating on the render should not need that.
+    */
+   ta5_dump_ppm(sc, index);
 
    ret = drmModeSetCrtc(sc->drm_fd, sc->crtc_id, fb, 0, 0,
                         &sc->connector_id, 1,

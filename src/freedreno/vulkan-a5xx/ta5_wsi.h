@@ -30,6 +30,7 @@ struct wl_registry;
 struct wl_compositor;
 struct wl_surface;
 struct wl_shm;
+struct wl_drm;
 struct wl_shm_pool;
 struct wl_buffer;
 struct zwp_linux_dmabuf_v1;
@@ -95,6 +96,7 @@ struct ta5_surface
    struct wl_compositor *wl_compositor;
    struct zwp_linux_dmabuf_v1 *wl_dmabuf;
    struct wl_shm *wl_shm;
+   struct wl_drm *wl_drm;
    struct xdg_wm_base *wl_xdg_wm_base;
    struct xdg_surface *wl_xdg_surface;
    struct xdg_toplevel *wl_toplevel;
@@ -109,6 +111,19 @@ struct ta5_surface
 };
 
 /** One swapchain image: a colour-attachment image plus its GEM state. */
+struct ta5_swapchain;
+
+/**
+ * What a frame callback is told, so it can release the right image.
+ *
+ * One of these per present; the callback owns it and frees it.
+ */
+struct ta5_frame_cookie
+{
+   struct ta5_swapchain *sc;
+   uint32_t index;
+};
+
 struct ta5_swapchain_image
 {
    struct ta5_image *image;
@@ -119,6 +134,15 @@ struct ta5_swapchain_image
    struct wl_shm_pool *wl_shm_pool; /**< the shm path's backing pool */
    int wl_shm_fd;                   /**< and its memfd, -1 until created */
 #endif
+   /**
+    * The compositor has this image and has not finished with it.
+    *
+    * This is wsi_common's per-image `busy` (wsi_common_wayland.c:164): set on
+    * acquire, cleared when the frame callback fires.  Acquire hands out a
+    * non-busy image, so a buffer the compositor is still sampling is never
+    * rendered into again.
+    */
+   bool busy;
 };
 
 /** A swapchain over a display-plane surface, presented via drmModeSetCrtc. */
@@ -144,6 +168,18 @@ struct ta5_swapchain
    uint32_t crtc_id;
    uint32_t connector_id;
 };
+
+#ifdef TA5_HAVE_WAYLAND
+/**
+ * Flush and dispatch the connection, waiting up to timeout_ms.
+ *
+ * Exposed for ta5_AcquireNextImageKHR, which waits for a frame callback to
+ * release an image.  Sets *timed_out when the deadline passed without events.
+ * Returns 0 on success, -1 on error.
+ */
+int ta5_wayland_acquire_dispatch(struct ta5_surface *surf, int timeout_ms,
+                                 bool *timed_out);
+#endif
 
 VK_DEFINE_NONDISP_HANDLE_CASTS(ta5_display, base, VkDisplayKHR,
                                VK_OBJECT_TYPE_DISPLAY_KHR)

@@ -62,8 +62,6 @@
 #include "linux_dmabuf-client-protocol.h"
 #include "wayland_drm-client-protocol.h"
 
-/* Set on the first present, so the stopgap rate limit has a reference. */
-static struct timespec ta5_last_present;
 
 /* ------------------------------------------------------------------ */
 /* Registry                                                            */
@@ -271,16 +269,21 @@ static const struct wl_surface_listener ta5_wl_surface_listener = {
 /**
  * End of a frame: the compositor has finished with the buffer.
  *
- * This is the pacing signal, so present() waits on it rather than queuing
- * frames as fast as the CPU can record them.
+ * This releases the image rather than pacing anything.  wsi_common does
+ * exactly this -- present marks the image busy and returns, the frame callback
+ * clears it, and acquire skips busy images
+ * (wsi_common_wayland.c:2630, :3033).  Nothing waits here: the wait for a
+ * free image belongs in acquire, bounded by the application's timeout.
  */
 static void
 ta5_wl_frame_done(void *data, struct wl_callback *callback, uint32_t time)
 {
-   struct ta5_surface *surf = (struct ta5_surface *)data;
+   struct ta5_frame_cookie *cookie = (struct ta5_frame_cookie *)data;
 
    (void)time;
-   surf->wl_frame_done = true;
+   if (cookie->sc && cookie->index < cookie->sc->image_count)
+      cookie->sc->images[cookie->index].busy = false;
+   free(cookie);
    wl_callback_destroy(callback);
 }
 
@@ -467,94 +470,77 @@ ta5_wayland_capabilities(struct ta5_surface *surf,
    return VK_SUCCESS;
 }
 
-/** Monotonic milliseconds, for the frame-callback bound. */
-static int64_t
-ta5_wayland_now_ms(void)
+/**
+ * Flush and dispatch the connection, waiting up to timeout_ms.
+ *
+ * One round trip: prepare_read, flush, poll, read_events, dispatch_pending.
+ * This is the primitive both the frame wait and acquire need -- acquire uses it
+ * to pick up frame callbacks, which is how an image stops being busy.
+ *
+ * Returns 0 on success (whether or not anything arrived), -1 on error, and
+ * sets *timed_out when the poll expired.  wsi_common's equivalent is
+ * loader_wayland_dispatch(), which acquire calls in the same place
+ * (wsi_common_wayland.c:3043).
+ */
+int
+ta5_wayland_acquire_dispatch(struct ta5_surface *surf, int timeout_ms,
+                             bool *timed_out)
 {
-   struct timespec ts;
+   struct pollfd pfd;
+   int ret;
 
-   if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0)
+   if (timed_out)
+      *timed_out = false;
+
+   while (wl_display_prepare_read(surf->wl_display) != 0)
+      if (wl_display_dispatch_pending(surf->wl_display) < 0)
+         return -1;
+
+   wl_display_flush(surf->wl_display);
+
+   pfd.fd = wl_display_get_fd(surf->wl_display);
+   pfd.events = POLLIN;
+   pfd.revents = 0;
+
+   ret = poll(&pfd, 1, timeout_ms);
+   if (ret < 0) {
+      wl_display_cancel_read(surf->wl_display);
+      return -1;
+   }
+   if (ret == 0) {
+      wl_display_cancel_read(surf->wl_display);
+      if (timed_out)
+         *timed_out = true;
       return 0;
-   return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+   }
+
+   if (wl_display_read_events(surf->wl_display) < 0)
+      return -1;
+   if (wl_display_dispatch_pending(surf->wl_display) < 0)
+      return -1;
+   return 0;
 }
 
-/**
- * Wait for the frame callback, with a bound.
+/*
+ * There is deliberately no frame-callback wait here any more.
  *
- * The callback is what makes this a FIFO present.  The bound is a backstop,
- * not pacing -- a compositor that has gone quiet should cost a second of
- * latency on the next frame, not wedge the application forever.
- *
- * The bound is on *elapsed time*, not on iterations.  It used to be
- * `for (waits = 0; waits < 1000 && !done; waits++)` around a 1000 ms poll,
- * which is sixteen minutes of blocking, not the second the comment promises.
- * That is not hypothetical: a compositor withholds frame callbacks for an
- * occluded surface, and then vkcube sits in poll() inside
- * vkQueuePresentKHR with no presents and no error until it is killed.
- * Measured on an Adreno 506 under phosh, gdb on the stalled process:
+ * There used to be: ta5_wayland_wait_frame(), bounded by a thousand one-second
+ * polls, called from present.  It was the wrong shape twice over.  The bound was
+ * sixteen minutes, not the second its comment promised, so a compositor that
+ * withheld callbacks for an occluded surface left the application blocked in
+ * poll() inside vkQueuePresentKHR -- measured on an Adreno 506 under phosh with
+ * gdb on the stalled process:
  *
  *     #3 ta5_wayland_wait_frame (ta5_wayland.cc:497)
- *     #4 ta5_wayland_present    (ta5_wayland.cc:620)
  *     #6 ta5_QueuePresentKHR    (ta5_wsi.cc:1142)
  *
- * A missed frame callback is the compositor saying "not yet"; the right
- * response is to stop throttling and let the application carry on rendering,
- * which is what a present without a callback costs us.
- *
- * TA5_FRAME_WAIT_MS overrides the bound; TA5_FRAME_WAIT_MS=-1 restores the
- * old 1000-iteration loop so the two can be compared on the same binary.
+ * And more fundamentally, waiting in present puts the throttle in the wrong
+ * place.  wsi_common_wayland.c marks the image busy, commits, and returns; the
+ * frame callback clears busy; acquire hands out only non-busy images and is
+ * where a compositor that is not producing callbacks makes the application wait
+ * -- bounded by the application's own timeout, which is the one thing that
+ * knows how long it is willing to wait.
  */
-static void
-ta5_wayland_wait_frame(struct ta5_surface *surf)
-{
-   const char *ms_env = getenv("TA5_FRAME_WAIT_MS");
-   long bound_ms = ms_env ? strtol(ms_env, NULL, 0) : 1000;
-   bool legacy = (bound_ms < 0);
-   int64_t deadline;
-   int waits;
-
-   surf->wl_frame_done = false;
-
-   deadline = ta5_wayland_now_ms() + (legacy ? 0 : bound_ms);
-
-   for (waits = 0; !surf->wl_frame_done; waits++) {
-      struct pollfd pfd;
-      int timeout;
-      int ret;
-
-      if (legacy) {
-         if (waits >= 1000)
-            return;
-         timeout = 1000;
-      } else {
-         int64_t left = deadline - ta5_wayland_now_ms();
-
-         if (left <= 0)
-            return;
-         timeout = (int)left;
-      }
-
-      while (wl_display_prepare_read(surf->wl_display) != 0)
-         if (wl_display_dispatch_pending(surf->wl_display) < 0)
-            return;
-      wl_display_flush(surf->wl_display);
-
-      pfd.fd = wl_display_get_fd(surf->wl_display);
-      pfd.events = POLLIN;
-      pfd.revents = 0;
-
-      ret = poll(&pfd, 1, timeout);
-      if (ret <= 0) {
-         wl_display_cancel_read(surf->wl_display);
-         return;
-      }
-
-      if (wl_display_read_events(surf->wl_display) < 0)
-         return;
-      if (wl_display_dispatch_pending(surf->wl_display) < 0)
-         return;
-   }
-}
 
 /**
  * Present one swapchain image to a Wayland compositor, zero-copy.
@@ -655,9 +641,23 @@ ta5_wayland_present_shm(struct ta5_swapchain *sc, uint32_t index)
    wl_surface_damage_buffer(surf->wl_surface, 0, 0, sc->extent.width,
                             sc->extent.height);
 
+   /*
+    * The callback releases the image rather than unblocking present: it
+    * carries the swapchain and index, and clears `busy` when the compositor is
+    * finished, so acquire can hand the image out again.  This is
+    * wsi_common_wayland.c:3442 with the release at :2630.
+    */
    callback = wl_surface_frame(surf->wl_surface);
-   if (callback)
-      wl_callback_add_listener(callback, &ta5_wl_frame_listener, surf);
+   if (callback) {
+      struct ta5_frame_cookie *cookie =
+         (struct ta5_frame_cookie *)malloc(sizeof(*cookie));
+
+      if (cookie) {
+         cookie->sc = sc;
+         cookie->index = index;
+         wl_callback_add_listener(callback, &ta5_wl_frame_listener, cookie);
+      }
+   }
 
    wl_surface_commit(surf->wl_surface);
    wl_display_flush(surf->wl_display);
@@ -666,28 +666,12 @@ ta5_wayland_present_shm(struct ta5_swapchain *sc, uint32_t index)
       fprintf(stderr, "ta5[wl] shm present: %ux%u stride=%u\n",
               sc->extent.width, sc->extent.height, stride);
 
-   if (callback)
-      ta5_wayland_wait_frame(surf);
+   /* No wait.  The image stays busy until its frame callback fires, which is
+    * what makes it unavailable to the next acquire -- the throttle lives in
+    * acquire now, not here. */
 
    /* The buffer is the image's, and stays until the swapchain dies. */
 
-   /* Same stopgap rate limit as the dma-buf path. */
-   {
-      struct timespec now;
-
-      clock_gettime(CLOCK_MONOTONIC, &now);
-      int64_t ns = (int64_t)(now.tv_sec - ta5_last_present.tv_sec) * 1000000000 +
-                   (now.tv_nsec - ta5_last_present.tv_nsec);
-      if (ns < 16666666) {
-         struct timespec delay;
-         delay.tv_sec = 0;
-         delay.tv_nsec = 16666666 - ns;
-         nanosleep(&delay, NULL);
-         clock_gettime(CLOCK_MONOTONIC, &ta5_last_present);
-      } else {
-         ta5_last_present = now;
-      }
-   }
 
    return VK_SUCCESS;
 }
@@ -761,9 +745,23 @@ ta5_wayland_present_drm(struct ta5_swapchain *sc, uint32_t index)
    wl_surface_damage_buffer(surf->wl_surface, 0, 0, sc->extent.width,
                             sc->extent.height);
 
+   /*
+    * The callback releases the image rather than unblocking present: it
+    * carries the swapchain and index, and clears `busy` when the compositor is
+    * finished, so acquire can hand the image out again.  This is
+    * wsi_common_wayland.c:3442 with the release at :2630.
+    */
    callback = wl_surface_frame(surf->wl_surface);
-   if (callback)
-      wl_callback_add_listener(callback, &ta5_wl_frame_listener, surf);
+   if (callback) {
+      struct ta5_frame_cookie *cookie =
+         (struct ta5_frame_cookie *)malloc(sizeof(*cookie));
+
+      if (cookie) {
+         cookie->sc = sc;
+         cookie->index = index;
+         wl_callback_add_listener(callback, &ta5_wl_frame_listener, cookie);
+      }
+   }
 
    wl_surface_commit(surf->wl_surface);
    wl_display_flush(surf->wl_display);
@@ -772,8 +770,9 @@ ta5_wayland_present_drm(struct ta5_swapchain *sc, uint32_t index)
       fprintf(stderr, "ta5[wl] drm present: %ux%u fourcc=0x%08x stride=%u\n",
               sc->extent.width, sc->extent.height, fourcc, stride);
 
-   if (callback)
-      ta5_wayland_wait_frame(surf);
+   /* No wait.  The image stays busy until its frame callback fires, which is
+    * what makes it unavailable to the next acquire -- the throttle lives in
+    * acquire now, not here. */
 
    return VK_SUCCESS;
 }
@@ -854,9 +853,23 @@ ta5_wayland_present(struct ta5_swapchain *sc, uint32_t index)
                             sc->extent.height);
 
    /* Pacing, and the point at which the compositor is finished with buffer. */
+   /*
+    * The callback releases the image rather than unblocking present: it
+    * carries the swapchain and index, and clears `busy` when the compositor is
+    * finished, so acquire can hand the image out again.  This is
+    * wsi_common_wayland.c:3442 with the release at :2630.
+    */
    callback = wl_surface_frame(surf->wl_surface);
-   if (callback)
-      wl_callback_add_listener(callback, &ta5_wl_frame_listener, surf);
+   if (callback) {
+      struct ta5_frame_cookie *cookie =
+         (struct ta5_frame_cookie *)malloc(sizeof(*cookie));
+
+      if (cookie) {
+         cookie->sc = sc;
+         cookie->index = index;
+         wl_callback_add_listener(callback, &ta5_wl_frame_listener, cookie);
+      }
+   }
 
    wl_surface_commit(surf->wl_surface);
    wl_display_flush(surf->wl_display);
@@ -869,41 +882,24 @@ ta5_wayland_present(struct ta5_swapchain *sc, uint32_t index)
               (unsigned)img->image->row_pitch, (void *)buffer,
               (int)surf->wl_configured);
 
-   if (callback)
-      ta5_wayland_wait_frame(surf);
+   /* No wait.  The image stays busy until its frame callback fires, which is
+    * what makes it unavailable to the next acquire -- the throttle lives in
+    * acquire now, not here. */
 
    /*
     * The wl_buffer is NOT destroyed here.  It is the image's, and it lives
     * until the swapchain does -- see the comment at the top of this function.
+    *
+    * There is no rate limit here either, and there should not be.  The stopgap
+    * one this replaced existed because the frame callback was not pacing
+    * anything: present ignored it and acquired round-robin regardless, so phoc
+    * answered 4,940 callbacks in 16 seconds -- immediate, not vsynced -- and
+    * had three hundred buffer imports a second to absorb.  That is a symptom
+    * of not honouring the callback, not a property of the compositor.  Now the
+    * callback clears `busy` and acquire will not hand the image out until it
+    * does, so the compositor decides the rate; a cap on top of that would only
+    * add latency.
     */
-
-   /*
-    * STOPGAP, and it needs saying plainly: the frame callback is not pacing
-    * this.  phoc answered 4,940 of them in 16 seconds -- immediate, not
-    * vsynced -- which flooded it with three hundred buffer imports a second
-    * and took the compositor down.  Until the reason for the immediate
-    * callbacks is understood (an occluded surface is the usual one: a
-    * compositor releases frame callbacks as fast as it can for a surface it is
-    * not compositing), cap the present rate at 60 Hz.  This is a rate limit,
-    * not pacing: the callback is still what sequences a frame, and this only
-    * stops the flood.
-    */
-   {
-      struct timespec now;
-
-      clock_gettime(CLOCK_MONOTONIC, &now);
-      int64_t ns = (int64_t)(now.tv_sec - ta5_last_present.tv_sec) * 1000000000 +
-                   (now.tv_nsec - ta5_last_present.tv_nsec);
-      if (ns < 16666666) {
-         struct timespec delay;
-         delay.tv_sec = 0;
-         delay.tv_nsec = 16666666 - ns;
-         nanosleep(&delay, NULL);
-         clock_gettime(CLOCK_MONOTONIC, &ta5_last_present);
-      } else {
-         ta5_last_present = now;
-      }
-   }
 
    return VK_SUCCESS;
 }
