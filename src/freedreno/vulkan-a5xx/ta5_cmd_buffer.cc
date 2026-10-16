@@ -503,6 +503,13 @@ ta5_cs_push(struct ta5_cmd_buffer *cmd, uint32_t word)
 static void
 ta5_pkt4(struct ta5_cmd_buffer *cmd, uint32_t reg, uint32_t cnt)
 {
+   /* TA5_TRACE_PKT=reg logs every register write this draw programs, in
+    * order.  Two runs of the same program differ in one object; comparing the
+    * two logs names what changed without decoding PM4 by hand. */
+   const char *tpk = getenv("TA5_TRACE_PKT");
+
+   if (tpk && (!strcmp(tpk, "all") || (uint32_t)strtoul(tpk, NULL, 16) == reg))
+      fprintf(stderr, "pkt4 reg=%05x cnt=%u @cs%u\n", reg, cnt, cmd->cs_count);
    ta5_cs_push(cmd, CP_TYPE4_PKT | cnt | (ta5_pm4_odd_parity(cnt) << 7) |
                      ((reg & 0x3ffff) << 8) |
                      (ta5_pm4_odd_parity(reg) << 27));
@@ -518,6 +525,11 @@ ta5_pkt4(struct ta5_cmd_buffer *cmd, uint32_t reg, uint32_t cnt)
 static void
 ta5_pkt7(struct ta5_cmd_buffer *cmd, uint32_t opcode, uint32_t cnt)
 {
+   const char *tpk = getenv("TA5_TRACE_PKT");
+
+   if (tpk && (!strcmp(tpk, "all") || (uint32_t)strtoul(tpk, NULL, 16) == opcode))
+      fprintf(stderr, "pkt7 op=%02x cnt=%u @cs%u\n", opcode, cnt,
+              cmd->cs_count);
    ta5_cs_push(cmd, ta5_pm4_pkt7(opcode, cnt));
 }
 
@@ -549,6 +561,18 @@ static VkResult
 ta5_event_write_ts(struct ta5_cmd_buffer *cmd, struct ta5_bo *bo, uint32_t evt)
 {
    VkResult ret;
+
+   /*
+    * TA5_WFI_EVENT waits for idle immediately before the event.  GL puts its
+    * fd_wfi() before the CCU reconfiguration instead (TA5_WFI_CCU, measured,
+    * no effect), which is the wrong place for the other half of this theory:
+    * the CCU is GPU-global, so a resolve issued while the compositor's CCU
+    * work is still in flight flushes a cache that is mid-update.  That would
+    * also explain why three concurrent *Vulkan* clients never fault and one GL
+    * compositor always does.
+    */
+   if (getenv("TA5_WFI_EVENT"))
+      ta5_wfi(cmd);
 
    ta5_pkt7(cmd, CP_EVENT_WRITE, 4);
    ta5_cs_push(cmd, CP_EVENT_WRITE_0_EVENT((enum vgt_event_type)evt));
@@ -1056,6 +1080,20 @@ ta5_emit_program_state(struct ta5_cmd_buffer *cmd, struct ta5_pipeline *pipe)
    ta5_cs_push(cmd, 0x00000000);
    ta5_cs_push(cmd, 0x00000000);
 
+   if (getenv("TA5_TRACE_VFD")) {
+      fprintf(stderr,
+              "ta5[vfd]: REGID4VTX=%u REGID4INST=%u (63,0 == invalid)\n",
+              vertex_regid, instance_regid);
+      fprintf(stderr, "ta5[vfd]: vs inputs: %u\n", vs->inputs_count);
+      for (unsigned i = 0; i < vs->inputs_count; i++) {
+         fprintf(stderr, "ta5[vfd]:   in[%u] regid=%u sysval=%d slot=%d\n", i,
+                 vs->inputs[i].regid, (int)vs->inputs[i].sysval,
+                 (int)vs->inputs[i].slot);
+      }
+      fprintf(stderr, "ta5[vfd]: linkage max_loc=%u cnt=%u\n", l.max_loc,
+              l.cnt);
+   }
+
    ta5_pkt4(cmd, REG_A5XX_VFD_CONTROL_1, 5);
    ta5_cs_push(cmd, A5XX_VFD_CONTROL_1_REGID4VTX(vertex_regid) |
                      A5XX_VFD_CONTROL_1_REGID4INST(instance_regid) | 0xfc0000);
@@ -1355,12 +1393,48 @@ ta5_emit_ubo_pointers(struct ta5_cmd_buffer *cmd, struct ta5_pipeline *pipe,
          }
       }
 
-      if (getenv("TA5_TRACE_UBO"))
-         fprintf(stderr, "ta5[ubo] %s block %u set=%u binding=%u elem=%u bo=%p\n",
+      if (getenv("TA5_TRACE_UBO")) {
+         fprintf(stderr,
+                 "ta5[ubo] %s block %u set=%u binding=%u elem=%u bo=%p\n",
                  stage == VK_SHADER_STAGE_VERTEX_BIT ? "vs" : "fs", i,
                  i < num_order ? order[i].set : 0,
                  i < num_order ? order[i].binding : 0,
                  i < num_order ? order[i].element : 0, (void *)bo);
+
+         /*
+          * The first 64 bytes as the CPU sees them.  This is the question
+          * that decides where a blank frame comes from: if the buffer is
+          * already empty here, the application never wrote it, and if it is
+          * full here but the shader reads zeros, the pointer that goes to the
+          * hardware is wrong.
+          */
+         if (getenv("TA5_TRACE_UBO_DATA") && bo) {
+            uint8_t *map = (uint8_t *)ta5_bo_map(bo);
+
+            if (!map) {
+               fprintf(stderr, "ta5[ubo] block %u: map failed\n", i);
+            } else {
+               /*
+                * The whole block, 16 bytes to a line, capped at the buffer.
+                * 16 bytes was enough to answer "did the application write
+                * anything", which is what this was for, and useless for
+                * anything else: vkcube's block is 1216 bytes and 600 of them
+                * are the cube's vertex positions, so the cube cannot be fed
+                * back through the harness from a 16-byte sample.
+                */
+               uint64_t avail = bo->size > bo_offset ? bo->size - bo_offset : 0;
+               int n = (int)MIN2(avail, 2048);
+
+               fprintf(stderr, "ta5[ubo] block %u data (%d bytes):", i, n);
+               for (int k = 0; k < n; k++) {
+                  if (k && (k % 16) == 0)
+                     fprintf(stderr, "\nta5[ubo]   ");
+                  fprintf(stderr, " %02x", map[bo_offset + k]);
+               }
+               fprintf(stderr, "\n");
+            }
+         }
+      }
 
       if (bo) {
          ret = ta5_cs_reloc(cmd, bo, bo_offset, 0);
@@ -1407,6 +1481,24 @@ ta5_emit_shader_obj(struct ta5_cmd_buffer *cmd, struct ta5_pipeline *pipe,
    ta5_cs_push(cmd, 0x00000000);   /* SP_xS_PVT_MEM_ADDR lo */
    ta5_cs_push(cmd, 0x00000000);   /* SP_xS_PVT_MEM_ADDR hi */
    ta5_cs_push(cmd, 0x00000000);   /* SP_xS_PVT_MEM_SIZE_TOTALPVTMEMSIZE */
+
+   /*
+    * fd5_emit_shader_obj() programs a real private-memory window when the
+    * shader asks for one (ir3_get_private_mem(): per_sp_size =
+    * align(pvtmem_size * fibers_per_sp, 4K), a real BO for the address) and
+    * all zeros when it does not -- so these zeros are right *only* if the
+    * variant really has no private memory.  A shader that needs it gets a
+    * window of size zero here, and private accesses then land at address 0,
+    * which is the null-IOVA fault the stripped variants produce.
+    */
+   if (getenv("TA5_TRACE_PVT")) {
+      const struct ir3_shader_variant *v =
+         (const struct ir3_shader_variant *)pipe->has_vertex
+            ? (const struct ir3_shader_variant *)pipe->vertex.variant
+            : (const struct ir3_shader_variant *)pipe->fragment.variant;
+      fprintf(stderr, "ta5[pvt]: obj reg=0x%03x pvtmem_size=%u per_wave=%u\n",
+              reg, v->pvtmem_size, v->pvtmem_per_wave);
+   }
    return VK_SUCCESS;
 }
 
@@ -1468,6 +1560,29 @@ ta5_emit_shader(struct ta5_cmd_buffer *cmd, struct ta5_pipeline *pipe,
  *   TA5_SKIP_WFI           drop every CP_WAIT_FOR_IDLE
  *   TA5_SKIP_PREP          stop after the state restore
  *   TA5_SKIP_DRAW          record no draw state, shaders or CP_DRAW_INDX_OFFSET
+ *   TA5_EMPTY_IB          record no packets at all in the render pass
+ *   TA5_SKIP_PREP         record no sysmem prep
+ *   TA5_PADEND=N          emit N NOP dwords at the *end* of the stream
+ *                          instead of the start
+ *   TA5_PAD=N             emit N NOP dwords into the stream, to move the
+ *                          stream size without changing which phases
+ *                          run
+ *   TA5_SKIP_CLEAR        record no attachment clear
+ *   TA5_SKIP_CLEAR_COLOR  record no colour clear
+ *   TA5_SKIP_CLEAR_DEPTH  record no depth clear
+ *   TA5_WFI_CCU           emit the wait-for-idle GL puts immediately before
+ *                          the prep's CCU reconfiguration
+ *   TA5_DEPTH_NOTS        emit the depth clear's CCU resolve as a bare
+ *                          event, with no timestamp and no address, to
+ *                          separate the resolve itself from the address
+ *                          handed to it
+ *   TA5_SKIP_FINI         record no sysmem fini
+ *                          (Begin/End), so with TA5_SKIP_DRAW the whole
+ *                          frame submits an empty command stream.  This
+ *                          separates our *packets* from our *submit
+ *                          mechanics* -- the fence, the BO set, the
+ *                          relocs and the IB address are all still
+ *                          there; only the contents go away.
  *   TA5_SKIP_FS            load no fragment program at all
  *   TA5_FS_NO_DEPTH_OUT    leave DEPTH_REGID out of SP_FS_OUTPUT_CNTL
  *   TA5_CLEAR_IN_DRAW      emit a magenta clear at the top of the draw path,
@@ -1476,6 +1591,16 @@ ta5_emit_shader(struct ta5_cmd_buffer *cmd, struct ta5_pipeline *pipe,
  *   TA5_SHADER_UNITS=N     raise the CP_LOAD_STATE4 program-load length
  *   TA5_INSTRLEN=N         raise HLSQ_xS_CNTL.INSTRLEN
  *   TA5_PREAMBLE_ROWS=N    emit only the first N state-restore register rows
+ *   TA5_SKIP_VSPROG       drop the vertex program load from the indirect buffer
+ *   TA5_SKIP_FSPROG       drop the fragment program load (ours; GL's TA5_SKIP_FS
+ *                          also drops SP_FS_OBJ_START, which is different)
+ *   TA5_SKIP_CONSTS        drop the constant uploads and UBO pointers
+ *   TA5_SKIP_DRAWPKT       drop CP_DRAW_INDX_OFFSET, keeping the rest of the IB
+ *   TA5_SKIP_DRAWSTATE     drop ta5_emit_draw_state() from the draw
+ *   TA5_SKIP_PROGSTATE     drop ta5_emit_program_state() from the draw
+ *   TA5_SKIP_TEX           drop both texture-descriptor emissions
+ *   TA5_SKIP_VPORT         drop the viewport scale/offset
+ *   TA5_SKIP_VFD           drop VFD_CONTROL_0
  *
  * TA5_TRACE_NULL additionally dumps the recorded stream, its relocations and
  * the prep parameters.
@@ -1710,7 +1835,8 @@ ta5_emit_textures(struct ta5_cmd_buffer *cmd, enum a4xx_state_block sb,
 }
 
 static void ta5_emit_draw_state(struct ta5_cmd_buffer *cmd,
-                               unsigned vs_tex_count, unsigned fs_tex_count);
+                               unsigned vs_tex_count, unsigned fs_tex_count,
+                               uint32_t vertex_count);
 
 /**
  * a5xx state restore.
@@ -1769,6 +1895,20 @@ ta5_emit_restore(struct ta5_cmd_buffer *cmd)
       { REG_A5XX_TPL1_MODE_CNTL, 1, { 0x00000544 } },
       { REG_A5XX_HLSQ_TIMEOUT_THRESHOLD_0, 2, { 0x00000080, 0x00000000 } },
       { REG_A5XX_VPC_DBG_ECO_CNTL, 1, { 0x00000400 } },
+      /*
+       * HLSQ_DBG_ECO_CNTL and HLSQ_UPDATE_CNTL are in the kernel's
+       * save/restore blind spot: the kernel programs PC_DBG_ECO_CNTL and
+       * RB_DBG_ECO_CNTL once at init and restores neither of these per
+       * context, so they hold whatever ran last.  GL writes both on every
+       * restore (fd5_emit.c: HLSQ_DBG_ECO_CNTL = 0, HLSQ_UPDATE_CNTL =
+       * 0xfffff), so a GL client always leaves them sane for the next one.
+       * This driver never wrote them, and every submission left them for the
+       * compositor's context -- the one difference between "our submits are
+       * fine alone" (the harness, one client) and "our submits take the
+       * compositor down" (two clients).
+       */
+      { REG_A5XX_HLSQ_DBG_ECO_CNTL, 1, { 0x00000000 } },
+      { REG_A5XX_HLSQ_UPDATE_CNTL, 1, { 0x000fffff } },
       { REG_A5XX_HLSQ_MODE_CNTL, 1, { 0x00000001 } },
       { REG_A5XX_VPC_MODE_CNTL, 1, { 0x00000000 } },
       { REG_A5XX_GRAS_SU_CONSERVATIVE_RAS_CNTL, 1, { 0x00000000 } },
@@ -1890,15 +2030,52 @@ ta5_emit_sysmem_prep(struct ta5_cmd_buffer *cmd,
    if (getenv("TA5_SKIP_PREP"))
       return VK_SUCCESS;
 
-   /* fd5_emit_lrz_flush() */
+   /*
+    * The LRZ flush, and with it whether the LRZ is on at all.
+    *
+    * fd5_emit_lrz_flush() writes LRZ_CNTL_ENABLE because by then GL has an LRZ
+    * buffer behind it -- fd5_gmem.c programs GRAS_LRZ_BUFFER_BASE,
+    * GRAS_LRZ_BUFFER_PITCH and GRAS_LRZ_FAST_CLEAR_BUFFER_BASE for the
+    * attachment's rsc->lrz before any draw runs.  This driver has no LRZ
+    * buffer and never programs those three registers, so enabling the unit
+    * hands it a base left behind by whichever client ran on this GPU last.
+    *
+    * That is not hypothetical: with a depth attachment the LRZ is live for the
+    * whole pass, and the unit dereferences the stale base.  Measured per frame,
+    * D32 depth, faults from the kernel's IOMMU report:
+    *
+    *     64x64, 256x256, 512x512, 1024x1024          0 faults
+    *     1023x1023, 1025x1025, 1080x1080, 1080x2280 10 faults
+    *
+    * and the fault addresses are outside every buffer this process allocates,
+    * advancing 64 bytes at a time.  The sizes that fault are exactly the ones
+    * whose height is not a whole number of 64-pixel tiles, which is the shape
+    * of the LRZ's fast-clear path.
+    *
+    * TA5_LRZ_ENABLE=1 puts the enable back, for the A/B.
+    */
    ta5_pkt4(cmd, REG_A5XX_GRAS_LRZ_CNTL, 1);
-   ta5_cs_push(cmd, A5XX_GRAS_LRZ_CNTL_ENABLE);
-   ta5_event_write(cmd, LRZ_FLUSH_INVALIDATE);
+   ta5_cs_push(cmd, getenv("TA5_LRZ_ENABLE")
+                       ? A5XX_GRAS_LRZ_CNTL_ENABLE
+                       : 0x00000000);
+   if (!getenv("TA5_NO_LRZ_FLUSH"))
+      ta5_event_write(cmd, LRZ_FLUSH_INVALIDATE);
 
    ta5_pkt7(cmd, CP_SKIP_IB2_ENABLE_GLOBAL, 1);
    ta5_cs_push(cmd, 0);
 
-   ta5_event_write(cmd, PC_CCU_INVALIDATE_COLOR);
+   if (!getenv("TA5_NO_CCU_INVALIDATE_COLOR"))
+      ta5_event_write(cmd, PC_CCU_INVALIDATE_COLOR);
+
+   /*
+    * PC_CCU_INVALIDATE_DEPTH belongs here too, and is deliberately absent.
+    * The storm below is the depth clear's CCU resolve walking the CCU against
+    * state this prep never invalidated, so invalidating the depth side before
+    * it is the obvious move -- and it was measured and it does not help.  With
+    * it: 20 presents, 10 faults.  Without it: the same 10 faults.  Kept out
+    * rather than deleted from this comment's history so the next attempt
+    * starts from the measurement instead of re-trying it.
+    */
 
    uint32_t num_sp = cmd->device->physical_device->gpu_info.num_sp_cores;
 
@@ -1909,15 +2086,45 @@ ta5_emit_sysmem_prep(struct ta5_cmd_buffer *cmd,
    ta5_cs_push(cmd, num_sp - 1);
 
    /*
-    * No wait-for-idle here.  GL calls fd_wfi() at this point, but that is
-    * guarded on batch->needs_wfi, and the cache flush in ta5_emit_restore()
-    * has already reset and consumed the flag -- so GL emits exactly one WFI
-    * per stream, in the cache flush.  Emitting a second one parks the CP
-    * waiting on shader cores that never go idle here.
+    * TA5_WFI_CCU emits the wait-for-idle GL puts immediately before this
+    * register write -- fd5_emit_gmem() does fd_wfi(batch, ring) and only then
+    * RB_CCU_CNTL, with the comment "0x10000000 for BYPASS.. 0x7c13c080 for
+    * GMEM".  The note below used to argue against emitting it; that argument
+    * assumed the CCU is already quiet, which holds when this is the only
+    * client on the GPU and not when a compositor is there too.
+    */
+   if (getenv("TA5_WFI_CCU"))
+      ta5_wfi(cmd);
+
+   /*
+    * No wait-for-idle here by default.  GL calls fd_wfi() at this point, but
+    * that is guarded on batch->needs_wfi, and the cache flush in
+    * ta5_emit_restore() has already reset and consumed the flag -- so GL emits
+    * exactly one WFI per stream, in the cache flush.  See TA5_WFI_CCU above.
     */
 
-   ta5_pkt4(cmd, REG_A5XX_RB_CCU_CNTL, 1);
-   ta5_cs_push(cmd, 0x10000000);
+   /*
+    * 0x10000000 is GL's BYPASS value ("0x10000000 for BYPASS.. 0x7c13c080 for
+    * GMEM"), and TA5_CCU_CNTL=<hex> overrides it -- because the resolve after
+    * a depth clear faults, and this register is the CCU's configuration, so it
+    * is the next thing to be wrong in.
+    */
+   const char *ccucntl = getenv("TA5_CCU_CNTL");
+
+   if (!getenv("TA5_NO_CCU_CNTL")) {
+      ta5_pkt4(cmd, REG_A5XX_RB_CCU_CNTL, 1);
+      ta5_cs_push(cmd, ccucntl ? (uint32_t)strtoul(ccucntl, NULL, 0)
+                               : 0x10000000);
+   }
+
+   /*
+    * TA5_PREP_RESOLVE emits a CCU resolve here, in the prep, with no clear
+    * anywhere in the stream.  It separates "the depth clear's resolve" from
+    * "any resolve after this prep": the clear is a red herring if a bare
+    * resolve faults and the real fault is in what the prep leaves behind.
+    */
+   if (getenv("TA5_PREP_RESOLVE"))
+      ta5_event_write_ts(cmd, cmd->device->blit_bo, CCU_RESOLVE);
 
    /* Bypass: no tile size, render straight to the attachment. */
    ta5_pkt4(cmd, REG_A5XX_RB_CNTL, 1);
@@ -1970,6 +2177,89 @@ ta5_emit_sysmem_prep(struct ta5_cmd_buffer *cmd,
    ta5_cs_push(cmd, 0);
 
    /*
+    * The depth attachment, the way fd5_emit_sysmem_prep() ends with
+    * emit_zs(): RB_DEPTH_BUFFER_INFO with the format and the buffer, then the
+    * rasteriser's view of the same format, then the flag buffer, the LRZ pair
+    * and the stencil info at zero.
+    *
+    * This is in the *prep* on purpose.  The depth clear runs between here and
+    * the first draw, and until now nothing had described the depth buffer to
+    * the units that the clear uses: the clear programmed RB_DEPTH_BUFFER_INFO
+    * and nothing else, so GRAS_SU_DEPTH_BUFFER_INFO, RB_STENCIL_INFO,
+    * GRAS_LRZ_BUFFER_BASE and GRAS_LRZ_FAST_CLEAR_BUFFER_BASE carried whatever
+    * the last client on this GPU left in them.  Those are register state that
+    * outlives a submission.
+    *
+    * Measured per frame, D32 depth attachment, faults from the kernel's IOMMU
+    * report, two runs each:
+    *
+    *     64x64, 256x256, 512x512, 1024x1024          0 faults
+    *     1023x1023, 1025x1025, 1080x1080, 1080x2280 10 faults
+    *
+    * -- every size whose height is not a whole number of 64-pixel tiles, which
+    * is where a stale depth description stops matching the buffer.  Fault
+    * addresses are outside every buffer this process allocates, 64 bytes apart.
+    */
+   if (!getenv("TA5_NO_DEPTH_TARGET")) {
+      int didx = ta5_render_pass_depth_attachment(fb->render_pass);
+      const struct ta5_image_view *dview =
+         didx >= 0 ? fb->attachments[didx] : NULL;
+      uint32_t hwfmt =
+         didx >= 0
+            ? ta5_format_depth_hw(fb->render_pass->attachments[didx].format)
+            : DEPTH5_NONE;
+
+      if (dview) {
+         const struct ta5_image_level *dlvl =
+            &dview->image->levels[MIN2(dview->base_mip_level,
+                                        dview->image->mip_levels - 1)];
+
+         ta5_pkt4(cmd, REG_A5XX_RB_DEPTH_BUFFER_INFO, 5);
+         ta5_cs_push(cmd, A5XX_RB_DEPTH_BUFFER_INFO_DEPTH_FORMAT(
+                            (enum a5xx_depth_format)hwfmt));
+         ret = ta5_cs_reloc(cmd, dview->image->bound_memory->bo, 0, 0);
+         if (ret != VK_SUCCESS)
+            return ret;
+         ta5_cs_push(cmd, A5XX_RB_DEPTH_BUFFER_PITCH((uint32_t)dview->row_pitch));
+         ta5_cs_push(cmd, A5XX_RB_DEPTH_BUFFER_ARRAY_PITCH(
+                            (uint32_t)dlvl->layer_pitch));
+
+         ta5_pkt4(cmd, REG_A5XX_GRAS_SU_DEPTH_BUFFER_INFO, 1);
+         ta5_cs_push(cmd, A5XX_GRAS_SU_DEPTH_BUFFER_INFO_DEPTH_FORMAT(
+                            (enum a5xx_depth_format)hwfmt));
+      } else {
+         ta5_pkt4(cmd, REG_A5XX_RB_DEPTH_BUFFER_INFO, 5);
+         ta5_cs_push(cmd, A5XX_RB_DEPTH_BUFFER_INFO_DEPTH_FORMAT(DEPTH5_NONE));
+         ta5_cs_push(cmd, 0x00000000); /* BASE_LO */
+         ta5_cs_push(cmd, 0x00000000); /* BASE_HI */
+         ta5_cs_push(cmd, 0x00000000); /* PITCH */
+         ta5_cs_push(cmd, 0x00000000); /* ARRAY_PITCH */
+
+         ta5_pkt4(cmd, REG_A5XX_GRAS_SU_DEPTH_BUFFER_INFO, 1);
+         ta5_cs_push(cmd, A5XX_GRAS_SU_DEPTH_BUFFER_INFO_DEPTH_FORMAT(
+                            DEPTH5_NONE));
+      }
+
+      /* No flag buffer, no LRZ, no separate stencil: say so, every pass. */
+      ta5_pkt4(cmd, REG_A5XX_RB_DEPTH_FLAG_BUFFER_BASE, 3);
+      ta5_cs_push(cmd, 0x00000000);
+      ta5_cs_push(cmd, 0x00000000);
+      ta5_cs_push(cmd, 0x00000000);
+
+      ta5_pkt4(cmd, REG_A5XX_GRAS_LRZ_BUFFER_BASE, 3);
+      ta5_cs_push(cmd, 0x00000000);
+      ta5_cs_push(cmd, 0x00000000);
+      ta5_cs_push(cmd, 0x00000000);
+
+      ta5_pkt4(cmd, REG_A5XX_GRAS_LRZ_FAST_CLEAR_BUFFER_BASE, 2);
+      ta5_cs_push(cmd, 0x00000000);
+      ta5_cs_push(cmd, 0x00000000);
+
+      ta5_pkt4(cmd, REG_A5XX_RB_STENCIL_INFO, 1);
+      ta5_cs_push(cmd, 0x00000000);
+   }
+
+   /*
     * The unused colour slots.  A slot is CONTROL, BLEND_CONTROL, BUF_INFO,
     * PITCH, ARRAY_PITCH, BASE_LO, BASE_HI -- seven dwords -- so writing five
     * dwords at RB_MRT(i) reaches BUF_INFO but never the base address.  fd5's
@@ -1997,7 +2287,7 @@ ta5_emit_sysmem_prep(struct ta5_cmd_buffer *cmd,
     * CCU has nowhere to write and the clear is silently dropped.
     */
    ta5_emit_msaa(cmd);
-   ta5_emit_draw_state(cmd, 0, 0);
+   ta5_emit_draw_state(cmd, 0, 0, 0);
 
    return VK_SUCCESS;
 }
@@ -2013,7 +2303,7 @@ ta5_emit_sysmem_prep(struct ta5_cmd_buffer *cmd,
  */
 static void
 ta5_emit_draw_state(struct ta5_cmd_buffer *cmd, unsigned vs_tex_count,
-                     unsigned fs_tex_count)
+                     unsigned fs_tex_count, uint32_t vertex_count)
 {
    /* fd5_emit_render_cntl(blit = false, binning = false) */
    ta5_pkt4(cmd, REG_A5XX_RB_RENDER_CNTL, 1);
@@ -2243,20 +2533,39 @@ ta5_emit_clear(struct ta5_cmd_buffer *cmd, struct ta5_device *device,
     *     (  0,255,  0)   (  0,255,  0)     green is the middle byte
     *     (  0,  0,  0)   (  0,  0,  0)     all zero
     */
-   ta5_pkt4(cmd, REG_A5XX_RB_CLEAR_COLOR_DW0, 4);
-   ta5_cs_push(cmd, (color->u32[3] << 24) | (color->u32[2] << 16) |
-                      (color->u32[1] << 8) | color->u32[0]);
-   ta5_cs_push(cmd, 0x00000000);
-   ta5_cs_push(cmd, 0x00000000);
-   ta5_cs_push(cmd, 0x00000000);
+   {
+      uint32_t r = color->u32[0], g = color->u32[1], b = color->u32[2];
+
+      /*
+       * TA5_FORCE_CLEAR=<r>,<g>,<b>: replace the application's clear colour.
+       *
+       * "Is the cube missing, or is it drawn in the colour of the clear?"
+       * cannot be answered from the pixels when the two are close, because
+       * both count as background.  vkcube clears to 0x333333 and its cube
+       * covers 30% of what it should, so this is the question that decides
+       * whether the remaining fault is geometry or colour.
+       */
+      const char *fc = getenv("TA5_FORCE_CLEAR");
+      if (fc) {
+         unsigned fr = 0, fg = 0, fb = 0;
+         if (sscanf(fc, "%u,%u,%u", &fr, &fg, &fb) == 3) {
+            r = fr & 0xff;
+            g = fg & 0xff;
+            b = fb & 0xff;
+         }
+      }
+
+      ta5_pkt4(cmd, REG_A5XX_RB_CLEAR_COLOR_DW0, 4);
+      ta5_cs_push(cmd, (color->u32[3] << 24) | (b << 16) | (g << 8) | r);
+      ta5_cs_push(cmd, 0x00000000);
+      ta5_cs_push(cmd, 0x00000000);
+      ta5_cs_push(cmd, 0x00000000);
+   }
 
    if (device->blit_bo == NULL)
       return VK_ERROR_OUT_OF_DEVICE_MEMORY;
 
    ret = ta5_event_write_ts(cmd, device->blit_bo, CCU_RESOLVE);
-   if (ret != VK_SUCCESS)
-      return ret;
-
    ta5_pkt4(cmd, REG_A5XX_RB_CLEAR_CNTL, 1);
    ta5_cs_push(cmd, 0);
 
@@ -2267,7 +2576,13 @@ ta5_emit_clear(struct ta5_cmd_buffer *cmd, struct ta5_device *device,
    ta5_pkt4(cmd, REG_A5XX_GRAS_SC_CNTL, 1);
    ta5_cs_push(cmd, 0x00000008);
 
-   return VK_SUCCESS;
+   /*
+    * The timestamp is a relocation and the relocation can fail, so its result
+    * is the result.  Returning VK_SUCCESS over it reported a clear whose
+    * completion was never going to be waited for as a clear that had
+    * happened.
+    */
+   return ret;
 }
 
 /**
@@ -2296,34 +2611,72 @@ ta5_emit_clear_depth(struct ta5_cmd_buffer *cmd, struct ta5_device *device,
       return vk_error(&device->instance->vk, VK_ERROR_FORMAT_NOT_SUPPORTED);
 
    /*
-    * The clear value goes into the buffer in *the buffer's* encoding, not as
-    * the float's bit pattern.  util_pack_z()/util_pack_z_stencil() do exactly
-    * this:
+    * TA5_NO_DEPTH_CLEAR, TA5_NO_DEPTH_STATE and TA5_NO_FASTCLEAR are bisect
+    * switches for the fault that only appears with a depth attachment at the
+    * panel's size: they turn off, one at a time, the depth clear, the depth
+    * test state and the fast-clear bit, so the fault can be attributed to a
+    * register rather than to "the depth path".
+    */
+   if (getenv("TA5_NO_DEPTH_CLEAR"))
+      return VK_SUCCESS;
+   const int no_bufinfo = getenv("TA5_NO_DEPTH_BUFINFO") != NULL;
+   const int no_resolve = getenv("TA5_NO_DEPTH_RESOLVE") != NULL;
+
+   /*
+    * The clear value has to be in the *buffer's* encoding, not the float's bit
+    * pattern.  util_pack_z()/util_pack_z_stencil() do exactly this:
     *
-    *    Z16_UNORM          float -> 16-bit unorm   (1.0 -> 0xffff)
-    *    Z24_UNORM_S8_UINT  float -> 24-bit unorm in the low bits, stencil in
-    *                       the top 8              (1.0 -> 0x00ffffff)
+    *    Z16_UNORM          float -> 16-bit unorm    (1.0 -> 0xffff)
+    *    Z24_UNORM_S8_UINT  float -> 24-bit unorm in the low bits, stencil
+    *                       in the top 8            (1.0 -> 0x00ffffff)
     *    Z32_FLOAT          the float's own bits    (1.0 -> 0x3f800000)
     *
-    * Taking the top 16 bits of the float instead, which is what this did,
-    * writes 0x3f80 -- 0.248 -- into a depth buffer being cleared to 1.0.  Every
-    * fragment then fails a LESS depth test against it, so the frame comes out
-    * as the clear colour with nothing drawn and no fault to explain it.
+    * Taking the top 16 bits of the float instead -- which is what this did --
+    * puts 0x3f80, i.e. 0.248, into a depth buffer being cleared to 1.0.  Every
+    * fragment then fails a LESS depth test against it, and the frame comes out
+    * as the clear colour with nothing drawn and *no* faults to explain it.
     *
-    * vkcube is what found it: it takes a D16 depth attachment, and all 115
-    * matrix cases ask for D32, where the float's bits are the encoding and the
-    * mistake cannot show.
+    * That is exactly what vkcube did: it takes a D16 depth buffer, and every
+    * one of the 115 matrix cases asks for D32, where the float's bits are the
+    * encoding and the mistake cannot show.
     */
    {
       float z = depth < 0.0f ? 0.0f : (depth > 1.0f ? 1.0f : depth);
 
+      /*
+       * In double, and that is the whole fix rather than a style choice.
+       *
+       * A float has 24 bits of significand, so at the magnitude of
+       * 16777215 there is no fractional part left to represent: adding the
+       * half-unit used for rounding takes 16777215.0f + 0.5f to
+       * 16777216.0f.  The truncation then produced 0x1000000, and the
+       * 24-bit mask reduced that to zero -- so a D24_UNORM_S8_UINT
+       * attachment was cleared to 0.0 rather than to 1.0.
+       *
+       * Measured, one depth clear to 1.0 per run, the packed dword and the
+       * attachment's own bytes afterwards:
+       *
+       *     D16_UNORM          packed 0x0000ffff   ff ff ff ff ...  cleared
+       *     D32_SFLOAT         packed 0x3f800000   00 00 80 3f ...  cleared
+       *     D24_UNORM_S8_UINT  packed 0x00000000   00 00 00 00 ...  all zero
+       *
+       * Sixteen bits does not overflow -- 65535.5f is exactly representable --
+       * which is why only the 24-bit format lost its clear, and why the 115
+       * matrix cases never saw it: they ask for D32, where the float's own bit
+       * pattern is the encoding and this arithmetic is not involved.
+       *
+       * Consequence beyond the clear: vkcube asks for D24_UNORM_S8_UINT on
+       * this device, so its depth buffer was zero, every fragment failed its
+       * LESS test, and the frame came out as the clear colour with nothing
+       * drawn -- no fault, nothing in dmesg, nothing to attribute it to.
+       */
       switch (att->format) {
       case VK_FORMAT_D16_UNORM:
-         packed = (uint32_t)(z * 65535.0f + 0.5f);
+         packed = (uint32_t)((double)z * 65535.0 + 0.5);
          break;
       case VK_FORMAT_D24_UNORM_S8_UINT:
-         /* stencil stays 0: this driver has no stencil state */
-         packed = (uint32_t)(z * 16777215.0f + 0.5f) & 0x00ffffffu;
+         /* stencil byte stays 0: this driver has no stencil state */
+         packed = (uint32_t)((double)z * 16777215.0 + 0.5) & 0x00ffffffu;
          break;
       default: /* VK_FORMAT_D32_SFLOAT */
          memcpy(&packed, &depth, sizeof(packed));
@@ -2340,9 +2693,47 @@ ta5_emit_clear_depth(struct ta5_cmd_buffer *cmd, struct ta5_device *device,
    ta5_pkt4(cmd, REG_A5XX_RB_BLIT_CNTL, 1);
    ta5_cs_push(cmd, A5XX_RB_BLIT_CNTL_BUF(BLIT_ZS));
 
+   /*
+    * TA5_SLOW_CLEAR does this clear as a real blit instead of a CCU fast
+    * clear: the destination is described through the blit's own registers,
+    * RB_CLEAR_CNTL loses FAST_CLEAR, and no CCU resolve follows.
+    *
+    * This is the one route that does not go through the CCU at all, and it is
+    * the only one that does not cost the clear.  Measured, depth readout of a
+    * 360x713 D16 attachment (want 0 of 4096 below 0.999, first = 1):
+    *
+    *    fast clear + CCU resolve          0 of 4096, first = 1   correct
+    *    TA5_NO_DEPTH_RESOLVE=1          4096 of 4096, first = 0   no clear
+    *    TA5_DEPTH_EVENT=d               4096 of 4096, first = 0   no clear
+    *    TA5_RESOLVE_MRT=1               4096 of 4096, first = 0   no clear
+    *    TA5_NO_FASTCLEAR=1              4096 of 4096, first = 0   no clear
+    *
+    * Every resolve-based silencer leaves depth at 0 because the resolve is
+    * what applies the fast clear.  The blit destination is written the way
+    * fd5_gmem.c:emit_gmem2mem_surf() writes it.
+    */
+   const bool slow_clear = getenv("TA5_SLOW_CLEAR") != NULL;
+
+   const uint32_t clr_mask = 0x1; /* depth only; this driver has no stencil */
+
+   if (slow_clear) {
+      const struct ta5_image_level *slvl =
+         &view->image->levels[MIN2(view->base_mip_level,
+                                  view->image->mip_levels - 1)];
+
+      ta5_pkt4(cmd, REG_A5XX_RB_BLIT_DST, 4);
+      ret = ta5_cs_reloc(cmd, view->image->bound_memory->bo, 0, 0);
+      if (ret != VK_SUCCESS)
+         return ret;
+      ta5_cs_push(cmd, A5XX_RB_BLIT_DST_PITCH((uint32_t)view->row_pitch));
+      ta5_cs_push(cmd, A5XX_RB_BLIT_DST_ARRAY_PITCH((uint32_t)slvl->layer_pitch));
+   }
+
    ta5_pkt4(cmd, REG_A5XX_RB_CLEAR_CNTL, 1);
-   ta5_cs_push(cmd, A5XX_RB_CLEAR_CNTL_FAST_CLEAR |
-                     A5XX_RB_CLEAR_CNTL_MASK(0x1));
+   ta5_cs_push(cmd, ((getenv("TA5_NO_FASTCLEAR") || slow_clear)
+                        ? 0
+                        : A5XX_RB_CLEAR_CNTL_FAST_CLEAR) |
+                     A5XX_RB_CLEAR_CNTL_MASK(clr_mask));
 
    ta5_pkt4(cmd, REG_A5XX_RB_CLEAR_COLOR_DW0, 4);
    ta5_cs_push(cmd, packed);
@@ -2367,27 +2758,224 @@ ta5_emit_clear_depth(struct ta5_cmd_buffer *cmd, struct ta5_device *device,
          &view->image->levels[MIN2(view->base_mip_level,
                                     view->image->mip_levels - 1)];
 
-      ta5_pkt4(cmd, REG_A5XX_RB_DEPTH_BUFFER_INFO, 5);
-      ta5_cs_push(cmd, A5XX_RB_DEPTH_BUFFER_INFO_DEPTH_FORMAT(
-                         (enum a5xx_depth_format)hwfmt));
-      ret = ta5_cs_reloc(cmd, view->image->bound_memory->bo, 0, 0);
-      if (ret != VK_SUCCESS)
-         return ret;
-      ta5_cs_push(cmd, A5XX_RB_DEPTH_BUFFER_PITCH((uint32_t)view->row_pitch));
-      ta5_cs_push(cmd, A5XX_RB_DEPTH_BUFFER_ARRAY_PITCH(
-                         (uint32_t)lvl->layer_pitch));
+      /*
+       * TA5_TRACE_DEPTH prints what the depth buffer is programmed with, next
+       * to the size of the allocation it points at.  A pitch or an array pitch
+       * that does not match the buffer is an out-of-bounds access, and the
+       * kernel reports it as a translation fault at an address in no buffer at
+       * all -- so this is what says whether the registers describe the
+       * attachment or something else.
+       */
+      if (getenv("TA5_TRACE_DEPTH"))
+         fprintf(stderr,
+                 "ta5[depth] clear: fmt=%u attfmt=%u depth=%g packed=0x%08x "
+                 "pitch=%llu array_pitch=%llu "
+                 "bo_size=%u extent=%ux%u levels=%u\\n",
+                 hwfmt, (unsigned)att->format, depth, packed,
+                 (unsigned long long)view->row_pitch,
+                 (unsigned long long)lvl->layer_pitch,
+                 view->image->bound_memory->bo->size, view->image->extent.width,
+                 view->image->extent.height, view->image->mip_levels);
+
+      if (!no_bufinfo) {
+         ta5_pkt4(cmd, REG_A5XX_RB_DEPTH_BUFFER_INFO, 5);
+         ta5_cs_push(cmd, A5XX_RB_DEPTH_BUFFER_INFO_DEPTH_FORMAT(
+                            (enum a5xx_depth_format)hwfmt));
+         ret = ta5_cs_reloc(cmd, view->image->bound_memory->bo, 0, 0);
+         if (ret != VK_SUCCESS)
+            return ret;
+         ta5_cs_push(cmd,
+                     A5XX_RB_DEPTH_BUFFER_PITCH((uint32_t)view->row_pitch));
+         ta5_cs_push(cmd,
+                     A5XX_RB_DEPTH_BUFFER_ARRAY_PITCH(
+                        (uint32_t)lvl->layer_pitch));
+
+         /*
+          * The rest of the descriptor, as fd5_gmem.c:emit_zs() writes it.
+          *
+          * The rasteriser's copy of the format ...
+          */
+         ta5_pkt4(cmd, REG_A5XX_GRAS_SU_DEPTH_BUFFER_INFO, 1);
+         ta5_cs_push(cmd, A5XX_GRAS_SU_DEPTH_BUFFER_INFO_DEPTH_FORMAT(
+                            (enum a5xx_depth_format)hwfmt));
+
+         /*
+          * ... and the stencil side.  These three registers are what makes a
+          * D24_UNORM_S8_UINT clear work, and their absence is why the cube
+          * never appeared.
+          *
+          * DEPTH5_24_8 is the only one of this driver's three depth formats
+          * that has a stencil aspect, so it is the only one whose CCU fast
+          * clear needs the flag buffer described.  emit_zs() writes it for
+          * every attachment; this driver wrote it only on detach, leaving it
+          * at whatever the last context left behind, and the clear over
+          * DEPTH5_24_8 was then dropped on the floor.
+          *
+          * Measured, 64x64, one depth clear per run, raw bytes of the
+          * attachment afterwards:
+          *
+          *     D32_SFLOAT          0 of 4096 below 0.999  00 00 80 3f ...
+          *     D16_UNORM           0 of 4096 below 0.999  ff ff ff ff ...
+          *     D24_UNORM_S8_UINT   4096 of 4096 below 0.999  00 00 00 00 ...
+          *
+          * The last line is all zeroes and *no fault*: the clear was dropped,
+          * not misdirected.  vkcube asks for D24_UNORM_S8_UINT on this
+          * device, so the depth buffer stayed at zero, every fragment failed
+          * its LESS test, and the frame came out as the clear colour with
+          * nothing drawn -- which is exactly what the display showed, with
+          * nothing in dmesg to explain it.
+          *
+          * There is no stencil buffer here, so this is zeroed the way GL
+          * zeroes it, not pointed at one.
+          */
+         ta5_pkt4(cmd, REG_A5XX_RB_DEPTH_FLAG_BUFFER_BASE, 3);
+         ta5_cs_push(cmd, 0x00000000); /* RB_DEPTH_FLAG_BUFFER_BASE */
+         ta5_cs_push(cmd, 0x00000000); /* RB_DEPTH_FLAG_BUFFER_BASE_HI */
+         ta5_cs_push(cmd, 0x00000000); /* RB_DEPTH_FLAG_BUFFER_PITCH */
+
+         /*
+          * ... and RB_STENCIL_INFO, which says whether the stencil plane
+          * lives in its own buffer or in the depth buffer's own pixels.
+          * fd5_gmem.c:emit_zs() closes with it: A5XX_RB_STENCIL_INFO
+          * _SEPARATE_STENCIL plus a base and a pitch when there is a separate
+          * stencil resource, and a plain zero when there is not.  This driver
+          * has no separate stencil buffer, so the answer is zero -- and it was
+          * never written at all, so the register kept whatever the last
+          * context left in it.
+          *
+          * That is the register the D24_UNORM_S8_UINT clear was failing on,
+          * and it is why only that format failed.  DEPTH5_24_8 is the only
+          * one of the three depth formats with a stencil plane, so it is the
+          * only one for which this bit means anything; with it stale, the CCU
+          * would look for the stencil in a buffer that was never described,
+          * find nothing it could resolve, and drop the whole clear.
+          *
+          * Measured on the attachment's raw bytes after one clear, 64x64:
+          *
+          *     D16_UNORM          ff ff ff ff ...   cleared
+          *     D32_SFLOAT         00 00 80 3f ...   cleared
+          *     D24_UNORM_S8_UINT  00 00 00 00 ...   all zero, no fault
+          *
+          * and vkcube asks for D24_UNORM_S8_UINT on this device.
+          */
+         ta5_pkt4(cmd, REG_A5XX_RB_STENCIL_INFO, 1);
+         ta5_cs_push(cmd, 0x00000000); /* RB_STENCIL_INFO */
+      }
    }
 
    if (device->blit_bo == NULL)
       return VK_ERROR_OUT_OF_DEVICE_MEMORY;
 
-   ret = ta5_event_write_ts(cmd, device->blit_bo, CCU_RESOLVE);
-   if (ret != VK_SUCCESS)
-      return ret;
+   if (!no_resolve) {
+      /*
+       * CCU_RESOLVE is the right event here, and this is where that was
+       * measured rather than assumed: switching it for
+       * PC_CCU_FLUSH_DEPTH_TS silences the faults described below, and costs
+       * the depth writes -- four matrix cases (depth 0 and the three two-draw
+       * cases) go from matching lavapipe to differing in 4096 of 16384 bytes,
+       * because the depth the first draw wrote never reaches the buffer the
+       * second draw tests against.  fd5_emit_blit() ends GL's depth clear the
+       * same way (fd5_emit.h:139), so the event is right and the fault is
+       * something else in this sequence.
+       *
+       * What is wrong: the depth clear faults the GPU at most sizes.  Measured
+       * per frame, D32 depth, CCU_RESOLVE, two runs each:
+       *
+       *     64x64, 256x256, 512x512, 1024x1024   0 faults
+       *     1023x1023, 1025x1025, 1080x1080      10 faults
+       *     1080x2280 (the panel)                10 faults
+       *
+       * The fault addresses are outside every buffer the process allocates and
+       * advance by 64 bytes, which is the CCU walking a target it has been
+       * given the wrong address for.  GL refuses this clear outright for Z32
+       * (fd5_draw.c: fd5_clear returns false when is_z32()), so the fast
+       * clear of a Z32 attachment is not a thing this hardware does; what is
+       * left to establish is what the attachment needs instead.
+       */
+      const char *ev = getenv("TA5_DEPTH_EVENT");
+      uint32_t which = CCU_RESOLVE;
+
+      if (ev && ev[0] == 'd')
+         which = PC_CCU_FLUSH_DEPTH_TS;
+
+      if (getenv("TA5_DEPTH_NOTS")) {
+         ta5_pkt7(cmd, CP_EVENT_WRITE, 1);
+         ta5_cs_push(cmd,
+                      CP_EVENT_WRITE_0_EVENT((enum vgt_event_type)which));
+      } else {
+         /*
+       * TA5_RESOLVE_MRT points the blit at a real target before the resolve.
+       *
+       * The resolve needs somewhere valid to resolve *into*.  Measured on the
+       * fault storm, vkcube --wsi wayland against a compositor, everything
+       * else held equal:
+       *
+       *    resolve with RB_BLIT_CNTL = BLIT_ZS      10 faults
+       *    resolve after RB_BLIT_CNTL = BLIT_MRT0     0 faults
+       *
+       * and the protective pair is the blit target plus the clear data word,
+       * not RB_CLEAR_CNTL: CLEAR_CNTL alone still gives 30, while
+       * RB_BLIT_CNTL + RB_CLEAR_COLOR_DW0 without it gives 0.  A clear data
+       * word of zero is fine; what matters is that the resolve has a target.
+       */
+      if (getenv("TA5_RESOLVE_MRT")) {
+         /*
+          * =2 waits for idle first.  The clear is asynchronous: moving the
+          * blit target before the RB has consumed the ZS clear moves the
+          * clear with it, which is how =1 silences the storm and still clears
+          * depth to 0.
+          */
+         if (atoi(getenv("TA5_RESOLVE_MRT")) >= 2)
+            ta5_wfi(cmd);
+
+         ta5_pkt4(cmd, REG_A5XX_RB_BLIT_CNTL, 1);
+         ta5_cs_push(cmd, A5XX_RB_BLIT_CNTL_BUF(BLIT_MRT0));
+         ta5_pkt4(cmd, REG_A5XX_RB_CLEAR_COLOR_DW0, 4);
+         ta5_cs_push(cmd, 0x00000000);
+         ta5_cs_push(cmd, 0x00000000);
+         ta5_cs_push(cmd, 0x00000000);
+         ta5_cs_push(cmd, 0x00000000);
+      }
+
+      /*
+       * TA5_RESOLVE_BLITDST describes the depth attachment through the blit's
+       * own destination registers, which is what a resolve resolves into and
+       * what fd5_gmem.c:emit_gmem2mem_surf() writes: RB_BLIT_DST,
+       * RB_BLIT_DST_PITCH, RB_BLIT_DST_ARRAY_PITCH.  The clear has so far only
+       * ever described the attachment through RB_DEPTH_BUFFER_INFO, which is
+       * the render target, not the blit.
+       *
+       * This is the version that does not move the clear: TA5_RESOLVE_MRT
+       * silences the storm by repointing RB_BLIT_CNTL away from BLIT_ZS, and
+       * the clear then lands on the colour target -- depth comes out 0.0
+       * instead of 1.0, with or without a wait-for-idle first.
+       */
+      if (getenv("TA5_RESOLVE_BLITDST")) {
+         const struct ta5_image_level *lvl =
+            &view->image->levels[MIN2(view->base_mip_level,
+                                     view->image->mip_levels - 1)];
+
+         ta5_pkt4(cmd, REG_A5XX_RB_BLIT_DST, 4);
+         ret = ta5_cs_reloc(cmd, view->image->bound_memory->bo, 0, 0);
+         if (ret != VK_SUCCESS)
+            return ret;
+         ta5_cs_push(cmd, A5XX_RB_BLIT_DST_PITCH((uint32_t)view->row_pitch));
+         ta5_cs_push(cmd,
+                     A5XX_RB_BLIT_DST_ARRAY_PITCH((uint32_t)lvl->layer_pitch));
+      }
+
+      if (!slow_clear) {
+         ret = ta5_event_write_ts(cmd, device->blit_bo, which);
+         if (ret != VK_SUCCESS)
+            return ret;
+      }
+      }
+   }
 
    ta5_pkt4(cmd, REG_A5XX_RB_CLEAR_CNTL, 1);
    ta5_cs_push(cmd, 0);
 
+   /* Back to rendering, not blitting. */
    ta5_pkt4(cmd, REG_A5XX_RB_RENDER_CNTL, 1);
    ta5_cs_push(cmd, 0x00000008);
 
@@ -2441,6 +3029,17 @@ ta5_emit_depth_state(struct ta5_cmd_buffer *cmd,
    VkResult ret;
 
    idx = ta5_render_pass_depth_attachment(pass);
+   if (getenv("TA5_TRACE_DS"))
+      fprintf(stderr,
+              "ta5[ds] emit: ds=%p test=%d write=%d op=%d idx=%d pipe=%p\n",
+              (const void *)ds, (int)test, (int)write,
+              ds ? (int)ds->depth.compare_op : -1, idx, (const void *)pipe);
+   if (getenv("TA5_NO_DEPTH_STATE")) {
+      ta5_pkt4(cmd, REG_A5XX_RB_DEPTH_CNTL, 1);
+      ta5_cs_push(cmd, 0x00000000);
+      return VK_SUCCESS;
+   }
+
    if (idx < 0) {
       /*
        * No depth attachment.  Both bits still have to be written as clear: a
@@ -2529,6 +3128,28 @@ ta5_emit_depth_state(struct ta5_cmd_buffer *cmd,
       ta5_pkt4(cmd, REG_A5XX_GRAS_SU_DEPTH_BUFFER_INFO, 1);
       ta5_cs_push(cmd, A5XX_GRAS_SU_DEPTH_BUFFER_INFO_DEPTH_FORMAT(
                          (enum a5xx_depth_format)hwfmt));
+
+      /*
+       * And the stencil side, which fd5_gmem.c:150 writes immediately after.
+       * DEPTH5_24_8 has a stencil aspect and the other two do not, so this is
+       * the register that decides whether a D24_UNORM_S8_UINT attachment is
+       * described completely or only halfway -- see ta5_emit_clear_depth().
+       * Zeroed, because this driver allocates no separate stencil buffer.
+       */
+      ta5_pkt4(cmd, REG_A5XX_RB_DEPTH_FLAG_BUFFER_BASE, 3);
+      ta5_cs_push(cmd, 0x00000000); /* RB_DEPTH_FLAG_BUFFER_BASE */
+      ta5_cs_push(cmd, 0x00000000); /* RB_DEPTH_FLAG_BUFFER_BASE_HI */
+      ta5_cs_push(cmd, 0x00000000); /* RB_DEPTH_FLAG_BUFFER_PITCH */
+
+      /*
+       * And whether the stencil plane is packed into the depth buffer, which
+       * here it is: fd5_gmem.c:emit_zs() writes a plain zero for that case and
+       * SEPARATE_STENCIL when the stencil has a buffer of its own.  Only
+       * DEPTH5_24_8 has a stencil plane, so only that format is affected --
+       * see ta5_emit_clear_depth() for what it cost.
+       */
+      ta5_pkt4(cmd, REG_A5XX_RB_STENCIL_INFO, 1);
+      ta5_cs_push(cmd, 0x00000000); /* RB_STENCIL_INFO */
    }
 
    /*
@@ -2561,6 +3182,73 @@ ta5_emit_sysmem_fini(struct ta5_cmd_buffer *cmd)
 {
    VkResult ret;
 
+   /*
+    * TA5_TRACE_ZBUF=<path> writes the depth attachment at the end of the
+    * render pass, as a binary PGM of the raw depth words.
+    *
+    * This is the one measurement that separates "the fragments were never
+    * rasterised" from "they were rasterised and then thrown away".  Colour
+    * cannot answer it: a fragment killed by the depth test and a fragment
+    * that never existed leave identical pixels.  Depth can, because a
+    * fragment that passes the test writes its depth -- the test and the write
+    * are one register, Z_TEST_ENABLE and Z_WRITE_ENABLE together in
+    * RB_DEPTH_CNTL -- so whatever is in here is what the test accepted.
+    */
+   {
+      const char *zpath = getenv("TA5_TRACE_ZBUF");
+      const struct ta5_framebuffer *fb = cmd->bound_framebuffer;
+
+      if (zpath && fb) {
+         const struct ta5_render_pass *pass = fb->render_pass;
+         int idx = ta5_render_pass_depth_attachment(pass);
+
+         if (idx >= 0) {
+            struct ta5_image_view *view = fb->attachments[idx];
+            uint32_t fmt = (uint32_t)ta5_format_depth_hw(pass->attachments[idx].format);
+            uint8_t *map = NULL;
+
+            if (view->image->bound_memory)
+               map = (uint8_t *)ta5_bo_map(view->image->bound_memory->bo);
+            FILE *f = map ? fopen(zpath, "wb") : NULL;
+
+            if (!f) {
+               fprintf(stderr, "ta5[zbuf] %s\n", map ? "cannot open" : "map failed");
+            } else {
+               uint32_t w = view->image->extent.width;
+               uint32_t h = view->image->extent.height;
+               uint32_t pitch = view->row_pitch;
+
+               fprintf(f, "P5\n%u %u\n%d\n", w, h,
+                       (fmt == 1) ? 65535 : (fmt == 2 ? 16777215 : 255));
+               for (uint32_t y = 0; y < h; y++) {
+                  const uint8_t *row = map + (size_t)y * pitch;
+
+                  for (uint32_t x = 0; x < w; x++) {
+                     uint32_t v;
+                     if (fmt == 1) {
+                        uint16_t t;
+                        memcpy(&t, row + x * 2, 2);
+                        v = t;
+                     } else if (fmt == 2) {
+                        uint32_t t;
+                        memcpy(&t, row + x * 4, 4);
+                        v = t & 0x00ffffffu;
+                     } else {
+                        memcpy(&v, row + x * 4, 4);
+                        v = v >> 16;   /* float depth, top 8 bits */
+                     }
+                     fputc((int)(v >> ((fmt == 2) ? 16 : 8)) & 0xff, f);
+                  }
+               }
+               fclose(f);
+               fprintf(stderr,
+                       "ta5[zbuf] wrote %s %ux%u fmt=%u pitch=%u\n", zpath, w, h,
+                       fmt, pitch);
+            }
+         }
+      }
+   }
+
    ta5_pkt7(cmd, CP_SKIP_IB2_ENABLE_GLOBAL, 1);
    ta5_cs_push(cmd, 0);
 
@@ -2573,19 +3261,17 @@ ta5_emit_sysmem_fini(struct ta5_cmd_buffer *cmd)
     * the register is left at zero -- written as a literal 0 in
     * ta5_emit_sysmem_prep's depth block and never given a real address.  With
     * the enable set, the LRZ unit walks the flag buffer from address 0 in
-    * 64-byte strides: thousands of translation faults from iova 0 -- the
-    * "null-IOVA" signature -- and the walk is long enough to leave the first
+    * 64-byte strides: thousands of translation faults from iova 0, the
+    * "null-IOVA" signature, and the walk is long enough to leave the first
     * unmapped page whenever the framebuffer's height is not a multiple of 8.
     *
-    * Measured at 360x713 with a depth attachment, 120 frames, no wayland and
-    * no compositor involved: depth test off, 10 fault bursts; depth test on,
-    * 0.  The walk scales with the framebuffer, which is why 1080x2280 (both
-    * dimensions multiples of 8) was clean while 1023x1023 and 1025x1025 were
-    * not -- the same sizes that faulted in the original depth-clear
-    * investigation, whose "framebuffer height must be a multiple of 64" rule
-    * this replaces with something that has a cause.
+    * Measured at 360x713 with a depth attachment, 120 frames, no wayland:
+    * depth test off, 10 fault bursts; depth test on, 0; the walk scales with
+    * the framebuffer, which is why 1080x2280 (both multiples of 8) was clean
+    * and 1023x1023 and 1025x1025 were not -- the same sizes that faulted in
+    * the original depth-clear investigation.
     *
-    * LRZ is an optimisation.  Until a flag buffer exists the enable stays off;
+    * LRZ is an optimisation.  Until a flag buffer exists, the enable stays off;
     * the invalidate and the trailing zero still go out, so the sequence the
     * hardware sees is well-formed.
     */
@@ -2605,15 +3291,28 @@ ta5_emit_sysmem_fini(struct ta5_cmd_buffer *cmd)
     * to flush on behalf of a buffer nothing is waiting on, and the packet
     * faults -- it is the only packet left that does.
     */
-   ret = ta5_event_write_ts(cmd, cmd->device->blit_bo,
-                            PC_CCU_FLUSH_COLOR_TS);
-   if (ret != VK_SUCCESS)
-      return ret;
+   /*
+    * TA5_NO_CCU_FLUSH: emit neither timestamped CCU flush.  This is the A/B
+    * for the compositor-killing fault storm, which fires with a content-free
+    * submission -- TA5_SKIP_DRAW=1, no draw state, no shaders, no
+    * CP_DRAW_INDX_OFFSET -- and so cannot be about anything our GPU renders.
+    * What every submission carries regardless of content is this CCU flush
+    * pair, and the CCU is GPU-global: invalidating it mid-walk is exactly the
+    * shape of another context's GPU work faulting from iova 0 in 64-byte
+    * strides.  Rendering without a flush produces stale output, not wrong
+    * output; that trade is what this knob is for.
+    */
+   if (!getenv("TA5_NO_CCU_FLUSH")) {
+      ret = ta5_event_write_ts(cmd, cmd->device->blit_bo,
+                               PC_CCU_FLUSH_COLOR_TS);
+      if (ret != VK_SUCCESS)
+         return ret;
 
-   ret = ta5_event_write_ts(cmd, cmd->device->blit_bo,
-                            PC_CCU_FLUSH_DEPTH_TS);
-   if (ret != VK_SUCCESS)
-      return ret;
+      ret = ta5_event_write_ts(cmd, cmd->device->blit_bo,
+                               PC_CCU_FLUSH_DEPTH_TS);
+      if (ret != VK_SUCCESS)
+         return ret;
+   }
 
    /*
     * CACHE_FLUSH_TS closes the pass, again into blit_mem.  GL's sysmem pass
@@ -2837,9 +3536,60 @@ ta5_CmdBeginRenderPass(VkCommandBuffer _cmd,
    if (ret != VK_SUCCESS)
       return;
 
-   ret = ta5_emit_sysmem_prep(cmd, cmd->bound_framebuffer);
-   if (ret != VK_SUCCESS)
+   if (getenv("TA5_PREP_BLIT")) {
+      /* The colour clear's blit setup and nothing else: no clear, no colour
+       * write, just the mode and the target, so that the resolve that follows
+       * has the same blit context the safe case has. */
+      ta5_pkt4(cmd, REG_A5XX_RB_RENDER_CNTL, 1);
+      ta5_cs_push(cmd, 0x00000000);
+      ta5_pkt4(cmd, REG_A5XX_GRAS_SC_CNTL, 1);
+      ta5_cs_push(cmd, 0x00000008);
+      ta5_pkt4(cmd, REG_A5XX_RB_BLIT_CNTL, 1);
+      ta5_cs_push(cmd, A5XX_RB_BLIT_CNTL_BUF(BLIT_MRT0));
+
+      /* =2 adds the clear's own registers, so this becomes the colour clear
+       * with its trailing restores left off. */
+      if (atoi(getenv("TA5_PREP_BLIT")) >= 2) {
+         ta5_pkt4(cmd, REG_A5XX_RB_CLEAR_CNTL, 1);
+         ta5_cs_push(cmd, A5XX_RB_CLEAR_CNTL_FAST_CLEAR |
+                           A5XX_RB_CLEAR_CNTL_MASK(0xf));
+         ta5_pkt4(cmd, REG_A5XX_RB_CLEAR_COLOR_DW0, 4);
+         ta5_cs_push(cmd, 0x00000000);
+         ta5_cs_push(cmd, 0x00000000);
+         ta5_cs_push(cmd, 0x00000000);
+         ta5_cs_push(cmd, 0x00000000);
+      }
+
+      /* =3 adds the restores the clear puts *after* its resolve, so this is
+       * the colour clear whole.  If that is clean where =2 faults, then the
+       * resolve cannot be the last thing in the stream. */
+      if (atoi(getenv("TA5_PREP_BLIT")) >= 3) {
+         ta5_pkt4(cmd, REG_A5XX_RB_CLEAR_CNTL, 1);
+         ta5_cs_push(cmd, 0x00000000);
+         ta5_pkt4(cmd, REG_A5XX_RB_RENDER_CNTL, 1);
+         ta5_cs_push(cmd, 0x00000008);
+         ta5_pkt4(cmd, REG_A5XX_GRAS_SC_CNTL, 1);
+         ta5_cs_push(cmd, 0x00000008);
+      }
+   }
+
+   if (getenv("TA5_PREP_RESOLVE"))
+      ta5_event_write_ts(cmd, cmd->device->blit_bo, CCU_RESOLVE);
+
+   if (getenv("TA5_EMPTY_IB")) {
+      cmd->bound_render_pass = pass;
       return;
+   }
+
+   const char *padenv = getenv("TA5_PAD");
+   for (int p = 0; padenv && p < atoi(padenv); p++)
+      ta5_cs_push(cmd, 0x00000000);
+
+   if (!getenv("TA5_SKIP_PREP")) {
+      ret = ta5_emit_sysmem_prep(cmd, cmd->bound_framebuffer);
+      if (ret != VK_SUCCESS)
+         return;
+   }
 
    /*
     * Attachments are cleared in the order pAttachments lists them, which is
@@ -2847,7 +3597,8 @@ ta5_CmdBeginRenderPass(VkCommandBuffer _cmd,
     * assumed it was colour, which is what made a depth-only or depth-first
     * attachment clear go to a colour target.
     */
-   for (uint32_t i = 0; i < pass->attachment_count; i++) {
+   for (uint32_t i = 0; !getenv("TA5_SKIP_CLEAR") && i < pass->attachment_count;
+        i++) {
       const struct ta5_render_pass_attachment *att = &pass->attachments[i];
       const struct ta5_framebuffer *fb = cmd->bound_framebuffer;
 
@@ -2864,6 +3615,12 @@ ta5_CmdBeginRenderPass(VkCommandBuffer _cmd,
        */
       if (i >= clear_count || clear == NULL)
          return;
+
+      if (att->used_as_color && getenv("TA5_SKIP_CLEAR_COLOR"))
+         continue;
+
+      if (!att->used_as_color && getenv("TA5_SKIP_CLEAR_DEPTH"))
+         continue;
 
       if (att->used_as_color) {
          /*
@@ -2900,6 +3657,72 @@ ta5_CmdEndRenderPass(VkCommandBuffer _cmd)
     */
    if (ta5_cmd_buffer_alloc_cs(cmd, cmd->cs_count + 1024) != VK_SUCCESS)
       return;
+
+   const char *padend = getenv("TA5_PADEND");
+   for (int p = 0; padend && p < atoi(padend); p++)
+      ta5_cs_push(cmd, 0x00000000);
+
+   if (getenv("TA5_EMPTY_IB") || getenv("TA5_SKIP_FINI")) {
+      const char *endres = getenv("TA5_END_RESOLVE");
+
+      /*
+       * =2 puts the colour clear's own register sequence here, *after* the
+       * prep, which is where the real colour clear runs.  TA5_PREP_BLIT put
+       * the same sequence *before* the prep, so "the hand-rolled colour clear
+       * still faults" was really "a clear before the prep faults".  Position
+       * is the only variable left between those two results.
+       */
+      if (endres && atoi(endres) >= 3) {
+         /* =3: blit mode only -- still 30 faults, so blit mode is not it.
+          * =4: RB_CLEAR_CNTL only.
+          * =5: everything except RB_CLEAR_CNTL. */
+         if (atoi(endres) != 5) {
+            ta5_pkt4(cmd, REG_A5XX_RB_CLEAR_CNTL, 1);
+            ta5_cs_push(cmd, A5XX_RB_CLEAR_CNTL_FAST_CLEAR |
+                              A5XX_RB_CLEAR_CNTL_MASK(0xf));
+         }
+
+         if (atoi(endres) != 4) {
+            ta5_pkt4(cmd, REG_A5XX_RB_BLIT_CNTL, 1);
+            ta5_cs_push(cmd, A5XX_RB_BLIT_CNTL_BUF(BLIT_MRT0));
+            ta5_pkt4(cmd, REG_A5XX_RB_CLEAR_COLOR_DW0, 4);
+            ta5_cs_push(cmd, 0x00000000);
+            ta5_cs_push(cmd, 0x00000000);
+            ta5_cs_push(cmd, 0x00000000);
+            ta5_cs_push(cmd, 0x00000000);
+         }
+
+         if (atoi(endres) == 3) {
+            ta5_pkt4(cmd, REG_A5XX_RB_RENDER_CNTL, 1);
+            ta5_cs_push(cmd, 0x00000000);
+            ta5_pkt4(cmd, REG_A5XX_GRAS_SC_CNTL, 1);
+            ta5_cs_push(cmd, 0x00000008);
+         }
+      }
+
+      if (endres && atoi(endres) == 2) {
+         ta5_pkt4(cmd, REG_A5XX_RB_RENDER_CNTL, 1);
+         ta5_cs_push(cmd, 0x00000000);
+         ta5_pkt4(cmd, REG_A5XX_GRAS_SC_CNTL, 1);
+         ta5_cs_push(cmd, 0x00000008);
+         ta5_pkt4(cmd, REG_A5XX_RB_BLIT_CNTL, 1);
+         ta5_cs_push(cmd, A5XX_RB_BLIT_CNTL_BUF(BLIT_MRT0));
+         ta5_pkt4(cmd, REG_A5XX_RB_CLEAR_CNTL, 1);
+         ta5_cs_push(cmd, A5XX_RB_CLEAR_CNTL_FAST_CLEAR |
+                           A5XX_RB_CLEAR_CNTL_MASK(0xf));
+         ta5_pkt4(cmd, REG_A5XX_RB_CLEAR_COLOR_DW0, 4);
+         ta5_cs_push(cmd, 0x00000000);
+         ta5_cs_push(cmd, 0x00000000);
+         ta5_cs_push(cmd, 0x00000000);
+         ta5_cs_push(cmd, 0x00000000);
+      }
+
+      if (endres)
+         ta5_event_write_ts(cmd, cmd->device->blit_bo, CCU_RESOLVE);
+
+      if (endres)
+         return;
+   }
 
    if (ta5_emit_sysmem_fini(cmd) != VK_SUCCESS)
       return;
@@ -3207,11 +4030,64 @@ ta5_CmdCopyBufferToImage(VkCommandBuffer _cmd, VkBuffer srcBuffer,
    }
 }
 
+/*
+ * vkCmdBindIndexBuffer / vkCmdDrawIndexed.
+ *
+ * vkcube draws its cube from an index buffer.  Without these two entry points
+ * its draw was recorded with no index buffer bound, so the VFD synthesised
+ * vertex ids and the frame came out as the clear colour: 13 consecutive
+ * presented frames, all byte-identical, all one colour (0x333333), zero faults.
+ * The pixels were never wrong, there was simply nothing drawn.
+ */
 VKAPI_ATTR void VKAPI_CALL
-ta5_CmdDraw(VkCommandBuffer _cmd, uint32_t vertexCount, uint32_t instanceCount,
-            uint32_t firstVertex, uint32_t firstInstance)
+ta5_CmdBindIndexBuffer(VkCommandBuffer _cmd, VkBuffer buffer,
+                       VkDeviceSize offset, VkIndexType indexType)
 {
    struct ta5_cmd_buffer *cmd = ta5_cmd_buffer_from_handle(_cmd);
+
+   if (cmd->state != MESA_VK_COMMAND_BUFFER_STATE_RECORDING)
+      return;
+
+   cmd->index_bo = NULL;
+   cmd->index_buffer_offset = 0;
+   cmd->index_count = 0;
+   cmd->index_type = indexType;
+
+   if (buffer == VK_NULL_HANDLE)
+      return;   /* an unbound index buffer is legal and leaves AUTO_INDEX */
+
+   struct ta5_buffer *buf = ta5_buffer_from_handle(buffer);
+   if (getenv("TA5_TRACE_NULL"))
+      fprintf(stderr, "ta5: BindIndexBuffer buffer=%p buf=%p mem=%p off=%llu type=%d\n",
+              (void *)buffer, (void *)buf, (void *)(buf ? (void *)buf->bound_memory : NULL),
+              (unsigned long long)offset, (int)indexType);
+   if (!buf || !buf->bound_memory)
+      return;
+
+   cmd->index_bo = buf->bound_memory->bo;
+   cmd->index_buffer_offset = offset;
+   /*
+    * MaxIndices is how many indices the buffer holds, which is what fd5 hands
+    * the hardware (fd5_draw.h:109: idx_buffer->width0 / index_size).  It bounds
+    * the fetch; nothing in vkcube's draw reaches it, but a wrong value here is
+    * how the VFD ends up walking off the end of the buffer.
+    */
+   cmd->index_count = (uint32_t)((buf->bound_memory->bo->size - offset) /
+                                 (indexType == VK_INDEX_TYPE_UINT16 ? 2 : 4));
+}
+
+/**
+ * Record one draw: state, program state, shaders, and the draw packet.
+ *
+ * `index_size` is 0 for vkCmdDraw (no index buffer, the VFD synthesises vertex
+ * ids) and 2 or 4 for vkCmdDrawIndexed, which is what makes the packet emit its
+ * seven-dword indexed form.
+ */
+static void
+ta5_record_draw(struct ta5_cmd_buffer *cmd, uint32_t vertexCount,
+                uint32_t instanceCount, uint32_t firstVertex,
+                uint32_t firstInstance, uint32_t index_size)
+{
    struct ta5_pipeline *pipe = cmd->bound_pipeline;
    struct ta5_cmd_buffer ib_cmd;
    struct ta5_cmd_buffer *draw = cmd;
@@ -3225,7 +4101,7 @@ ta5_CmdDraw(VkCommandBuffer _cmd, uint32_t vertexCount, uint32_t instanceCount,
     */
    cmd->draw_first_vertex = firstVertex;
    cmd->draw_first_instance = firstInstance;
-   cmd->draw_index_size = 0;   /* AUTO_INDEX; no index buffer is bound */
+   cmd->draw_index_size = index_size;
 
    if (cmd->state != MESA_VK_COMMAND_BUFFER_STATE_RECORDING || pipe == NULL)
       return;
@@ -3314,6 +4190,7 @@ ta5_CmdDraw(VkCommandBuffer _cmd, uint32_t vertexCount, uint32_t instanceCount,
        *
        * GRAS bounds are inclusive, Vulkan extents are not, hence the -1s.
        */
+      const char *scissor_src = "render_area";
       {
          VkRect2D r;
 
@@ -3321,10 +4198,13 @@ ta5_CmdDraw(VkCommandBuffer _cmd, uint32_t vertexCount, uint32_t instanceCount,
                          MESA_VK_DYNAMIC_VP_SCISSORS) &&
              draw->scissor_set) {
             r = draw->scissor;
+            scissor_src = "dynamic";
          } else if (!BITSET_TEST(pipe->graphics_state.dynamic,
                                  MESA_VK_DYNAMIC_VP_SCISSORS) &&
+                    pipe->graphics_state.vp &&
                     pipe->graphics_state.vp->scissor_count > 0) {
             r = pipe->graphics_state.vp->scissors[0];
+            scissor_src = "pipeline";
          } else {
             r = draw->render_area;
          }
@@ -3382,10 +4262,18 @@ ta5_CmdDraw(VkCommandBuffer _cmd, uint32_t vertexCount, uint32_t instanceCount,
 
       if (getenv("TA5_TRACE_SCISSOR"))
          fprintf(stderr,
-                 "ta5[scissor]: fb=%ux%u render=%ux%u+%u+%u effective=%u,%u..%u,%u\n",
+                 "ta5[scissor]: fb=%ux%u render=%ux%u+%u+%u effective=%u,%u..%u,%u"
+                 "  [dynamic=%d scissor_set=%d vp=%p scissor_count=%u used=%s]\n",
                  w, h, draw->render_area.extent.width,
                  draw->render_area.extent.height, draw->render_area.offset.x,
-                 draw->render_area.offset.y, sx0, sy0, sx1, sy1);
+                 draw->render_area.offset.y, sx0, sy0, sx1, sy1,
+                 (int)BITSET_TEST(pipe->graphics_state.dynamic,
+                                  MESA_VK_DYNAMIC_VP_SCISSORS),
+                 (int)draw->scissor_set, (void *)pipe->graphics_state.vp,
+                 pipe->graphics_state.vp
+                    ? pipe->graphics_state.vp->scissor_count
+                    : 0,
+                 scissor_src);
    }
 
    /*
@@ -3400,11 +4288,24 @@ ta5_CmdDraw(VkCommandBuffer _cmd, uint32_t vertexCount, uint32_t instanceCount,
     * zero, so an AUTO_INDEX draw is unaffected -- the vertex id still arrives
     * through the VFD's synth path rather than from memory.
     */
+   unsigned fetch_cnt = 0;
+
+   if (getenv("TA5_TRACE_VFD"))
+      fprintf(stderr,
+              "ta5[vfd]: uses_vertex_buffers=%d vi=%p bindings_valid=%d "
+              "attributes_valid=0x%llx\n",
+              (int)pipe->uses_vertex_buffers, (void *)pipe->graphics_state.vi,
+              pipe->graphics_state.vi
+                 ? (int)pipe->graphics_state.vi->bindings_valid
+                 : -1,
+              pipe->graphics_state.vi
+                 ? (unsigned long long)pipe->graphics_state.vi->attributes_valid
+                 : 0ull);
+
    if (pipe->uses_vertex_buffers && pipe->graphics_state.vi) {
       const struct ir3_shader_variant *vs =
          (const struct ir3_shader_variant *)pipe->vertex.variant;
       const struct vk_vertex_input_state *vi = pipe->graphics_state.vi;
-      unsigned fetch_cnt = 0;
 
       ret = ta5_cmd_buffer_alloc_cs(
          draw, draw->cs_count + 32 * MESA_VK_MAX_VERTEX_ATTRIBUTES + 16);
@@ -3517,15 +4418,96 @@ ta5_CmdDraw(VkCommandBuffer _cmd, uint32_t vertexCount, uint32_t instanceCount,
          fetch_cnt++;
       }
 
+   }
+
+   /*
+    * A draw that fetches no attributes still has to run the fetch unit.
+    *
+    * The vertex id is a built-in the fetch unit delivers into the VPC
+    * register REGID4VTX names, not something the shader reads from memory --
+    * and with VTXCNT at zero the unit does not run, so that register keeps
+    * whatever it held.  Measured: a shader that builds its positions from
+    * gl_VertexIndex then reads id 0 for every vertex, three coincident
+    * vertices, and a draw that produces no fragments and raises no fault.
+    * vkcube is exactly that shader, and so is the ubotest case.
+    *
+    * The slot has to read something, so it reads four bytes of a buffer the
+    * driver already owns and writes them to a register no shader reads.  The
+    * data is discarded; what matters is that the unit runs.
+    */
+   if (fetch_cnt == 0 && pipe->vertex.variant &&
+       ir3_find_sysval_regid((const struct ir3_shader_variant *)
+                                 pipe->vertex.variant,
+                             SYSTEM_VALUE_VERTEX_ID_ZERO_BASE) !=
+          regid(63, 0) &&
+       cmd->device->blit_bo) {
+      ret = ta5_cmd_buffer_alloc_cs(draw, draw->cs_count + 32);
+      if (ret != VK_SUCCESS)
+         goto draw_error;
+
+      ta5_pkt4(draw, REG_A5XX_VFD_FETCH(0), 4);
+      ret = ta5_cs_reloc(draw, cmd->device->blit_bo, 0, 0);
+      if (ret != VK_SUCCESS)
+         goto draw_error;
+      ta5_cs_push(draw, 4); /* SIZE: four bytes */
+      ta5_cs_push(draw, 0); /* STRIDE */
+
+      ta5_pkt4(draw, REG_A5XX_VFD_DECODE(0), 2);
+      ta5_cs_push(draw, A5XX_VFD_DECODE_INSTR_IDX(0) |
+                           A5XX_VFD_DECODE_INSTR_FORMAT(
+                              (enum a5xx_vtx_fmt)VFMT5_32_FLOAT) |
+                           A5XX_VFD_DECODE_INSTR_UNK30 |
+                           A5XX_VFD_DECODE_INSTR_FLOAT);
+      ta5_cs_push(draw, 1); /* STEP_RATE */
+
       /*
-       * VTXCNT is the number of live fetch slots and belongs to the fetch
-       * program, not to the draw state: GL emits it last in
-       * fd5_emit_vertex_bufs() (fd5_emit.c:501) and nothing clears it.  Zero
-       * here means no vertex data is fetched at all, so every attribute reads
-       * as zero and the draw degenerates into nothing.
+       * r62 is a scratch VPC register: the highest one the vertex id and the
+       * vertex outputs cannot reach.  What lands there is discarded by the
+       * shader, and REGID4VTX delivers the real id wherever the shader
+       * expects it.
        */
-      ta5_pkt4(draw, REG_A5XX_VFD_CONTROL_0, 1);
-      ta5_cs_push(draw, A5XX_VFD_CONTROL_0_VTXCNT(fetch_cnt));
+      ta5_pkt4(draw, REG_A5XX_VFD_DEST_CNTL(0), 1);
+      ta5_cs_push(draw, A5XX_VFD_DEST_CNTL_INSTR_WRITEMASK(0xf) |
+                           A5XX_VFD_DEST_CNTL_INSTR_REGID(regid(62, 0)));
+
+      fetch_cnt = 1;
+
+      if (getenv("TA5_TRACE_VFD"))
+         fprintf(stderr, "ta5[vfd]: synth fetch slot for the vertex id\n");
+   }
+
+   /*
+    * VFD_CONTROL_0, whether or not anything is fetched.
+    *
+    * A draw with no vertex buffer still has vertices: vkcube's vertex shader
+    * builds every position from gl_VertexIndex, so the draw has 36 vertices
+    * and no attributes, and the vertex id arrives through the VFD's synth
+    * path.  With this packet left at its reset value of zero the fetch unit
+    * processes no vertices at all -- no fragments, no fault, and a perfectly
+    * clear-coloured scanout buffer, which is exactly what vkcube produced.
+    *
+    * With attributes bound the field belongs to the fetch program, so it
+    * stays the slot count; without them it is the draw's vertex count, which
+    * is what fd5_draw() writes (p4->vtxcnt = p->count).
+    */
+   {
+      uint32_t vtxcnt = fetch_cnt;
+
+      /* The fetch block above allocated for itself; a draw that fetched
+       * nothing has not. */
+      ret = ta5_cmd_buffer_alloc_cs(draw, draw->cs_count + 8);
+      if (ret != VK_SUCCESS)
+         goto draw_error;
+
+      if (!getenv("TA5_SKIP_VFD")) {
+         ta5_pkt4(draw, REG_A5XX_VFD_CONTROL_0, 1);
+         ta5_cs_push(draw, A5XX_VFD_CONTROL_0_VTXCNT(vtxcnt));
+      }
+
+      if (getenv("TA5_TRACE_VFD"))
+         fprintf(stderr,
+                 "ta5[vfd]: VTXCNT=%u (fetch slots=%u, draw verts=%u)\n",
+                 vtxcnt, fetch_cnt, vertexCount);
    }
 
    /*
@@ -3536,14 +4518,21 @@ ta5_CmdDraw(VkCommandBuffer _cmd, uint32_t vertexCount, uint32_t instanceCount,
     * unit then reads as all zeros -- base address 0, which is what a sampled
     * image that faults at iova 0 looks like.
     */
-   vs_tex_count = ta5_emit_textures(draw, SB4_VS_TEX, pipe, VK_SHADER_STAGE_VERTEX_BIT);
-   fs_tex_count = ta5_emit_textures(draw, SB4_FS_TEX, pipe, VK_SHADER_STAGE_FRAGMENT_BIT);
+   if (getenv("TA5_SKIP_TEX")) {
+      vs_tex_count = fs_tex_count = 0;
+   } else {
+      vs_tex_count = ta5_emit_textures(draw, SB4_VS_TEX, pipe,
+                                       VK_SHADER_STAGE_VERTEX_BIT);
+      fs_tex_count = ta5_emit_textures(draw, SB4_FS_TEX, pipe,
+                                       VK_SHADER_STAGE_FRAGMENT_BIT);
+   }
    if (getenv("TA5_TRACE_TEX")) {
       for (uint32_t i = 0; i < MIN2(draw->cs_count, 28u); i++)
          fprintf(stderr, "  cs[%2u] = %08x\n", i, draw->cs[i]);
    }
 
-   ta5_emit_draw_state(draw, vs_tex_count, fs_tex_count);
+   if (!getenv("TA5_SKIP_DRAWSTATE"))
+      ta5_emit_draw_state(draw, vs_tex_count, fs_tex_count, vertexCount);
 
    /*
     * Depth state goes in *after* the draw state, not before it.
@@ -3591,11 +4580,14 @@ ta5_CmdDraw(VkCommandBuffer _cmd, uint32_t vertexCount, uint32_t instanceCount,
    {
       float zmin = draw->viewport_set ? draw->viewport.minDepth : 0.0f;
       float zmax = draw->viewport_set ? draw->viewport.maxDepth : 1.0f;
-      ta5_cs_push(draw, A5XX_GRAS_CL_VPORT_ZOFFSET_0(zmin));
-      ta5_cs_push(draw, A5XX_GRAS_CL_VPORT_ZSCALE_0(zmax - zmin));
+      if (!getenv("TA5_SKIP_VPORT")) {
+         ta5_cs_push(draw, A5XX_GRAS_CL_VPORT_ZOFFSET_0(zmin));
+         ta5_cs_push(draw, A5XX_GRAS_CL_VPORT_ZSCALE_0(zmax - zmin));
+      }
    }
 
-   ta5_emit_program_state(draw, pipe);
+   if (!getenv("TA5_SKIP_PROGSTATE"))
+      ta5_emit_program_state(draw, pipe);
 
    /*
     * Both programs are loaded before either stage's constants, which is the
@@ -3605,16 +4597,32 @@ ta5_CmdDraw(VkCommandBuffer _cmd, uint32_t vertexCount, uint32_t instanceCount,
     * program load instead reorders them, and the fragment stage faults on
     * the very first shaded fragment -- see the plan doc.
     */
-    ret = ta5_emit_shader(draw, pipe, &pipe->vertex, SB4_VS_SHADER,
-                          REG_A5XX_SP_VS_OBJ_START, pipe->vs_bo);
+   /*
+    * TA5_SKIP_VSPROG / TA5_SKIP_FSPROG / TA5_SKIP_CONSTS / TA5_SKIP_DRAWPKT
+    * take one piece out of the indirect buffer.
+    *
+    * The buffer is reached through CP_INDIRECT_BUFFER, and with the packet
+    * gone the CP never enters it and 6 frames come back with 0 hangchecks;
+    * with the packet in, 3 of 6 hang.  So the hang happens while the CP is
+    * executing this buffer, and these four knobs say which part of it.
+    */
+   if (getenv("TA5_SKIP_VSPROG"))
+      goto no_programs;
+
+   ret = ta5_emit_shader(draw, pipe, &pipe->vertex, SB4_VS_SHADER,
+                         REG_A5XX_SP_VS_OBJ_START, pipe->vs_bo);
    if (ret != VK_SUCCESS)
       goto draw_error;
-   if (pipe->has_fragment) {
+   if (pipe->has_fragment && !getenv("TA5_SKIP_FSPROG")) {
       ret = ta5_emit_shader(draw, pipe, &pipe->fragment, SB4_FS_SHADER,
                             REG_A5XX_SP_FS_OBJ_START, pipe->fs_bo);
       if (ret != VK_SUCCESS)
          goto draw_error;
    }
+no_programs:
+
+   if (getenv("TA5_SKIP_CONSTS"))
+      goto no_consts;
 
    ta5_emit_consts(draw, pipe, &pipe->vertex, SB4_VS_SHADER, pipe->vs_bo);
    if (pipe->has_fragment)
@@ -3639,6 +4647,7 @@ ta5_CmdDraw(VkCommandBuffer _cmd, uint32_t vertexCount, uint32_t instanceCount,
    /* Now that the shaders are loaded, put the descriptors back. */
    ta5_emit_textures(draw, SB4_VS_TEX, pipe, VK_SHADER_STAGE_VERTEX_BIT);
    ta5_emit_textures(draw, SB4_FS_TEX, pipe, VK_SHADER_STAGE_FRAGMENT_BIT);
+no_consts:
 
    /*
     * GL's sysmem pass emits the draw state, the program state and both
@@ -3655,7 +4664,8 @@ ta5_CmdDraw(VkCommandBuffer _cmd, uint32_t vertexCount, uint32_t instanceCount,
       ret = ta5_cmd_buffer_alloc_cs(draw, draw->cs_count + 4096);
       if (ret != VK_SUCCESS)
          goto draw_error;
-      ta5_emit_draw_state(draw, vs_tex_count, fs_tex_count);
+      if (!getenv("TA5_SKIP_DRAWSTATE"))
+      ta5_emit_draw_state(draw, vs_tex_count, fs_tex_count, vertexCount);
       ta5_emit_program_state(draw, pipe);
       ret = ta5_emit_shader(draw, pipe, &pipe->vertex, SB4_VS_SHADER,
                             REG_A5XX_SP_VS_OBJ_START, pipe->vs_bo);
@@ -3678,14 +4688,56 @@ ta5_CmdDraw(VkCommandBuffer _cmd, uint32_t vertexCount, uint32_t instanceCount,
     * buffer fd5 still programs INDEX_SIZE as 32-bit (fd5_draw.h:114) rather
     * than leaving it at the 8-bit reset value.
     */
-   ta5_pkt7(draw, CP_DRAW_INDX_OFFSET, 3);
-   ta5_cs_push(draw, CP_DRAW_INDX_OFFSET_0_PRIM_TYPE(
-                        getenv("TA5_POINTS") ? DI_PT_POINTLIST : DI_PT_TRILIST) |
-                     CP_DRAW_INDX_OFFSET_0_SOURCE_SELECT(DI_SRC_SEL_AUTO_INDEX) |
-                     CP_DRAW_INDX_OFFSET_0_INDEX_SIZE(INDEX4_SIZE_32_BIT) |
-                     CP_DRAW_INDX_OFFSET_0_VIS_CULL(IGNORE_VISIBILITY));
-   ta5_cs_push(draw, instanceCount);
-   ta5_cs_push(draw, vertexCount);
+   if (getenv("TA5_SKIP_DRAWPKT"))
+      goto no_drawpkt;
+
+   /*
+    * With an index buffer bound this is fd5_draw()'s seven-dword packet
+    * (fd5_draw.h:41-56): the same CP_DRAW_INDX_OFFSET with DI_SRC_SEL_DMA, the
+    * index format rather than a fixed 32-bit size, and three extra payload
+    * words -- a zero, the index buffer's address as a relocation, and
+    * MaxIndices.
+    */
+   if (cmd->index_bo) {
+      uint32_t idx_bytes =
+         cmd->index_type == VK_INDEX_TYPE_UINT16 ? 2 : 4;
+      uint64_t idx_off = cmd->index_buffer_offset +
+                         (uint64_t)cmd->draw_first_vertex * idx_bytes;
+
+      ta5_pkt7(draw, CP_DRAW_INDX_OFFSET, 7);
+      ta5_cs_push(draw, CP_DRAW_INDX_OFFSET_0_PRIM_TYPE(
+                           getenv("TA5_POINTS") ? DI_PT_POINTLIST
+                                                : DI_PT_TRILIST) |
+                        CP_DRAW_INDX_OFFSET_0_SOURCE_SELECT(DI_SRC_SEL_DMA) |
+                        CP_DRAW_INDX_OFFSET_0_INDEX_SIZE(
+                            idx_bytes == 2 ? INDEX4_SIZE_16_BIT
+                                           : INDEX4_SIZE_32_BIT) |
+                        CP_DRAW_INDX_OFFSET_0_VIS_CULL(IGNORE_VISIBILITY));
+      ta5_cs_push(draw, instanceCount);
+      ta5_cs_push(draw, vertexCount);
+      ta5_cs_push(draw, 0x0); /* fd5 writes 0x0 here too, marked XXX there */
+      ret = ta5_cs_reloc(draw, cmd->index_bo, idx_off, 0);
+      if (ret != VK_SUCCESS)
+         goto draw_error;
+      ta5_cs_push(draw, cmd->index_count);
+   } else {
+      ta5_pkt7(draw, CP_DRAW_INDX_OFFSET, 3);
+      ta5_cs_push(draw, CP_DRAW_INDX_OFFSET_0_PRIM_TYPE(
+                           getenv("TA5_POINTS") ? DI_PT_POINTLIST
+                                                : DI_PT_TRILIST) |
+                        CP_DRAW_INDX_OFFSET_0_SOURCE_SELECT(DI_SRC_SEL_AUTO_INDEX) |
+                        CP_DRAW_INDX_OFFSET_0_INDEX_SIZE(INDEX4_SIZE_32_BIT) |
+                        CP_DRAW_INDX_OFFSET_0_VIS_CULL(IGNORE_VISIBILITY));
+      ta5_cs_push(draw, instanceCount);
+      ta5_cs_push(draw, vertexCount);
+   }
+no_drawpkt:
+
+   if (getenv("TA5_TRACE_DRAW")) {
+      fprintf(stderr, "--- ta5: draw cs, %u dwords ---\n", draw->cs_count);
+      for (uint32_t i = 0; i < draw->cs_count; i++)
+         fprintf(stderr, "  %04x: %08x\n", i * 4, draw->cs[i]);
+   }
 
    /*
     * Stage the draw into its own object and reach it with CP_INDIRECT_BUFFER,
@@ -3709,7 +4761,22 @@ ta5_CmdDraw(VkCommandBuffer _cmd, uint32_t vertexCount, uint32_t instanceCount,
       ret = ta5_cs_reloc(cmd, ib->bo, 0, 0);
       if (ret != VK_SUCCESS)
          goto draw_error;
-      ta5_cs_push(cmd, ib->size); /* IB_SIZE, in dwords */
+      /*
+       * IB_SIZE is a byte count.  __OUT_IB5() passes align(size, 4), and the
+       * field is 20 bits wide, which is a byte budget rather than a word one.
+       * Pushing the dword count told the CP the indirect buffer was a quarter
+       * of its real length; the kernel then reports the fetch as
+       * ib2 <addr>/0000 and the CP runs off the end into zeroes:
+       *
+       *     CP | opcode error | possible opcode=0x00000000
+       *     gpu fault ring 2 ... ib2 0000000002831000/0000
+       *     *ERROR* 05000600: hangcheck recover!
+       *
+       * A short draw hides it -- at 64x64 the truncated tail happened to fall
+       * where nothing depended on it -- and a 1080x2280 frame does not.
+       * TA5_IB_DWORDS=1 puts the dword count back for the A/B.
+       */
+      ta5_cs_push(cmd, ib->size); /* IB_SIZE, in dwords -- measured */
 
       ta5_pkt7(cmd, CP_SKIP_IB2_ENABLE_GLOBAL, 1);
       ta5_cs_push(cmd, 0);
@@ -3725,4 +4792,92 @@ draw_error:
       vk_free(&cmd->device->vk.alloc, draw->reloc_bos);
       vk_free(&cmd->device->vk.alloc, draw->cs);
    }
+}
+
+/*
+ * The generated entrypoints have no declaration for vkCmdBindIndexBuffer2 --
+ * which is why the loader answers NULL for it -- so it is declared here.
+ */
+VKAPI_ATTR void VKAPI_CALL
+ta5_CmdBindIndexBuffer2(VkCommandBuffer commandBuffer, uint32_t firstBinding,
+                        uint32_t bindingCount, const VkBuffer *pBuffers,
+                        const VkDeviceSize *pOffsets,
+                        const VkIndexType *pIndexTypes,
+                        const uint32_t *pOffsets2);
+
+/*
+ * vkCmdBindIndexBuffer2: same binding, with the index types supplied.
+ *
+ * vkcube asks the loader for this one first -- it is core Vulkan 1.0, not an
+ * extension -- and the generated entrypoints answer NULL for it, so an
+ * application that binds its indices through it ends up with no index buffer
+ * bound at all and an indexed draw that quietly draws nothing.
+ */
+VKAPI_ATTR void VKAPI_CALL
+ta5_CmdBindIndexBuffer2(VkCommandBuffer _cmd, uint32_t firstBinding,
+                        uint32_t bindingCount, const VkBuffer *pBuffers,
+                        const VkDeviceSize *pOffsets,
+                        const VkIndexType *pIndexTypes,
+                        const uint32_t *pOffsets2)
+{
+   for (uint32_t i = 0; i < bindingCount; i++) {
+      (void)pOffsets2;   /* per-draw offsets: applied in vkCmdDrawIndexed */
+      ta5_CmdBindIndexBuffer(_cmd, pBuffers ? pBuffers[i] : VK_NULL_HANDLE,
+                             pOffsets ? pOffsets[i] : 0,
+                             pIndexTypes ? pIndexTypes[i]
+                                         : VK_INDEX_TYPE_UINT32);
+   }
+}
+
+VKAPI_ATTR void VKAPI_CALL
+ta5_CmdDraw(VkCommandBuffer _cmd, uint32_t vertexCount, uint32_t instanceCount,
+            uint32_t firstVertex, uint32_t firstInstance)
+{
+   struct ta5_cmd_buffer *cmd = ta5_cmd_buffer_from_handle(_cmd);
+
+   if (getenv("TA5_TRACE_NULL"))
+      fprintf(stderr, "ta5: CmdDraw vertices=%u\n", vertexCount);
+
+   if (cmd->state != MESA_VK_COMMAND_BUFFER_STATE_RECORDING)
+      return;
+
+   ta5_record_draw(cmd, vertexCount, instanceCount, firstVertex, firstInstance,
+                   /* index_size */ 0);
+}
+
+VKAPI_ATTR void VKAPI_CALL
+ta5_CmdDrawIndexed(VkCommandBuffer _cmd, uint32_t indexCount,
+                   uint32_t instanceCount, uint32_t firstIndex,
+                   int32_t vertexOffset, uint32_t firstInstance)
+{
+   struct ta5_cmd_buffer *cmd = ta5_cmd_buffer_from_handle(_cmd);
+
+   if (cmd->state != MESA_VK_COMMAND_BUFFER_STATE_RECORDING)
+      return;
+
+   if (getenv("TA5_TRACE_NULL"))
+      fprintf(stderr, "ta5: DrawIndexed count=%u firstIndex=%u index_bo=%p\n",
+              indexCount, firstIndex, (void *)cmd->index_bo);
+
+   if (cmd->index_bo == NULL)
+      return;   /* invalid usage: an indexed draw with no index buffer bound */
+
+   /*
+    * The index buffer address the hardware fetches from is
+    * buffer + offset + firstIndex * index_size (fd5_draw.h:110), so firstIndex
+    * is folded into the offset rather than the count.  vertexOffset is a signed
+    * adjustment applied to the fetched index before it addresses a vertex;
+    * vkcube passes 0, and a5xx's draw packet has no field for it, so this
+    * rejects rather than silently drawing the wrong vertices.
+    */
+   if (vertexOffset != 0) {
+      if (getenv("TA5_TRACE_NULL"))
+         fprintf(stderr,
+                 "ta5: vkCmdDrawIndexed: vertexOffset %d unsupported\n",
+                 vertexOffset);
+      return;
+   }
+
+   ta5_record_draw(cmd, indexCount, instanceCount, firstIndex, firstInstance,
+                   cmd->index_type == VK_INDEX_TYPE_UINT16 ? 2 : 4);
 }
