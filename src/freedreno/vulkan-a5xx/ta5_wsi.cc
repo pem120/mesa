@@ -637,6 +637,155 @@ ta5_GetPhysicalDeviceSurfacePresentModesKHR(VkPhysicalDevice physicalDevice,
    return VK_SUCCESS;
 }
 
+/*
+ * VK_KHR_get_surface_capabilities2: the same three questions as the
+ * 1-variants, asked through structures that carry a pNext chain.  The
+ * answers are the ones above, so both entry points are wrappers.
+ *
+ * They have to exist, and being absent was not a tolerable gap.  The
+ * runtime resolves physical-device names through trampolines that are
+ * handed out whenever the extension is enabled, implemented or not: the
+ * loader took vk_tramp_GetPhysicalDeviceSurfaceFormats2KHR, called it, and
+ * it jumped through the NULL slot where the missing implementation would
+ * have been.  vulkaninfo died jumping to address 0 right after creating
+ * its device; vkgears died the same way.  vkcube never noticed because it
+ * asks the 1-variants.
+ */
+VKAPI_ATTR VkResult VKAPI_CALL
+ta5_GetPhysicalDeviceSurfaceCapabilities2KHR(
+   VkPhysicalDevice physicalDevice,
+   const VkPhysicalDeviceSurfaceInfo2KHR *pSurfaceInfo,
+   VkSurfaceCapabilities2KHR *pSurfaceCapabilities)
+{
+   if (!pSurfaceInfo || !pSurfaceInfo->surface || !pSurfaceCapabilities)
+      return VK_ERROR_INITIALIZATION_FAILED;
+
+   VkResult result = ta5_GetPhysicalDeviceSurfaceCapabilitiesKHR(
+      physicalDevice, pSurfaceInfo->surface,
+      &pSurfaceCapabilities->surfaceCapabilities);
+
+   /* A chained-in structure is a query the caller wants answered.  The
+    * only one this driver recognises is protected memory, and a5xx has
+    * none: answer it explicitly rather than leaving whatever the caller
+    * initialised it to. */
+   for (VkBaseOutStructure *out =
+           (VkBaseOutStructure *)pSurfaceCapabilities->pNext;
+        out != NULL; out = out->pNext) {
+      if (out->sType == VK_STRUCTURE_TYPE_SURFACE_PROTECTED_CAPABILITIES_KHR) {
+         ((VkSurfaceProtectedCapabilitiesKHR *)out)->supportsProtected =
+            VK_FALSE;
+      }
+   }
+
+   return result;
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL
+ta5_GetPhysicalDeviceSurfaceFormats2KHR(
+   VkPhysicalDevice physicalDevice,
+   const VkPhysicalDeviceSurfaceInfo2KHR *pSurfaceInfo,
+   uint32_t *pSurfaceFormatCount, VkSurfaceFormat2KHR *pSurfaceFormats)
+{
+   if (!pSurfaceFormatCount)
+      return VK_ERROR_INITIALIZATION_FAILED;
+
+   /* The same single format as the 1-variant; see the comment there. */
+   if (!pSurfaceFormats) {
+      *pSurfaceFormatCount = 1;
+      return VK_SUCCESS;
+   }
+
+   if (*pSurfaceFormatCount < 1) {
+      *pSurfaceFormatCount = 1;
+      return VK_INCOMPLETE;
+   }
+
+   pSurfaceFormats[0].sType = VK_STRUCTURE_TYPE_SURFACE_FORMAT_2_KHR;
+   pSurfaceFormats[0].surfaceFormat.format = VK_FORMAT_R8G8B8A8_UNORM;
+   pSurfaceFormats[0].surfaceFormat.colorSpace =
+      VK_COLOR_SPACE_SRGB_NONLINEAR_KHR;
+   (void)physicalDevice;
+   (void)pSurfaceInfo;
+   *pSurfaceFormatCount = 1;
+   return VK_SUCCESS;
+}
+
+/*
+ * VK_KHR_device_group's present queries.  The group is one device, so every
+ * answer is the single-device answer: device 0 is present everywhere, the
+ * only present mode is LOCAL, and the only present rectangle is the surface
+ * itself.
+ *
+ * They have to exist for the same reason as the get_surface_capabilities2
+ * wrappers above.  vkGetDeviceGroupPresentCapabilitiesKHR belongs to an
+ * extension the driver advertises, and it has no core-promoted alias to hide
+ * behind: the loader asked for it, got the trampoline, and jumped through
+ * the NULL slot -- vulkaninfo's full dump died there right after creating
+ * the device it uses to check presentation support.
+ */
+VKAPI_ATTR VkResult VKAPI_CALL
+ta5_GetDeviceGroupPresentCapabilitiesKHR(
+   VkDevice device, VkDeviceGroupPresentCapabilitiesKHR *pCapabilities)
+{
+   if (!pCapabilities)
+      return VK_ERROR_INITIALIZATION_FAILED;
+
+   pCapabilities->sType = VK_STRUCTURE_TYPE_DEVICE_GROUP_PRESENT_CAPABILITIES_KHR;
+   pCapabilities->pNext = NULL;
+   for (uint32_t i = 0; i < VK_MAX_DEVICE_GROUP_SIZE; i++)
+      pCapabilities->presentMask[i] = i == 0 ? 1u : 0u;
+   pCapabilities->modes = VK_DEVICE_GROUP_PRESENT_MODE_LOCAL_BIT_KHR;
+   (void)device;
+   return VK_SUCCESS;
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL
+ta5_GetDeviceGroupSurfacePresentModesKHR(
+   VkDevice device, VkSurfaceKHR surface,
+   VkDeviceGroupPresentModeFlagsKHR *pModes)
+{
+   if (!pModes)
+      return VK_ERROR_INITIALIZATION_FAILED;
+
+   *pModes = VK_DEVICE_GROUP_PRESENT_MODE_LOCAL_BIT_KHR;
+   (void)device;
+   (void)surface;
+   return VK_SUCCESS;
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL
+ta5_GetPhysicalDevicePresentRectanglesKHR(
+   VkPhysicalDevice physicalDevice, VkSurfaceKHR surface,
+   uint32_t *pRectCount, VkRect2D *pRects)
+{
+   VkSurfaceCapabilitiesKHR caps;
+   VkResult result;
+
+   if (!pRectCount)
+      return VK_ERROR_INITIALIZATION_FAILED;
+
+   if (!pRects) {
+      *pRectCount = 1;
+      return VK_SUCCESS;
+   }
+
+   if (*pRectCount < 1) {
+      *pRectCount = 1;
+      return VK_INCOMPLETE;
+   }
+
+   result = ta5_GetPhysicalDeviceSurfaceCapabilitiesKHR(
+      physicalDevice, surface, &caps);
+   if (result != VK_SUCCESS)
+      return result;
+
+   pRects[0].offset.x = 0;
+   pRects[0].offset.y = 0;
+   pRects[0].extent = caps.currentExtent;
+   *pRectCount = 1;
+   return VK_SUCCESS;
+}
+
 /* ------------------------------------------------------------------ */
 /* Swapchains                                                          */
 /* ------------------------------------------------------------------ */
