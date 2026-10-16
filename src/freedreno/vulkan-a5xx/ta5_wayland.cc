@@ -405,6 +405,7 @@ ta5_CreateWaylandSurfaceKHR(VkInstance _instance,
    fprintf(stderr, "ta5[wl] create: configured=%d %ux%u\n",
            (int)surf->wl_configured, surf->wl_width, surf->wl_height);
    *pSurface = ta5_surface_to_handle(surf);
+
    return VK_SUCCESS;
 }
 
@@ -467,6 +468,7 @@ ta5_wayland_capabilities(struct ta5_surface *surf,
    pCaps->supportedUsageFlags = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
                                 VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
                                 VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+
    return VK_SUCCESS;
 }
 
@@ -482,6 +484,8 @@ ta5_wayland_capabilities(struct ta5_surface *surf,
  * loader_wayland_dispatch(), which acquire calls in the same place
  * (wsi_common_wayland.c:3043).
  */
+static void ta5_wayland_throttle(void);
+
 int
 ta5_wayland_acquire_dispatch(struct ta5_surface *surf, int timeout_ms,
                              bool *timed_out)
@@ -519,6 +523,55 @@ ta5_wayland_acquire_dispatch(struct ta5_surface *surf, int timeout_ms,
    if (wl_display_dispatch_pending(surf->wl_display) < 0)
       return -1;
    return 0;
+}
+
+/**
+ * Hold presents to one refresh interval apart.
+ *
+ * The frame callback is not a rate limit.  A compositor that is not
+ * compositing the surface -- which is what an occluded window looks like --
+ * releases callbacks immediately, and then `busy` never blocks anything:
+ * measured on an Adreno 506 under phosh with the busy flag in place and no cap
+ * here, vkcube managed 2,949 presents in 25 s, 118 a second, and the compositor
+ * died of the fault storm.  So pacing is a separate mechanism from buffer
+ * safety, and the two do not stand in for each other.
+ *
+ * Upstream has the same two layers and reaches for a refresh interval in the
+ * second: it paces against wp_presentation display time, defaulting to 60 Hz
+ * when it has not measured one (wsi_common_wayland.c:3134,
+ * `refresh_nsec = 16666666`), and notes that a frame callback alone leaves
+ * occluded surfaces un-throttled (:3483).
+ *
+ * We have no presentation feedback, so 60 Hz is the fallback interval rather
+ * than a measured one -- which is exactly what upstream falls back to.
+ * TA5_PRESENT_HZ=N overrides it; TA5_PRESENT_HZ=0 removes the cap, for A/B.
+ */
+static void
+ta5_wayland_throttle(void)
+{
+   static struct timespec last;
+   const char *hz_env = getenv("TA5_PRESENT_HZ");
+   long hz = hz_env ? strtol(hz_env, NULL, 0) : 60;
+   struct timespec now;
+   int64_t ns, min_ns;
+
+   if (hz <= 0)
+      return;
+   min_ns = 1000000000L / hz;
+
+   clock_gettime(CLOCK_MONOTONIC, &now);
+   ns = (int64_t)(now.tv_sec - last.tv_sec) * 1000000000 +
+        (now.tv_nsec - last.tv_nsec);
+   if (last.tv_sec != 0 && ns < min_ns) {
+      struct timespec delay;
+
+      delay.tv_sec = 0;
+      delay.tv_nsec = (long)(min_ns - ns);
+      nanosleep(&delay, NULL);
+      clock_gettime(CLOCK_MONOTONIC, &last);
+   } else {
+      last = now;
+   }
 }
 
 /*
@@ -673,6 +726,8 @@ ta5_wayland_present_shm(struct ta5_swapchain *sc, uint32_t index)
    /* The buffer is the image's, and stays until the swapchain dies. */
 
 
+   ta5_wayland_throttle();
+
    return VK_SUCCESS;
 }
 
@@ -774,6 +829,8 @@ ta5_wayland_present_drm(struct ta5_swapchain *sc, uint32_t index)
     * what makes it unavailable to the next acquire -- the throttle lives in
     * acquire now, not here. */
 
+   ta5_wayland_throttle();
+
    return VK_SUCCESS;
 }
 
@@ -832,6 +889,39 @@ ta5_wayland_present(struct ta5_swapchain *sc, uint32_t index)
        * create() skips a round trip and means the wl_buffer exists by the time
        * attach runs.
        */
+      if (getenv("TA5_TRACE_DMABUF")) {
+         const struct ta5_image_level *dl =
+            &img->image->levels[0];
+         unsigned long long need =
+            (unsigned long long)img->image->row_pitch * sc->extent.height;
+
+         fprintf(stderr,
+                 "ta5[wl] dmabuf: swapchain=%ux%u image=%ux%u level=%ux%u "
+                 "stride=%llu pitch(reg)=%llu bo_size=%u need=%llu "
+                 "modifier=0 fourcc=0x%x %s\n",
+                 sc->extent.width, sc->extent.height,
+                 img->image->extent.width, img->image->extent.height,
+                 dl->width, dl->height,
+                 (unsigned long long)img->image->row_pitch,
+                 (unsigned long long)dl->row_pitch, bo->size, need, fourcc,
+                 (bo->size < need) ? "*** TOO SMALL ***"
+                                   : (dl->row_pitch != img->image->row_pitch
+                                          ? "*** PITCH MISMATCH ***"
+                                          : "ok"));
+         {
+            /* What the *kernel* allocated, not what we asked for. */
+            uint64_t ksize = 0;
+
+            if (!ta5_gem_get_offset(sc->device, bo->handle,
+                                    DRM_MSM_GEM_INFO_SIZE, &ksize))
+               fprintf(stderr,
+                       "ta5[wl] dmabuf: kernel_size=%llu requested=%u %s\n",
+                       (unsigned long long)ksize, bo->size,
+                       ksize < need ? "*** KERNEL BUFFER TOO SMALL ***"
+                                    : (ksize != bo->size ? "(differs)" : ""));
+         }
+      }
+
       params = zwp_linux_dmabuf_v1_create_params(surf->wl_dmabuf);
       zwp_linux_buffer_params_v1_add(params, prime_fd, 0, 0,
                                      (uint32_t)img->image->row_pitch, 0, 0);
@@ -900,6 +990,8 @@ ta5_wayland_present(struct ta5_swapchain *sc, uint32_t index)
     * does, so the compositor decides the rate; a cap on top of that would only
     * add latency.
     */
+
+   ta5_wayland_throttle();
 
    return VK_SUCCESS;
 }
