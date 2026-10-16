@@ -60,6 +60,7 @@
 
 #include "xdg_shell-client-protocol.h"
 #include "linux_dmabuf-client-protocol.h"
+#include "wayland_drm-client-protocol.h"
 
 /* Set on the first present, so the stopgap rate limit has a reference. */
 static struct timespec ta5_last_present;
@@ -106,6 +107,17 @@ ta5_wl_global(void *data, struct wl_registry *registry, uint32_t name,
    } else if (strcmp(interface, wl_shm_interface.name) == 0) {
       surf->wl_shm = (struct wl_shm *)wl_registry_bind(
          registry, name, &wl_shm_interface, version < 1 ? version : 1);
+   } else if (strcmp(interface, wl_drm_interface.name) == 0) {
+      /*
+       * The same-device fast path, and what the GL implementation uses:
+       * buffers are handed over by GEM name instead of by fd.  phoc
+       * advertises it (v2), and importing by name is a different code path in
+       * the compositor's renderer from importing a dmabuf fd -- which is the
+       * A/B that separates "the compositor mishandles our import" from
+       * "something else".
+       */
+      surf->wl_drm = (struct wl_drm *)wl_registry_bind(
+         registry, name, &wl_drm_interface, version < 2 ? version : 2);
    } else if (strcmp(interface, xdg_wm_base_interface.name) == 0) {
       surf->wl_xdg_wm_base = (struct xdg_wm_base *)wl_registry_bind(
          registry, name, &xdg_wm_base_interface, version < 3 ? version : 3);
@@ -455,23 +467,72 @@ ta5_wayland_capabilities(struct ta5_surface *surf,
    return VK_SUCCESS;
 }
 
+/** Monotonic milliseconds, for the frame-callback bound. */
+static int64_t
+ta5_wayland_now_ms(void)
+{
+   struct timespec ts;
+
+   if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0)
+      return 0;
+   return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
 /**
  * Wait for the frame callback, with a bound.
  *
  * The callback is what makes this a FIFO present.  The bound is a backstop,
  * not pacing -- a compositor that has gone quiet should cost a second of
  * latency on the next frame, not wedge the application forever.
+ *
+ * The bound is on *elapsed time*, not on iterations.  It used to be
+ * `for (waits = 0; waits < 1000 && !done; waits++)` around a 1000 ms poll,
+ * which is sixteen minutes of blocking, not the second the comment promises.
+ * That is not hypothetical: a compositor withholds frame callbacks for an
+ * occluded surface, and then vkcube sits in poll() inside
+ * vkQueuePresentKHR with no presents and no error until it is killed.
+ * Measured on an Adreno 506 under phosh, gdb on the stalled process:
+ *
+ *     #3 ta5_wayland_wait_frame (ta5_wayland.cc:497)
+ *     #4 ta5_wayland_present    (ta5_wayland.cc:620)
+ *     #6 ta5_QueuePresentKHR    (ta5_wsi.cc:1142)
+ *
+ * A missed frame callback is the compositor saying "not yet"; the right
+ * response is to stop throttling and let the application carry on rendering,
+ * which is what a present without a callback costs us.
+ *
+ * TA5_FRAME_WAIT_MS overrides the bound; TA5_FRAME_WAIT_MS=-1 restores the
+ * old 1000-iteration loop so the two can be compared on the same binary.
  */
 static void
 ta5_wayland_wait_frame(struct ta5_surface *surf)
 {
+   const char *ms_env = getenv("TA5_FRAME_WAIT_MS");
+   long bound_ms = ms_env ? strtol(ms_env, NULL, 0) : 1000;
+   bool legacy = (bound_ms < 0);
+   int64_t deadline;
    int waits;
 
    surf->wl_frame_done = false;
 
-   for (waits = 0; waits < 1000 && !surf->wl_frame_done; waits++) {
+   deadline = ta5_wayland_now_ms() + (legacy ? 0 : bound_ms);
+
+   for (waits = 0; !surf->wl_frame_done; waits++) {
       struct pollfd pfd;
+      int timeout;
       int ret;
+
+      if (legacy) {
+         if (waits >= 1000)
+            return;
+         timeout = 1000;
+      } else {
+         int64_t left = deadline - ta5_wayland_now_ms();
+
+         if (left <= 0)
+            return;
+         timeout = (int)left;
+      }
 
       while (wl_display_prepare_read(surf->wl_display) != 0)
          if (wl_display_dispatch_pending(surf->wl_display) < 0)
@@ -482,7 +543,7 @@ ta5_wayland_wait_frame(struct ta5_surface *surf)
       pfd.events = POLLIN;
       pfd.revents = 0;
 
-      ret = poll(&pfd, 1, 1000);
+      ret = poll(&pfd, 1, timeout);
       if (ret <= 0) {
          wl_display_cancel_read(surf->wl_display);
          return;
@@ -652,6 +713,71 @@ ta5_wayland_swapchain_destroy(struct ta5_swapchain *sc)
    }
 }
 
+/**
+ * Present through wl_drm, by GEM name -- the GL implementation's import path.
+ *
+ * The name comes from DRM_IOCTL_GEM_FLINK on our render node, and the
+ * compositor resolves it on its own fd for the same device, so there is no
+ * dma-buf and no import-by-fd.  The formats are the same codes as
+ * linux-dmabuf's: wl_drm v2 dropped the old enum and passes DRM fourccs.
+ *
+ * The wl_buffer is cached per image exactly as the dmabuf path caches it.
+ */
+static VkResult
+ta5_wayland_present_drm(struct ta5_swapchain *sc, uint32_t index)
+{
+   struct ta5_surface *surf = sc->surface;
+   struct ta5_swapchain_image *img = &sc->images[index];
+   struct wl_buffer *buffer;
+   struct wl_callback *callback;
+   struct ta5_bo *bo = img->memory->bo;
+   uint32_t fourcc = (img->image->format == VK_FORMAT_B8G8R8A8_UNORM)
+                        ? DRM_FORMAT_ARGB8888
+                        : DRM_FORMAT_ABGR8888;
+   uint32_t stride = (uint32_t)img->image->row_pitch;
+
+   if (!surf->wl_drm)
+      return VK_ERROR_SURFACE_LOST_KHR;
+
+   if (!img->wl_buffer) {
+      struct drm_gem_flink flink = { .handle = bo->handle };
+
+      if (drmIoctl(sc->device->fd, DRM_IOCTL_GEM_FLINK, &flink))
+         return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+
+      img->wl_buffer = wl_drm_create_buffer(
+         surf->wl_drm, flink.name, sc->extent.width, sc->extent.height,
+         stride, fourcc);
+
+      if (!img->wl_buffer) {
+         wl_display_flush(surf->wl_display);
+         return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+      }
+   }
+
+   buffer = img->wl_buffer;
+
+   wl_surface_attach(surf->wl_surface, buffer, 0, 0);
+   wl_surface_damage_buffer(surf->wl_surface, 0, 0, sc->extent.width,
+                            sc->extent.height);
+
+   callback = wl_surface_frame(surf->wl_surface);
+   if (callback)
+      wl_callback_add_listener(callback, &ta5_wl_frame_listener, surf);
+
+   wl_surface_commit(surf->wl_surface);
+   wl_display_flush(surf->wl_display);
+
+   if (getenv("TA5_TRACE_WL"))
+      fprintf(stderr, "ta5[wl] drm present: %ux%u fourcc=0x%08x stride=%u\n",
+              sc->extent.width, sc->extent.height, fourcc, stride);
+
+   if (callback)
+      ta5_wayland_wait_frame(surf);
+
+   return VK_SUCCESS;
+}
+
 VkResult
 ta5_wayland_present(struct ta5_swapchain *sc, uint32_t index)
 {
@@ -660,13 +786,28 @@ ta5_wayland_present(struct ta5_swapchain *sc, uint32_t index)
    struct wl_buffer *buffer;
    struct wl_callback *callback;
    struct ta5_bo *bo = img->memory->bo;
-   uint32_t fourcc = 0;
+   /*
+    * The format is a property of the image, not of whether its wl_buffer
+    * already exists: the buffer is cached per image, so deriving fourcc
+    * inside the "create the buffer" branch left it 0 for every present after
+    * the first and the trace claimed a shm fallback that never happened.
+    */
+   uint32_t fourcc = (img->image->format == VK_FORMAT_B8G8R8A8_UNORM)
+                        ? DRM_FORMAT_ARGB8888
+                        : DRM_FORMAT_ABGR8888;
 
    if (!surf->wl_surface)
       return VK_ERROR_SURFACE_LOST_KHR;
 
    if (getenv("TA5_WL_SHM"))
       return ta5_wayland_present_shm(sc, index);
+
+   /*
+    * TA5_WL_DRM=1: present by GEM name through wl_drm, the path the GL
+    * implementation takes on this compositor.  Default is linux-dmabuf.
+    */
+   if (getenv("TA5_WL_DRM") && surf->wl_drm)
+      return ta5_wayland_present_drm(sc, index);
 
    if (!surf->wl_dmabuf)
       return VK_ERROR_SURFACE_LOST_KHR;
@@ -686,10 +827,6 @@ ta5_wayland_present(struct ta5_swapchain *sc, uint32_t index)
 
       if (drmPrimeHandleToFD(sc->device->fd, bo->handle, DRM_CLOEXEC, &prime_fd))
          return VK_ERROR_OUT_OF_DEVICE_MEMORY;
-
-      fourcc = (img->image->format == VK_FORMAT_B8G8R8A8_UNORM)
-                 ? DRM_FORMAT_ARGB8888
-                 : DRM_FORMAT_ABGR8888;
 
       /*
        * One plane, at offset 0, implicit LINEAR.  create_immed() rather than
