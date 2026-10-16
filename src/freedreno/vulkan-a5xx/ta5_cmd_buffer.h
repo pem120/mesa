@@ -94,6 +94,9 @@ struct ta5_ib
    uint32_t reloc_bo_count;
 };
 
+/** The advertised maxPushConstantsSize (128), in dwords. */
+#define TA5_MAX_PUSH_CONST_DWORDS 32
+
 struct ta5_cmd_buffer
 {
    struct vk_object_base base;
@@ -134,6 +137,16 @@ struct ta5_cmd_buffer
    struct ta5_framebuffer *bound_framebuffer;
    struct ta5_render_pass *bound_render_pass;
    struct ta5_descriptor_set *bound_sets[4];
+
+   /**
+    * Push constant values, as written by vkCmdPushConstants().
+    *
+    * Sized to the advertised maxPushConstantsSize (128 bytes).  The draw
+    * emitter uploads the slice each shader's const allocation covers with a
+    * CP_LOAD_STATE4/ST4_CONSTANTS load; dwords the application never pushed
+    * stay zero, which is what the spec promises for unpushed ranges.
+    */
+   uint32_t push_consts[TA5_MAX_PUSH_CONST_DWORDS];
 
    /**
     * Render area of the pass being recorded.

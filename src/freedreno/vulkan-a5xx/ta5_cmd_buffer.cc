@@ -1231,6 +1231,31 @@ ta5_emit_consts(struct ta5_cmd_buffer *cmd, struct ta5_pipeline *pipe,
       }
    }
 
+   /*
+    * Push constants.  The shader's const allocation, fixed at compile time
+    * by the push-constant deref lowering, says which slice of the constant
+    * file the shader reads; the values come from vkCmdPushConstants()'s
+    * store.  This mirrors turnip's tu6_emit_per_stage_push_consts() minus
+    * the shared-consts layout it exists to dodge.
+    */
+   const struct ir3_const_allocation *push =
+      &const_state->allocs.consts[IR3_CONST_ALLOC_PUSH_CONSTS];
+   if (push->size_vec4 > 0) {
+      uint32_t ndwords = MIN2(push->size_vec4 * 4,
+                              (uint32_t)ARRAY_SIZE(cmd->push_consts));
+
+      ta5_pkt7(cmd, CP_LOAD_STATE4, 3 + ndwords);
+      ta5_cs_push(cmd, CP_LOAD_STATE4_0_DST_OFF(push->offset_vec4) |
+                        CP_LOAD_STATE4_0_STATE_SRC(SS4_DIRECT) |
+                        CP_LOAD_STATE4_0_STATE_BLOCK(state_block) |
+                        CP_LOAD_STATE4_0_NUM_UNIT(ndwords / 4));
+      ta5_cs_push(cmd, CP_LOAD_STATE4_1_EXT_SRC_ADDR(0) |
+                        CP_LOAD_STATE4_1_STATE_TYPE(ST4_CONSTANTS));
+      ta5_cs_push(cmd, CP_LOAD_STATE4_2_EXT_SRC_ADDR_HI(0));
+      for (uint32_t i = 0; i < ndwords; i++)
+         ta5_cs_push(cmd, cmd->push_consts[i]);
+   }
+
    /* a7xx+ folds these into the preamble instead; nothing to upload. */
    if (v->compiler->info->props.load_shader_consts_via_preamble)
       return;
@@ -3397,6 +3422,31 @@ ta5_CmdBindPipeline(VkCommandBuffer _cmd, VkPipelineBindPoint pipelineBindPoint,
       return;
    }
    cmd->bound_pipeline = ta5_pipeline_from_handle(_pipeline);
+}
+
+VKAPI_ATTR void VKAPI_CALL
+ta5_CmdPushConstants(VkCommandBuffer _cmd, VkPipelineLayout layout,
+                     VkShaderStageFlags stageFlags, uint32_t offset,
+                     uint32_t size, const void *pValues)
+{
+   struct ta5_cmd_buffer *cmd = ta5_cmd_buffer_from_handle(_cmd);
+
+   /*
+    * The driver advertises maxPushConstantsSize = 128, so an access past the
+    * store is an application bug; clamp rather than scribble past it.  The
+    * layout's per-stage ranges are not tracked -- nothing consumes them, the
+    * shaders' const allocations drive the draw-time emission -- so stageFlags
+    * and the layout go unchecked.
+    */
+   (void)layout;
+   (void)stageFlags;
+
+   if (!pValues || offset >= sizeof(cmd->push_consts))
+      return;
+   if (offset + size > sizeof(cmd->push_consts))
+      size = sizeof(cmd->push_consts) - offset;
+
+   memcpy(&cmd->push_consts[offset / 4], pValues, size);
 }
 
 /**

@@ -905,6 +905,155 @@ ta5_lower_output_reads(nir_function_impl *impl)
    return progress;
 }
 
+/**
+ * Push constant deref loads.
+ *
+ * vkgears reads its model-view matrix from a push constant block, and
+ * spirv_to_nir() spells that as a deref chain rooted at a push_const
+ * variable:
+ *
+ *     %3 = deref_var &#1 (push_const constants)
+ *     %4 = deref_struct &%3->modelview (push_const mat4)
+ *     %5 = deref_array &(*%4)[0] (push_const vec4)
+ *     %6 = @load_deref (%5)
+ *
+ * IR3 has no case for load_deref ("Unhandled intrinsic type", followed by a
+ * segfault while formatting the message) and nothing between the Vulkan front
+ * end and IR3 lowers this form, so the walk here folds the chain's constant
+ * part into a byte offset and the load is rewritten as load_const_ir3 --
+ * IR3's const-register-file read, whose data the draw emitter uploads from
+ * the vkCmdPushConstants() store with a CP_LOAD_STATE4/ST4_CONSTANTS load.
+ *
+ * Only constant chain indices are handled; a shader that indexes its push
+ * constants dynamically fails to compile rather than crashing IR3.
+ */
+
+/**
+ * Walk a deref chain leaf to root.  Returns true when the chain roots at a
+ * push_const variable, in which case *offset is the constant byte offset --
+ * or -1 when some index along the way is dynamic.
+ */
+static bool
+ta5_push_const_chain(const nir_deref_instr *leaf, int64_t *offset)
+{
+   int64_t off = 0;
+
+   for (const nir_deref_instr *deref = leaf; deref;
+        deref = nir_deref_instr_parent(deref)) {
+      switch (deref->deref_type) {
+      case nir_deref_type_var:
+         if (deref->var->data.mode != nir_var_mem_push_const)
+            return false;
+         *offset = off;
+         return true;
+      case nir_deref_type_struct:
+         off += glsl_get_struct_field_offset(
+            nir_deref_instr_parent((nir_deref_instr *)deref)->type,
+            deref->strct.index);
+         break;
+      case nir_deref_type_array: {
+         int64_t stride = nir_deref_instr_array_stride((nir_deref_instr *)deref);
+         if (stride <= 0 || !nir_src_is_const(deref->arr.index))
+            return true;   /* push const, but unreachable as a constant */
+         off += nir_src_as_uint(deref->arr.index) * stride;
+         break;
+      }
+      default:
+         return true;      /* same: push const, unlowerable */
+      }
+   }
+
+   return false;
+}
+
+/**
+ * Sum up the byte extent the shader reads from its push constant block.
+ * Returns false when a read uses a dynamic index, which cannot be spelled
+ * as a constant register offset.
+ */
+static bool
+ta5_scan_push_consts(nir_shader *nir, uint32_t *end_out)
+{
+   *end_out = 0;
+
+   nir_foreach_function_impl (impl, nir) {
+      nir_foreach_block (block, impl) {
+         nir_foreach_instr (instr, block) {
+            nir_intrinsic_instr *intr;
+            nir_deref_instr *deref;
+            int64_t off;
+            uint32_t end;
+
+            if (instr->type != nir_instr_type_intrinsic)
+               continue;
+            intr = nir_instr_as_intrinsic(instr);
+            if (intr->intrinsic != nir_intrinsic_load_deref)
+               continue;
+            deref = nir_src_as_deref(intr->src[0]);
+            if (!deref || !ta5_push_const_chain(deref, &off))
+               continue;
+            if (off < 0)
+               return false;
+            end = (uint32_t)off + intr->def.num_components * 4;
+            *end_out = MAX2(*end_out, end);
+         }
+      }
+   }
+
+   return true;
+}
+
+static bool
+ta5_is_push_const_load(const nir_instr *instr, const void *data)
+{
+   nir_intrinsic_instr *intr;
+   nir_deref_instr *deref;
+   int64_t off;
+
+   if (instr->type != nir_instr_type_intrinsic)
+      return false;
+   intr = nir_instr_as_intrinsic(instr);
+   if (intr->intrinsic != nir_intrinsic_load_deref)
+      return false;
+   deref = nir_src_as_deref(intr->src[0]);
+   return deref && ta5_push_const_chain(deref, &off) && off >= 0;
+}
+
+static nir_def *
+ta5_lower_push_const_derefs(nir_builder *b, nir_instr *instr, void *data)
+{
+   const struct ir3_const_allocation *push =
+      (const struct ir3_const_allocation *)data;
+   nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+   nir_deref_instr *deref = nir_src_as_deref(intr->src[0]);
+   nir_intrinsic_instr *ldc;
+   int64_t off;
+
+   if (!deref || !ta5_push_const_chain(deref, &off) || off < 0)
+      return NULL;
+
+   /*
+    * The base is a dword index into the const register file; every push
+    * constant member is 4-byte aligned, so the byte offset divides evenly.
+    * The index source stays zero and the whole offset rides in the base.
+    *
+    * Built by hand rather than through the nir_load_const_ir3() builder:
+    * the generated C++ macro folds its indices into a braced initializer
+    * behind a positional 0, which is a C99 designated-initializer extension
+    * here and narrows the base to int.
+    */
+   b->cursor = nir_before_instr(instr);
+   ldc = nir_intrinsic_instr_create(b->shader, nir_intrinsic_load_const_ir3);
+   ldc->num_components = intr->num_components;
+   nir_def_init(&ldc->instr, &ldc->def, ldc->num_components,
+                intr->def.bit_size);
+   ldc->src[0] = nir_src_for_ssa(nir_imm_int(b, 0));
+   nir_intrinsic_set_base(ldc, (int)(push->offset_vec4 * 4 +
+                                     (uint32_t)off / 4));
+   nir_builder_instr_insert(b, &ldc->instr);
+   return &ldc->def;
+}
+
 bool
 ta5_shader_compile(struct ta5_device *device, VkShaderStageFlagBits stage,
                    const struct ta5_pipeline_layout *layout,
@@ -1077,6 +1226,34 @@ ta5_shader_compile(struct ta5_device *device, VkShaderStageFlagBits stage,
       if (getenv("TA5_TRACE_UBO"))
          fprintf(stderr, "--- ta5: UBO loads after lowering ---\n"),
             nir_log_shaderi(nir);
+   }
+
+   /*
+    * Push constants.  The const-file region must be allocated before IR3
+    * gets the options -- driver params and everything else it allocates go
+    * above it -- and the lowering pass must run before ir3_finalize_nir()
+    * hands the NIR over, because load_deref has no IR3 case.
+    */
+   uint32_t push_end;
+   if (!ta5_scan_push_consts(nir, &push_end)) {
+      TA5_DBG_SHADER("shader indexes its push constants dynamically");
+      goto fail;
+   }
+
+   if (push_end > 0) {
+      /* 16-byte aligned extent, in vec4 units, matching what the draw
+       * emitter uploads (CP_LOAD_STATE4 NUM_UNIT is vec4 units). */
+      uint32_t size_vec4 = (push_end + 15) / 16 * 4;
+
+      ir3_const_alloc(&shader_options.const_allocs,
+                      IR3_CONST_ALLOC_PUSH_CONSTS, size_vec4, 1);
+      shader_options.push_consts_type = IR3_PUSH_CONSTS_PER_STAGE;
+   }
+
+   if (push_end > 0) {
+      nir_shader_lower_instructions(
+         nir, ta5_is_push_const_load, ta5_lower_push_const_derefs,
+         &shader_options.const_allocs.consts[IR3_CONST_ALLOC_PUSH_CONSTS]);
    }
 
    ir3_finalize_nir(compiler, &shader_nir_options, nir);
