@@ -1164,6 +1164,16 @@ ta5_shader_compile(struct ta5_device *device, VkShaderStageFlagBits stage,
       ir3_nir_lower_io(nir);
    }
 
+   /*
+    * Private-storage globals -- GLSL globals, which SPIR-V spells as OpVariable
+    * with Private storage -- arrive as shader_temp deref loads and stores, and
+    * ir3 has no case for store_deref ("Unhandled intrinsic type", then a
+    * segfault while formatting the message).  ANV lowers them the same way:
+    * to locals first, then to SSA.
+    */
+   NIR_PASS(_, nir, nir_lower_global_vars_to_local);
+   NIR_PASS(_, nir, nir_lower_vars_to_ssa);
+
    shader_options.api_wavesize = IR3_SINGLE_ONLY;
    shader_options.real_wavesize = IR3_SINGLE_ONLY;
 
