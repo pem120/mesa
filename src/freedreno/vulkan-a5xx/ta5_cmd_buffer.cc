@@ -1836,7 +1836,8 @@ ta5_emit_textures(struct ta5_cmd_buffer *cmd, enum a4xx_state_block sb,
 
 static void ta5_emit_draw_state(struct ta5_cmd_buffer *cmd,
                                unsigned vs_tex_count, unsigned fs_tex_count,
-                               uint32_t vertex_count);
+                               uint32_t vertex_count,
+                               const struct ta5_pipeline *pipe);
 
 /**
  * a5xx state restore.
@@ -2287,7 +2288,9 @@ ta5_emit_sysmem_prep(struct ta5_cmd_buffer *cmd,
     * CCU has nowhere to write and the clear is silently dropped.
     */
    ta5_emit_msaa(cmd);
-   ta5_emit_draw_state(cmd, 0, 0, 0);
+   /* No pipeline is bound yet: this arms the frame, and every draw
+    * re-emits this state with the pipeline that owns it. */
+   ta5_emit_draw_state(cmd, 0, 0, 0, NULL);
 
    return VK_SUCCESS;
 }
@@ -2303,7 +2306,8 @@ ta5_emit_sysmem_prep(struct ta5_cmd_buffer *cmd,
  */
 static void
 ta5_emit_draw_state(struct ta5_cmd_buffer *cmd, unsigned vs_tex_count,
-                     unsigned fs_tex_count, uint32_t vertex_count)
+                     unsigned fs_tex_count, uint32_t vertex_count,
+                     const struct ta5_pipeline *pipe)
 {
    /* fd5_emit_render_cntl(blit = false, binning = false) */
    ta5_pkt4(cmd, REG_A5XX_RB_RENDER_CNTL, 1);
@@ -2446,11 +2450,24 @@ ta5_emit_draw_state(struct ta5_cmd_buffer *cmd, unsigned vs_tex_count,
    ta5_cs_push(cmd, 0x00000000);
    ta5_cs_push(cmd, 0x00000000);
 
-   /* Rasteriser: filled triangles, width 1, no polygon offset, no culling.
-    * FRONT_CW is what GL's rasteriser state carries on this part.
+   /* Rasteriser: filled triangles, width 1, no polygon offset.
+    *
+    * GRAS_SU_CNTL also carries the face cull bits and the front-facing
+    * winding, which GL's rasteriser state holds on this same register
+    * (fd5_rasterizer.c: A5XX_GRAS_SU_CNTL_CULL_FRONT / _CULL_BACK, with
+    * FRONT_CW next to them).  Both used to be dropped, so every triangle was
+    * rasterised in both windings; see ta5_pipeline.h for what that did to
+    * vkcube's cube.
     */
    ta5_pkt4(cmd, REG_A5XX_GRAS_SU_CNTL, 1);
-   ta5_cs_push(cmd, A5XX_GRAS_SU_CNTL_FRONT_CW |
+   ta5_cs_push(cmd, (pipe && pipe->cull_front
+                        ? A5XX_GRAS_SU_CNTL_CULL_FRONT
+                        : 0) |
+                     (pipe && pipe->cull_back
+                         ? A5XX_GRAS_SU_CNTL_CULL_BACK
+                         : 0) |
+                     (pipe && pipe->front_cw ? A5XX_GRAS_SU_CNTL_FRONT_CW
+                                             : 0) |
                      A5XX_GRAS_SU_CNTL_LINEHALFWIDTH(0.5f));
 
    ta5_pkt4(cmd, REG_A5XX_GRAS_SU_POINT_MINMAX, 2);
@@ -4532,7 +4549,8 @@ ta5_record_draw(struct ta5_cmd_buffer *cmd, uint32_t vertexCount,
    }
 
    if (!getenv("TA5_SKIP_DRAWSTATE"))
-      ta5_emit_draw_state(draw, vs_tex_count, fs_tex_count, vertexCount);
+      ta5_emit_draw_state(draw, vs_tex_count, fs_tex_count,
+                            vertexCount, pipe);
 
    /*
     * Depth state goes in *after* the draw state, not before it.
@@ -4665,7 +4683,8 @@ no_consts:
       if (ret != VK_SUCCESS)
          goto draw_error;
       if (!getenv("TA5_SKIP_DRAWSTATE"))
-      ta5_emit_draw_state(draw, vs_tex_count, fs_tex_count, vertexCount);
+      ta5_emit_draw_state(draw, vs_tex_count, fs_tex_count,
+                            vertexCount, pipe);
       ta5_emit_program_state(draw, pipe);
       ret = ta5_emit_shader(draw, pipe, &pipe->vertex, SB4_VS_SHADER,
                             REG_A5XX_SP_VS_OBJ_START, pipe->vs_bo);

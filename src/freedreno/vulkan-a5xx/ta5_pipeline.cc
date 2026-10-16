@@ -408,14 +408,15 @@ ta5_CreateGraphicsPipelines(VkDevice _device, VkPipelineCache pipelineCache,
        *
        * That function plants pointers into all_state for the states it knows
        * about -- rs, cb, ms, vi, ia, ts, vp, dr, ial, cal -- and never touches
-       * ds, so graphics_state.ds stayed NULL on every pipeline this driver has
-       * ever created.  ta5_emit_depth_state() reads that pointer, finds NULL,
-       * and concludes that the application asked for no depth test at all.
+       * ds, so graphics_state.ds stayed NULL on every pipeline this driver
+       * ever made.  ta5_emit_depth_state() reads that pointer, found NULL, and
+       * concluded that the application had asked for no depth test at all.
        *
        * Nothing failed.  The pipeline was created with depthTestEnable =
        * VK_TRUE, checked and accepted, and then rendered with the depth test
        * and the depth write both off, because RB_DEPTH_CNTL went out as zero.
-       * The state was implemented and unreachable at the same time.
+       * vkcube's cube came out see-through: its far faces drew over its near
+       * ones and you could see the inside of it.
        *
        * Copy into all_state.ds, which the pipeline owns, and point at it.  The
        * pointer has to be ours: the one in VkGraphicsPipelineCreateInfo is
@@ -433,6 +434,19 @@ ta5_CreateGraphicsPipelines(VkDevice _device, VkPipelineCache pipelineCache,
             ci->pDepthStencilState->depthCompareOp;
       }
       pipe->graphics_state.ds = &pipe->all_state.ds;
+
+      if (getenv("TA5_TRACE_DS"))
+         fprintf(stderr,
+                 "ta5[ds] create: pDS=%p test=%u write=%u op=%d -> ds=%p "
+                 "test=%d write=%d op=%d\n",
+                 (void *)ci->pDepthStencilState,
+                 ci->pDepthStencilState ? ci->pDepthStencilState->depthTestEnable : 9u,
+                 ci->pDepthStencilState ? ci->pDepthStencilState->depthWriteEnable : 9u,
+                 ci->pDepthStencilState ? (int)ci->pDepthStencilState->depthCompareOp : -1,
+                 (void *)pipe->graphics_state.ds,
+                 (int)pipe->all_state.ds.depth.test_enable,
+                 (int)pipe->all_state.ds.depth.write_enable,
+                 (int)pipe->all_state.ds.depth.compare_op);
 
       /*
        * Depth and stencil state the draw path cannot honour.
@@ -459,6 +473,27 @@ ta5_CreateGraphicsPipelines(VkDevice _device, VkPipelineCache pipelineCache,
          const VkPipelineRasterizationStateCreateInfo *rs =
             ci->pRasterizationState;
          int didx = ta5_render_pass_depth_attachment(pipe->render_pass);
+
+         /*
+          * Face culling, which this driver previously ignored entirely.
+          *
+          * A5XX_GRAS_SU_CNTL_CULL_FRONT/CULL_BACK are what fd5_rasterizer.c
+          * sets from GL's cull face, and FRONT_CW says which winding is
+          * front-facing; both live in the GRAS_SU_CNTL the draw path already
+          * writes.  Without them the rasteriser keeps both windings, and for
+          * geometry that is drawn twice -- vkcube's cube is 12 triangles for
+          * 6 faces for exactly that reason -- each coplanar pair z-fights
+          * along the diagonal it shares.
+          */
+         if (rs) {
+            pipe->cull_front =
+               rs->cullMode == VK_CULL_MODE_FRONT_BIT ||
+               rs->cullMode == VK_CULL_MODE_FRONT_AND_BACK;
+            pipe->cull_back =
+               rs->cullMode == VK_CULL_MODE_BACK_BIT ||
+               rs->cullMode == VK_CULL_MODE_FRONT_AND_BACK;
+            pipe->front_cw = rs->frontFace == VK_FRONT_FACE_CLOCKWISE;
+         }
 
          if (ds && (ds->stencilTestEnable == VK_TRUE ||
                     ds->depthBoundsTestEnable == VK_TRUE)) {

@@ -105,6 +105,20 @@ struct ta5_pipeline
    /** Shaders were given as gl_Position/gl_FragCoord-only; no vertex buffer
     * fetch is configured yet. */
    bool uses_vertex_buffers;
+
+   /** pRasterizationState: which faces are discarded before rasterisation,
+    * and which winding counts as front-facing.
+    *
+    * These were not read at all before, so every pipeline rendered both
+    * windings of every triangle.  vkcube draws each cube face twice with
+    * opposite winding and asks for VK_CULL_MODE_BACK_BIT, so the driver was
+    * drawing all twelve triangles instead of six: each pair is coplanar, and
+    * the two triangles fight along the diagonal they share, which is what put
+    * a dashed seam across the middle of every face of the cube on screen.
+    */
+   bool cull_front;
+   bool cull_back;
+   bool front_cw;
 };
 
 VK_DEFINE_NONDISP_HANDLE_CASTS(ta5_pipeline, base, VkPipeline,
