@@ -4012,6 +4012,196 @@ ta5_CmdPipelineBarrier(VkCommandBuffer _cmd, VkPipelineStageFlags srcStageMask,
  * degenerates to a single packet per row, and a region that exactly fills a
  * level's rows coalesces to one packet because the pitches match.
  */
+/*
+ * A host copy, like every transfer in this driver (see CmdCopyBufferToImage):
+ * the store is unified and host-visible, so the queue operation reduces to a
+ * memcpy.  The work happens at record time, before the submission is queued,
+ * which is only safe while the application is not already executing a
+ * previous submission against this buffer -- the shape of every upload seen
+ * so far.  The runtime's own common implementation has the same dependency,
+ * just spelled through CmdUpdateMemoryKHR, which this driver does not
+ * implement and which used to leave the dispatch slot NULL.
+ */
+VKAPI_ATTR void VKAPI_CALL
+ta5_CmdUpdateBuffer(VkCommandBuffer _cmd, VkBuffer dstBuffer,
+                    VkDeviceSize dstOffset, VkDeviceSize dataSize,
+                    const void *pData)
+{
+   struct ta5_cmd_buffer *cmd = ta5_cmd_buffer_from_handle(_cmd);
+   struct ta5_buffer *buffer = ta5_buffer_from_handle(dstBuffer);
+   void *map;
+
+   if (cmd->state != MESA_VK_COMMAND_BUFFER_STATE_RECORDING)
+      return;
+
+   if (!buffer || !buffer->bound_memory || !pData || !dataSize)
+      return;
+
+   map = ta5_bo_map(buffer->bound_memory->bo);
+   if (!map)
+      return;
+
+   /* An access past the end of the buffer is an application bug; clamp
+    * rather than scribble past the allocation. */
+   if (dstOffset >= buffer->size)
+      return;
+   if (dstOffset + dataSize > buffer->size)
+      dataSize = buffer->size - dstOffset;
+
+   memcpy((char *)map + dstOffset, pData, dataSize);
+}
+
+/*
+ * A host copy again, same reasoning as CmdUpdateBuffer: one system-memory
+ * heap, both buffers in it, so the copy is a memcpy.  The runtime's common
+ * implementation only exists because it can funnel into CmdCopyBuffer2 (and
+ * on to CmdCopyMemory), neither of which is implemented here -- it left the
+ * dispatch slot NULL, which is what vkmark's vertex-buffer upload hit.
+ */
+VKAPI_ATTR void VKAPI_CALL
+ta5_CmdCopyBuffer(VkCommandBuffer _cmd, VkBuffer srcBuffer,
+                  VkBuffer dstBuffer, uint32_t regionCount,
+                  const VkBufferCopy *pRegions)
+{
+   struct ta5_cmd_buffer *cmd = ta5_cmd_buffer_from_handle(_cmd);
+   struct ta5_buffer *src = ta5_buffer_from_handle(srcBuffer);
+   struct ta5_buffer *dst = ta5_buffer_from_handle(dstBuffer);
+   void *src_map, *dst_map;
+
+   if (cmd->state != MESA_VK_COMMAND_BUFFER_STATE_RECORDING)
+      return;
+
+   if (!src || !dst || !pRegions || regionCount == 0)
+      return;
+
+   if (!src->bound_memory || !dst->bound_memory)
+      return;
+
+   src_map = ta5_bo_map(src->bound_memory->bo);
+   dst_map = ta5_bo_map(dst->bound_memory->bo);
+   if (!src_map || !dst_map) {
+      if (getenv("TA5_TRACE_COPY"))
+         fprintf(stderr, "ta5[copy] mmap failed\n");
+      return;
+   }
+
+   for (uint32_t r = 0; r < regionCount; r++) {
+      const VkBufferCopy *reg = &pRegions[r];
+      uint64_t size = reg->size;
+
+      /* Clamp each end against its own buffer: the copy is a memcpy into
+       * two host allocations, and an application bug must not become an
+       * out-of-bounds write. */
+      if (reg->srcOffset >= src->size || reg->dstOffset >= dst->size)
+         continue;
+      size = MIN3(size, src->size - reg->srcOffset,
+                  dst->size - reg->dstOffset);
+
+      memcpy((char *)dst_map + reg->dstOffset, (char *)src_map + reg->srcOffset,
+             size);
+   }
+}
+
+/*
+ * vkCmdClearColorImage, as a host fill.
+ *
+ * The [clear] scene clears its swapchain image this way instead of through
+ * a render pass, and the runtime's common implementation funnels into
+ * CmdClearImage2/CmdClearMemory, neither of which is implemented here -- the
+ * dispatch slot was NULL and vkmark died jumping to address 0.
+ *
+ * Like every transfer in this driver the work happens at record time: one
+ * system-memory heap, the image host-visible and laid out linearly, so a
+ * clear is a memcpy.  The fill is a repeating 32-bit word because the clear
+ * colour is solid and every format this driver renders is 4 bytes per texel.
+ */
+VKAPI_ATTR void VKAPI_CALL
+ta5_CmdClearColorImage(VkCommandBuffer _cmd, VkImage _image,
+                       VkImageLayout imageLayout, const VkClearColorValue *pColor,
+                       uint32_t rangeCount,
+                       const VkImageSubresourceRange *pRanges)
+{
+   struct ta5_cmd_buffer *cmd = ta5_cmd_buffer_from_handle(_cmd);
+   struct ta5_image *image = ta5_image_from_handle(_image);
+   void *map;
+   uint32_t word;
+
+   if (cmd->state != MESA_VK_COMMAND_BUFFER_STATE_RECORDING)
+      return;
+
+   (void)imageLayout;
+
+   if (!image || !image->bound_memory || !pColor || !pRanges || rangeCount == 0)
+      return;
+
+   /* The four colour formats this driver renders, as a byte order and a
+    * gamma.  Anything else -- depth included -- is not a colour clear and
+    * is left alone rather than filled with a wrong answer. */
+   switch (image->format) {
+   case VK_FORMAT_R8G8B8A8_UNORM:
+      word = ((uint32_t)_mesa_float_to_unorm(pColor->float32[0], 8)) |
+             ((uint32_t)_mesa_float_to_unorm(pColor->float32[1], 8) << 8) |
+             ((uint32_t)_mesa_float_to_unorm(pColor->float32[2], 8) << 16) |
+             ((uint32_t)_mesa_float_to_unorm(pColor->float32[3], 8) << 24);
+      break;
+   case VK_FORMAT_R8G8B8A8_SRGB:
+      word = ((uint32_t)_mesa_float_to_unorm(ta5_linear_to_srgb(pColor->float32[0]), 8)) |
+             ((uint32_t)_mesa_float_to_unorm(ta5_linear_to_srgb(pColor->float32[1]), 8) << 8) |
+             ((uint32_t)_mesa_float_to_unorm(ta5_linear_to_srgb(pColor->float32[2]), 8) << 16) |
+             ((uint32_t)_mesa_float_to_unorm(ta5_linear_to_srgb(pColor->float32[3]), 8) << 24);
+      break;
+   case VK_FORMAT_B8G8R8A8_UNORM:
+      word = ((uint32_t)_mesa_float_to_unorm(pColor->float32[2], 8)) |
+             ((uint32_t)_mesa_float_to_unorm(pColor->float32[1], 8) << 8) |
+             ((uint32_t)_mesa_float_to_unorm(pColor->float32[0], 8) << 16) |
+             ((uint32_t)_mesa_float_to_unorm(pColor->float32[3], 8) << 24);
+      break;
+   case VK_FORMAT_B8G8R8A8_SRGB:
+      word = ((uint32_t)_mesa_float_to_unorm(ta5_linear_to_srgb(pColor->float32[2]), 8)) |
+             ((uint32_t)_mesa_float_to_unorm(ta5_linear_to_srgb(pColor->float32[1]), 8) << 8) |
+             ((uint32_t)_mesa_float_to_unorm(ta5_linear_to_srgb(pColor->float32[0]), 8) << 16) |
+             ((uint32_t)_mesa_float_to_unorm(ta5_linear_to_srgb(pColor->float32[3]), 8) << 24);
+      break;
+   default:
+      if (getenv("TA5_TRACE_CLEAR"))
+         fprintf(stderr, "ta5[clear] format %d is not a colour clear\n",
+                 image->format);
+      return;
+   }
+
+   map = ta5_bo_map(image->bound_memory->bo);
+   if (!map) {
+      if (getenv("TA5_TRACE_CLEAR"))
+         fprintf(stderr, "ta5[clear] mmap failed\n");
+      return;
+   }
+
+   for (uint32_t r = 0; r < rangeCount; r++) {
+      const VkImageSubresourceRange *range = &pRanges[r];
+
+      for (uint32_t level = range->baseMipLevel;
+           level < range->baseMipLevel + range->levelCount &&
+           level < image->mip_levels;
+           level++) {
+         const struct ta5_image_level *lvl = &image->levels[level];
+         uint64_t offset = image->offset + lvl->offset;
+         uint64_t size = lvl->level_size;
+
+         /* Clamp the layer span against the image, the same way the other
+          * host transfers clamp: an application bug must not become an
+          * out-of-bounds write. */
+         if (range->baseArrayLayer >= image->array_layers)
+            continue;
+         if (range->baseArrayLayer + range->layerCount > image->array_layers)
+            size = lvl->layer_pitch *
+                   (image->array_layers - range->baseArrayLayer);
+
+         for (uint64_t i = 0; i < size / 4; i++)
+            ((uint32_t *)((char *)map + offset))[i] = word;
+      }
+   }
+}
+
 VKAPI_ATTR void VKAPI_CALL
 ta5_CmdCopyBufferToImage(VkCommandBuffer _cmd, VkBuffer srcBuffer,
                          VkImage dstImage, VkImageLayout dstImageLayout,
