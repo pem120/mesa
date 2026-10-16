@@ -82,6 +82,10 @@ const struct vk_instance_extension_table ta5_instance_extensions_supported = {
 #ifdef TA5_HAVE_WAYLAND
       .KHR_wayland_surface = true,
 #endif
+      /* vkmark's headless window system asks for this by name; without it
+       * vkCreateInstance fails with VK_ERROR_EXTENSION_NOT_PRESENT before
+       * any scene runs. */
+      .EXT_headless_surface = true,
    },
 };
 

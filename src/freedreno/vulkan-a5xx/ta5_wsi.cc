@@ -499,6 +499,39 @@ ta5_CreateDisplayPlaneSurfaceKHR(
    return VK_SUCCESS;
 }
 
+/*
+ * VK_EXT_headless_surface: a surface with no platform behind it.  vkmark's
+ * headless window system creates one so it can run a full benchmark without
+ * a compositor; the swapchain images are real, only the presentation is not.
+ */
+VKAPI_ATTR VkResult VKAPI_CALL
+ta5_CreateHeadlessSurfaceEXT(
+   VkInstance _instance, const VkHeadlessSurfaceCreateInfoEXT *pCreateInfo,
+   const VkAllocationCallbacks *pAllocator, VkSurfaceKHR *pSurface)
+{
+   struct ta5_instance *instance = (struct ta5_instance *)_instance;
+   struct ta5_surface *surf;
+
+   if (pAllocator == NULL)
+      pAllocator = vk_default_allocator();
+
+   if (!pCreateInfo)
+      return vk_error(&instance->vk, VK_ERROR_INITIALIZATION_FAILED);
+
+   surf = (struct ta5_surface *)vk_zalloc(
+      pAllocator, sizeof(*surf), 8, VK_SYSTEM_ALLOCATION_SCOPE_INSTANCE);
+   if (!surf)
+      return vk_error(&instance->vk, VK_ERROR_OUT_OF_HOST_MEMORY);
+
+   vk_object_base_instance_init(&instance->vk, &surf->base,
+                                VK_OBJECT_TYPE_SURFACE_KHR);
+   surf->instance = instance;
+   surf->headless = true;
+
+   *pSurface = ta5_surface_to_handle(surf);
+   return VK_SUCCESS;
+}
+
 VKAPI_ATTR void VKAPI_CALL
 ta5_DestroySurfaceKHR(VkInstance _instance, VkSurfaceKHR _surface,
                       const VkAllocationCallbacks *pAllocator)
@@ -554,7 +587,38 @@ ta5_GetPhysicalDeviceSurfaceCapabilitiesKHR(VkPhysicalDevice physicalDevice,
       return ta5_wayland_capabilities(surf, pCaps);
 #endif
 
-   if (!pCaps || !surf || !surf->display)
+   if (!pCaps || !surf)
+      return VK_ERROR_INITIALIZATION_FAILED;
+
+   if (surf->headless) {
+      /*
+       * A headless surface has no size of its own: the extent is whatever
+       * the swapchain was created with, so currentExtent is the spec's
+       * "undefined" value and the extents bracket what create accepts.
+       */
+      pCaps->minImageCount = 2;
+      pCaps->maxImageCount = 3;
+      pCaps->currentExtent.width = 0xffffffffu;
+      pCaps->currentExtent.height = 0xffffffffu;
+      pCaps->minImageExtent.width = 1;
+      pCaps->minImageExtent.height = 1;
+      pCaps->maxImageExtent.width = 4096;
+      pCaps->maxImageExtent.height = 4096;
+      pCaps->maxImageArrayLayers = 1;
+      pCaps->supportedTransforms =
+         VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR;
+      pCaps->currentTransform = VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR;
+      pCaps->supportedCompositeAlpha =
+         VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
+      pCaps->supportedUsageFlags =
+         VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
+         VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+         VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+      (void)physicalDevice;
+      return VK_SUCCESS;
+   }
+
+   if (!surf->display)
       return VK_ERROR_INITIALIZATION_FAILED;
 
    pCaps->minImageCount = 2;
@@ -623,23 +687,30 @@ ta5_GetPhysicalDeviceSurfacePresentModesKHR(VkPhysicalDevice physicalDevice,
    if (!pCount)
       return VK_ERROR_INITIALIZATION_FAILED;
 
-   /* FIFO only: drmModeSetCrtc is synchronous, so every present waits for
-    * the scanout.  MAILBOX and IMMEDIATE would need a flip queue that does
-    * not exist yet. */
+   /*
+    * FIFO and MAILBOX.  Neither is a lie on this driver: the present paths
+    * never block on a vblank (the Wayland one paces itself on frame
+    * callbacks, the KMS one on an atomic commit, the headless one not at
+    * all), so the difference the modes exist to express -- waiting for
+    * scanout versus replacing a queued frame -- does not exist here.
+    * IMMEDIATE is withheld: nothing synchronises against tearing either.
+    */
    if (!pModes) {
-      *pCount = 1;
+      *pCount = 2;
       return VK_SUCCESS;
    }
 
-   if (*pCount < 1) {
+   if (*pCount < 2) {
       *pCount = 1;
+      pModes[0] = VK_PRESENT_MODE_FIFO_KHR;
       return VK_INCOMPLETE;
    }
 
    pModes[0] = VK_PRESENT_MODE_FIFO_KHR;
+   pModes[1] = VK_PRESENT_MODE_MAILBOX_KHR;
    (void)physicalDevice;
    (void)surface;
-   *pCount = 1;
+   *pCount = 2;
    return VK_SUCCESS;
 }
 
@@ -827,9 +898,10 @@ ta5_CreateSwapchainKHR(VkDevice _device,
     * mode here to compare it against: the application asked for a size and the
     * size is what it gets.  The KMS branch still insists on an exact match
     * with the mode, because there the mode *is* the image and any other size
-    * is a request to scale, which this path does not do.
+    * is a request to scale, which this path does not do.  A headless surface
+    * is the same: the application's extent is the image extent.
     */
-   if (surf->wayland) {
+   if (surf->wayland || surf->headless) {
       if (pCreateInfo->imageExtent.width == 0 ||
           pCreateInfo->imageExtent.height == 0 ||
           pCreateInfo->imageExtent.width > 4096 ||
@@ -1292,6 +1364,11 @@ ta5_present_image(struct ta5_swapchain *sc, uint32_t index)
    if (sc->surface->wayland)
       return ta5_wayland_present(sc, index);
 #endif
+
+   /* Headless: there is nothing to present to.  The image is complete (the
+    * queue wait above saw to that) and the frame is done. */
+   if (sc->surface->headless)
+      return VK_SUCCESS;
 
    if (sc->drm_fd < 0) {
       sc->drm_fd = ta5_drm_open();

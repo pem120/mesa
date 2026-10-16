@@ -91,6 +91,10 @@ struct ta5_surface
 
    /* VK_KHR_wayland_surface.  All NULL for a display surface. */
    bool wayland;
+
+   /* VK_EXT_headless_surface.  No display, no compositor: the surface is a
+    * token the swapchain hangs off, and present is a no-op. */
+   bool headless;
    struct wl_display *wl_display;
    struct wl_registry *wl_registry;
    struct wl_compositor *wl_compositor;
