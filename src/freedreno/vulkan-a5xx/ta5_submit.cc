@@ -156,6 +156,30 @@ ta5_bo_alloc(struct ta5_device *device, uint32_t size, uint32_t flags)
       return NULL;
    }
 
+   /*
+    * TA5_TRACE_BO prints every buffer's GPU address, not just the ones this
+    * process happens to map.  An IOMMU fault in dmesg names an address, and
+    * the full map is what turns it into "the colour target", "a fetch the CP
+    * made from the wrong place in the ring" or "nothing we allocated at all".
+    *
+    * The mmap offset is the IOVA on this driver, and this is the same
+    * ta5_gem_get_offset() ta5_bo_map() uses to map the buffer.
+    */
+   if (getenv("TA5_TRACE_BO")) {
+      uint64_t iova = 0;
+
+      if (ta5_gem_get_offset(device, bo->handle, MSM_INFO_GET_OFFSET, &iova))
+         fprintf(stderr, "ta5[bo]: handle=%u size=%-9u iova=<%s>\n",
+                 bo->handle, size, strerror(errno));
+      else
+         fprintf(stderr,
+                 "ta5[bo]: handle=%-4u size=%-9u iova=0x%08llx "
+                 "[0x%llx..0x%llx)\n",
+                 bo->handle, size, (unsigned long long)iova,
+                 (unsigned long long)iova,
+                 (unsigned long long)(iova + size));
+   }
+
    return bo;
 }
 
@@ -248,6 +272,19 @@ ta5_bo_map(struct ta5_bo *bo)
       return NULL;
    }
 
+   /*
+    * TA5_TRACE_BO prints each buffer's GPU address.  On this driver the mmap
+    * offset of a GPU buffer *is* its IOVA, and an IOMMU fault in dmesg names
+    * an address: this is what turns that address into "the colour target",
+    * "the depth buffer" or "nothing we allocated", which is the difference
+    * between hunting in the driver and guessing.
+    */
+   if (getenv("TA5_TRACE_BO"))
+      fprintf(stderr,
+              "ta5[bo]: handle=%u size=%-9u iova=0x%08llx [0x%llx..0x%llx)\n",
+              bo->handle, bo->size, (unsigned long long)offset,
+              (unsigned long long)offset,
+              (unsigned long long)(offset + bo->size));
 
    bo->map = mmap(NULL, bo->size, PROT_READ | PROT_WRITE, MAP_SHARED,
                   bo->device->fd, offset);

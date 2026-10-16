@@ -231,13 +231,60 @@ ta5_queue_submit_batch(struct ta5_queue *queue, const VkCommandBuffer *cmds,
       memcpy(&stream[n], cmd->cs, cmd->cs_count * sizeof(uint32_t));
       n += cmd->cs_count;
 
+      /* TA5_TRACE_CB dumps the whole command-buffer stream of every buffer in
+       * the batch, before relocations.  The draw's own IB is dumped
+       * separately by TA5_TRACE_DRAW; this is everything around it. */
+      if (getenv("TA5_TRACE_CB")) {
+         fprintf(stderr, "=== cmd buffer %u: %u dwords ===\n", i,
+                 cmd->cs_count);
+         for (uint32_t w = 0; w < cmd->cs_count; w++)
+            fprintf(stderr, "  %04x: %08x\n", w * 4, cmd->cs[w]);
+      }
+
       for (uint32_t j = 0; j < cmd->ib_count; j++)
          merged_ibs[ib_n++] = &cmd->ibs[j];
     }
 
+    if (getenv("TA5_TRACE_CB")) {
+      fprintf(stderr, "=== relocs: %d over %u bos ===\n", reloc_n,
+              merged_bo_count);
+      for (uint32_t k = 0; k < merged_bo_count; k++)
+         fprintf(stderr, "  bo[%u] %p size=%u\n", k, (void *)merged_bos[k],
+                 merged_bos[k]->size);
+      for (uint32_t k = 0; k < reloc_n; k++)
+         fprintf(stderr, "  reloc dst=%u bo=%u or=%x\n",
+                 merged_relocs[k].dst_off, merged_relocs[k].bo_index,
+                 merged_relocs[k].or_mask);
+      fprintf(stderr, "  ibs: %u\n", ib_n);
+    }
+
+    /* The stream buffer is CPU memory the kernel reads with get_user_pages.
+     * Printing it says which half of the address space a fault address in
+     * dmesg belongs to: a GPU IOVA (near a buffer's) or a CPU address that
+     * leaked into the stream. */
+    if (getenv("TA5_TRACE_CB"))
+      fprintf(stderr, "  stream=%p (%u words)\n", (void *)stream, total_words);
+
     fence_fd = ta5_submit_cmd_relocs(queue, stream, total_words, merged_relocs,
                                      merged_bos, merged_bo_count, reloc_n,
                                      merged_ibs, ib_n);
+    /*
+     * The kernel patches relocations into the stream in place, so after the
+     * submit the words the relocations covered hold the IOVAs the hardware was
+     * actually told to use.  Printing them is how a fault address in dmesg gets
+     * matched to the buffer it came from.
+     */
+    if (getenv("TA5_TRACE_CB")) {
+      for (uint32_t k = 0; k < reloc_n; k++) {
+         uint32_t off = merged_relocs[k].dst_off / 4;
+         fprintf(stderr, "  patched[%u] bo=%u size=%u -> %08x%08x\n", k,
+                 merged_relocs[k].bo_index,
+                 merged_bos[merged_relocs[k].bo_index]->size,
+                 off + 1 < total_words ? stream[off + 1] : 0,
+                 off < total_words ? stream[off] : 0);
+      }
+    }
+
     free(merged_relocs);
     free(merged_bos);
     free(merged_ibs);

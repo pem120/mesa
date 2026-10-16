@@ -604,7 +604,9 @@ ta5_wayland_throttle(void)
  * the very memory the GPU wrote.
  *
  * The fourcc is the DRM code the image's Vulkan format already is:
- * R8G8B8A8_UNORM is DRM_FORMAT_ABGR8888, B8G8R8A8_UNORM is ARGB8888.  No
+ * R8G8B8A8_UNORM and R8G8B8A8_SRGB are DRM_FORMAT_ABGR8888, B8G8R8A8_UNORM
+ * and B8G8R8A8_SRGB are ARGB8888 -- SRGB spells the same byte layout, only
+ * the gamma the sink is expected to apply differs.  No
  * modifier is added, so linux-dmabuf v1 reads it as DRM_FORMAT_MOD_LINEAR,
  * which is how ta5_CreateImage lays every image out.
  *
@@ -770,7 +772,8 @@ ta5_wayland_present_drm(struct ta5_swapchain *sc, uint32_t index)
    struct wl_buffer *buffer;
    struct wl_callback *callback;
    struct ta5_bo *bo = img->memory->bo;
-   uint32_t fourcc = (img->image->format == VK_FORMAT_B8G8R8A8_UNORM)
+   uint32_t fourcc = (img->image->format == VK_FORMAT_B8G8R8A8_UNORM ||
+                      img->image->format == VK_FORMAT_B8G8R8A8_SRGB)
                         ? DRM_FORMAT_ARGB8888
                         : DRM_FORMAT_ABGR8888;
    uint32_t stride = (uint32_t)img->image->row_pitch;
@@ -872,7 +875,8 @@ ta5_wayland_present(struct ta5_swapchain *sc, uint32_t index)
     * inside the "create the buffer" branch left it 0 for every present after
     * the first and the trace claimed a shm fallback that never happened.
     */
-   uint32_t fourcc = (img->image->format == VK_FORMAT_B8G8R8A8_UNORM)
+   uint32_t fourcc = (img->image->format == VK_FORMAT_B8G8R8A8_UNORM ||
+                      img->image->format == VK_FORMAT_B8G8R8A8_SRGB)
                         ? DRM_FORMAT_ARGB8888
                         : DRM_FORMAT_ABGR8888;
 

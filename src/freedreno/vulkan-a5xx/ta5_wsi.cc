@@ -586,26 +586,32 @@ ta5_GetPhysicalDeviceSurfaceFormatsKHR(VkPhysicalDevice physicalDevice,
    if (!pCount)
       return VK_ERROR_INITIALIZATION_FAILED;
 
-   /* The swapchain image is an R8G8B8A8_UNORM colour attachment -- the one
-    * format this driver renders losslessly -- so that is the only format
-    * offered.  vkcube accepts the first format when it has no preference,
-    * and its preference list includes UNORM. */
+   /*
+    * The swapchain image is an 8_8_8_8 colour attachment; the driver renders
+    * the four byte orders below.  R8G8B8A8_UNORM stays first because vkcube
+    * takes the first format when it has no preference, and B8G8R8A8_SRGB is
+    * here because vkgears asks for it sight unseen.
+    */
+   static const VkSurfaceFormatKHR ta5_surface_formats[] = {
+      {VK_FORMAT_R8G8B8A8_UNORM, VK_COLOR_SPACE_SRGB_NONLINEAR_KHR},
+      {VK_FORMAT_B8G8R8A8_SRGB, VK_COLOR_SPACE_SRGB_NONLINEAR_KHR},
+      {VK_FORMAT_R8G8B8A8_SRGB, VK_COLOR_SPACE_SRGB_NONLINEAR_KHR},
+   };
+   const uint32_t total =
+      (uint32_t)(sizeof(ta5_surface_formats) / sizeof(ta5_surface_formats[0]));
+
    if (!pFormats) {
-      *pCount = 1;
+      *pCount = total;
       return VK_SUCCESS;
    }
 
-   if (*pCount < 1) {
-      *pCount = 1;
-      return VK_INCOMPLETE;
-   }
-
-   pFormats[0].format = VK_FORMAT_R8G8B8A8_UNORM;
-   pFormats[0].colorSpace = VK_COLOR_SPACE_SRGB_NONLINEAR_KHR;
+   uint32_t n = *pCount < total ? *pCount : total;
+   for (uint32_t i = 0; i < n; i++)
+      pFormats[i] = ta5_surface_formats[i];
+   *pCount = n;
    (void)physicalDevice;
    (void)surface;
-   *pCount = 1;
-   return VK_SUCCESS;
+   return n == total ? VK_SUCCESS : VK_INCOMPLETE;
 }
 
 VKAPI_ATTR VkResult VKAPI_CALL
@@ -689,25 +695,29 @@ ta5_GetPhysicalDeviceSurfaceFormats2KHR(
    if (!pSurfaceFormatCount)
       return VK_ERROR_INITIALIZATION_FAILED;
 
-   /* The same single format as the 1-variant; see the comment there. */
+   /* The same list as the 1-variant, chained; see the comment there. */
+   static const VkSurfaceFormatKHR ta5_surface_formats[] = {
+      {VK_FORMAT_R8G8B8A8_UNORM, VK_COLOR_SPACE_SRGB_NONLINEAR_KHR},
+      {VK_FORMAT_B8G8R8A8_SRGB, VK_COLOR_SPACE_SRGB_NONLINEAR_KHR},
+      {VK_FORMAT_R8G8B8A8_SRGB, VK_COLOR_SPACE_SRGB_NONLINEAR_KHR},
+   };
+   const uint32_t total =
+      (uint32_t)(sizeof(ta5_surface_formats) / sizeof(ta5_surface_formats[0]));
+
    if (!pSurfaceFormats) {
-      *pSurfaceFormatCount = 1;
+      *pSurfaceFormatCount = total;
       return VK_SUCCESS;
    }
 
-   if (*pSurfaceFormatCount < 1) {
-      *pSurfaceFormatCount = 1;
-      return VK_INCOMPLETE;
+   uint32_t n = *pSurfaceFormatCount < total ? *pSurfaceFormatCount : total;
+   for (uint32_t i = 0; i < n; i++) {
+      pSurfaceFormats[i].sType = VK_STRUCTURE_TYPE_SURFACE_FORMAT_2_KHR;
+      pSurfaceFormats[i].surfaceFormat = ta5_surface_formats[i];
    }
-
-   pSurfaceFormats[0].sType = VK_STRUCTURE_TYPE_SURFACE_FORMAT_2_KHR;
-   pSurfaceFormats[0].surfaceFormat.format = VK_FORMAT_R8G8B8A8_UNORM;
-   pSurfaceFormats[0].surfaceFormat.colorSpace =
-      VK_COLOR_SPACE_SRGB_NONLINEAR_KHR;
+   *pSurfaceFormatCount = n;
    (void)physicalDevice;
    (void)pSurfaceInfo;
-   *pSurfaceFormatCount = 1;
-   return VK_SUCCESS;
+   return n == total ? VK_SUCCESS : VK_INCOMPLETE;
 }
 
 /*
@@ -839,9 +849,23 @@ ta5_CreateSwapchainKHR(VkDevice _device,
                          VK_ERROR_INITIALIZATION_FAILED);
    }
 
-   if (pCreateInfo->imageFormat != VK_FORMAT_R8G8B8A8_UNORM &&
-       pCreateInfo->imageFormat != VK_FORMAT_B8G8R8A8_UNORM)
+   /*
+    * The SRGB spellings of the two UNORM formats ride along: the bytes are
+    * laid out identically and the hardware applies the gamma on write
+    * (RB_MRT_BUF_INFO.COLOR_SRGB).  vkgears asks for VK_FORMAT_B8G8R8A8_SRGB
+    * without querying the surface first; answering FORMAT_NOT_SUPPORTED left
+    * it holding a NULL swapchain handle, which it then passed to
+    * vkGetSwapchainImagesKHR and tripped its own assert(image_count > 0).
+    */
+   switch (pCreateInfo->imageFormat) {
+   case VK_FORMAT_R8G8B8A8_UNORM:
+   case VK_FORMAT_R8G8B8A8_SRGB:
+   case VK_FORMAT_B8G8R8A8_UNORM:
+   case VK_FORMAT_B8G8R8A8_SRGB:
+      break;
+   default:
       return vk_error(&device->instance->vk, VK_ERROR_FORMAT_NOT_SUPPORTED);
+   }
 
    count = pCreateInfo->minImageCount;
    if (count < 2)

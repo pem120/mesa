@@ -66,6 +66,19 @@ ta5_CreateImageView(VkDevice _device, const VkImageViewCreateInfo *pCreateInfo,
 
    image = ta5_image_from_handle(pCreateInfo->image);
 
+   if (getenv("TA5_TRACE_VIEW"))
+      fprintf(stderr,
+              "ta5[view] type=%d fmt=%d mips=%u baseMip=%u levels=%u "
+              "baseLayer=%u layers=%u img(mips=%u layers=%u %ux%u tiling=%d) "
+              "pitch=%u usage=0x%x\n",
+              (int)pCreateInfo->viewType, (int)pCreateInfo->format,
+              image->mip_levels, pCreateInfo->subresourceRange.baseMipLevel,
+              pCreateInfo->subresourceRange.levelCount,
+              pCreateInfo->subresourceRange.baseArrayLayer,
+              pCreateInfo->subresourceRange.layerCount, image->mip_levels,
+              image->array_layers, image->extent.width, image->extent.height,
+              (int)image->tiling, 0u, (unsigned)image->usage);
+
    block_size = ta5_format_block_size(pCreateInfo->format);
    if (!block_size)
       return vk_error(&device->instance->vk, VK_ERROR_FORMAT_NOT_SUPPORTED);
@@ -174,25 +187,25 @@ ta5_CreateImageView(VkDevice _device, const VkImageViewCreateInfo *pCreateInfo,
     * This zeroed the pitch for anything that was not VK_IMAGE_TILING_LINEAR,
     * on the reasoning that an optimal image is gmem and is addressed by the
     * tile system rather than by a stride.  That reasoning does not hold here:
-    * ta5_CreateImage lays every image out linearly and computes
-    * image->row_pitch from extent and block size with no reference to tiling
-    * at all, and the RB addresses attachments with RB_DEPTH_BUFFER_PITCH the
-    * same way as any other stride.  So an optimal-tiled attachment got a pitch
-    * of zero, the register was programmed with zero, and the buffer was
-    * addressed as if every row began at the same address.
+    * ta5_CreateImage lays every image out linearly and computes image->row_pitch
+    * from extent and block size with no reference to tiling at all, and the RB
+    * addresses attachments with RB_DEPTH_BUFFER_PITCH and the colour buffer
+    * pitch the same way.  So an optimal-tiled attachment got a pitch of zero,
+    * the register was programmed with zero, and the depth buffer was addressed
+    * as if every row started at the same address.
     *
     * vkcube is what found it, because vkcube creates its depth attachment with
     * VK_IMAGE_TILING_OPTIMAL.  Its depth test then compared fragments against
-    * the wrong rows and rejected about two thirds of the cube: the picture
-    * came out as a few disconnected faces with background between them, and
-    * with no fault, because from the hardware's point of view nothing was
-    * wrong.
+    * the wrong rows, and roughly two thirds of the cube was rejected: the
+    * picture came out as a few disconnected faces with the background showing
+    * between them, and with no fault, because nothing was wrong from the
+    * hardware's point of view.
     *
-    * All 115 regression cases create their depth attachment with linear
-    * tiling, which is why this survived every one of them.  The harness hid it
-    * rather than exposing it: with a zero pitch the depth test reads rows that
-    * nothing ever wrote, so nothing is ever rejected, and a single
-    * non-self-occluding draw still comes out complete.
+    * Every one of the 115 regression cases creates its depth attachment with
+    * linear tiling, which is why this survived all of them -- and why the
+    * harness hid it rather than exposing it: with a zero pitch the depth test
+    * reads rows that nothing ever wrote, so nothing is ever rejected and a
+    * single non-self-occluding draw still comes out complete.
     */
    view->row_pitch = image->row_pitch;
 

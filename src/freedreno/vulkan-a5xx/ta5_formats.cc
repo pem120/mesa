@@ -250,11 +250,48 @@ ta5_GetPhysicalDeviceFormatProperties2(VkPhysicalDevice _pdevice,
                                        VkFormat format,
                                        VkFormatProperties2 *pFormatProperties)
 {
-   const struct ta5_format_caps *caps = ta5_format_caps_get(format);
+   const struct ta5_format_caps *caps;
+
+   /*
+    * TA5_NO_D16=<format list>: report a format as unsupported so an
+    * application picks another one.  vkcube takes whichever depth format this
+    * reports first, and it takes D16, while every case in the regression
+    * matrix asks for D32 -- so "the cube comes out torn" and "the D16 depth
+    * path is wrong" are indistinguishable until the choice is taken away.
+    */
+   if (getenv("TA5_NO_D16")) {
+      const char *list = getenv("TA5_NO_D16");
+      char want[64];
+      size_t n = 0;
+
+      while (*list && n < sizeof(want) - 1) {
+         if (*list == ',' || *list == ' ') {
+            want[n] = 0;
+            if (n && (int)strtoul(want, NULL, 0) == (int)format)
+               goto unsupported;
+            n = 0;
+         } else {
+            want[n++] = *list;
+         }
+         list++;
+      }
+      if (n) {
+         want[n] = 0;
+         if (strtoul(want, NULL, 0) == (int)format)
+            goto unsupported;
+      }
+   }
+
+   caps = ta5_format_caps_get(format);
 
    pFormatProperties->formatProperties.linearTilingFeatures = caps->linear;
    pFormatProperties->formatProperties.optimalTilingFeatures = caps->optimal;
    pFormatProperties->formatProperties.bufferFeatures = caps->buffer;
+   return;
+unsupported:
+   pFormatProperties->formatProperties.linearTilingFeatures = 0;
+   pFormatProperties->formatProperties.optimalTilingFeatures = 0;
+   pFormatProperties->formatProperties.bufferFeatures = 0;
 }
 
 VKAPI_ATTR VkResult VKAPI_CALL

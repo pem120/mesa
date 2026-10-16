@@ -99,6 +99,73 @@ ta5_CreateShaderModule(VkDevice _device,
                        const VkAllocationCallbacks *pAllocator,
                        VkShaderModule *pShaderModule)
 {
+   /*
+    * Dump the module, on a knob: TA5_TRACE_SPIRV=<path>.<stage> writes the
+    * word stream so it can be read with spirv-dis.  Every question about a
+    * miscompiled shader starts with "what did the module actually say", and
+    * the application embeds its shaders, so without this there is no way to
+    * get them back out.
+    */
+   const char *path = getenv("TA5_TRACE_SPIRV");
+
+   if (path && pCreateInfo && pCreateInfo->pCode &&
+       pCreateInfo->codeSize >= 4 && (pCreateInfo->codeSize % 4) == 0) {
+      char name[512];
+      const uint32_t *code = pCreateInfo->pCode;
+      uint32_t words = pCreateInfo->codeSize / 4;
+
+      /*
+       * The stage is not in the header -- word 1 is the version and word 2 the
+       * generator magic.  It is the execution model of the first
+       * OpEntryPoint, so that instruction is read directly: the module's
+       * fifth word is it, and its second is the model.
+       */
+      const char *stage = "shader";
+
+      /* Walk the instruction stream: word 5 onwards, each instruction's first
+       * word is (word count << 16) | opcode, and the one we want is
+       * OpEntryPoint.  Anything else is a guess -- word 5 is whatever
+       * capability the generator emitted first. */
+      for (uint32_t i = 5; i < words;) {
+         uint32_t instr = code[i];
+         uint32_t len = instr >> 16;
+         uint32_t op = instr & 0xffff;
+
+         if (len == 0)
+            break;
+
+         if (op == 15 && i + 1 < words) {
+            stage = "";
+            switch (code[i + 1]) {
+            case 0: stage = "vert"; break;
+            case 1: stage = "tesc"; break;
+            case 2: stage = "tese"; break;
+            case 3: stage = "geom"; break;
+            case 4: stage = "frag"; break;
+            case 5: stage = "comp"; break;
+            default: stage = "shader"; break;
+            }
+            break;
+         }
+
+         i += len;
+      }
+
+      if (stage[0] == '\0')
+         stage = "shader";
+
+      snprintf(name, sizeof(name), "%s.%s.spv", path, stage);
+
+      FILE *f = fopen(name, "wb");
+      if (f) {
+         fwrite(code, 4, words, f);
+         fclose(f);
+         fprintf(stderr, "ta5[spirv]: wrote %s (%u words)\n", name, words);
+      } else {
+         fprintf(stderr, "ta5[spirv]: cannot write %s\n", name);
+      }
+   }
+
    return vk_common_CreateShaderModule(_device, pCreateInfo, pAllocator,
                                        pShaderModule);
 }
@@ -641,15 +708,28 @@ ta5_is_ubo_deref_instr(const nir_instr *instr, const void *data)
  * access's range from its component count, ignoring what the range says.  So
  * a second, provably-zero term is added to the offset instead.
  *
- * Zero has to be built out of the block number rather than written as a
- * constant, or the constant folder collapses the whole thing back into a
- * constant offset and the range is recomputed anyway.  `(block << 31) & 1` is
- * 0 for every 32-bit input -- the shift can only set bit 31, and the mask
- * keeps only bit 0 -- and neither half of it is a fold: `(block << 31) << 31`
- * was the first attempt and *is* folded, because shift-of-shift adds.
+ * Zero has to be built out of something the optimiser cannot fold, or the
+ * whole term collapses back into a constant offset and the range is
+ * recomputed anyway.  Three attempts, in order:
+ *
+ *   1. `iadd(offset, 0)` -- folded, obviously.
+ *   2. `(block << 31) << 31` -- folded, because shift-of-shift adds, and the
+ *      block number is a constant so the whole chain is one.
+ *   3. `(v << 31) & 1` where `v` is the vertex id (or gl_FragCoord.x in a
+ *      fragment shader) -- the shift can only set bit 31 and the mask keeps
+ *      only bit 0, so it is 0 for every input, and no fold rule here knows
+ *      that without the value.  The source has to be a system value rather
+ *      than anything derived from the descriptor: anything built out of the
+ *      block number is a constant, and a constant is exactly what the range
+ *      analysis is looking for.
+ *
+ * Measured before this: the vertex shader's four MVP loads came out as
+ * load_const_ir3 at bases 16/20/24/28 -- read.c4.x in the disassembly -- and
+ * the cube rasterised nothing, the scanout buffer coming back as a single
+ * clear colour.
  */
 static void
-ta5_defuse_ubo_ranges(nir_function_impl *impl)
+ta5_defuse_ubo_ranges(nir_function_impl *impl, bool is_vertex)
 {
    nir_foreach_block (block, impl) {
       nir_foreach_instr_safe (instr, block) {
@@ -664,9 +744,16 @@ ta5_defuse_ubo_ranges(nir_function_impl *impl)
             continue;
 
          nir_builder b = nir_builder_at(nir_before_instr(instr));
-         nir_def *always_zero =
-            nir_iand(&b, nir_ishl_imm(&b, intrin->src[0].ssa, 31),
-                     nir_imm_int(&b, 1));
+
+         /* One non-constant per function would do; it is built per load and
+          * CSE collapses the duplicates, because the builder has no way to
+          * memoise it here. */
+         nir_def *opaque = is_vertex
+                              ? nir_load_vertex_id_zero_base(&b)
+                              : nir_channel(&b, nir_load_frag_coord(&b), 0);
+
+         nir_def *always_zero = nir_iand(&b, nir_ishl_imm(&b, opaque, 31),
+                                          nir_imm_int(&b, 1));
 
          /*
           * nir_src_rewrite(), not an assignment: the source is already in the
@@ -979,10 +1066,17 @@ ta5_shader_compile(struct ta5_device *device, VkShaderStageFlagBits stage,
 
       nir_foreach_function (fn, nir) {
          if (fn->impl) {
-            ta5_defuse_ubo_ranges(fn->impl);
+            if (!getenv("TA5_NOZERO"))
+               ta5_defuse_ubo_ranges(fn->impl,
+                                     stage == VK_SHADER_STAGE_VERTEX_BIT);
             ta5_lower_output_reads(fn->impl);
          }
       }
+
+      /* The block loads as this pass leaves them, before IR3 sees them. */
+      if (getenv("TA5_TRACE_UBO"))
+         fprintf(stderr, "--- ta5: UBO loads after lowering ---\n"),
+            nir_log_shaderi(nir);
    }
 
    ir3_finalize_nir(compiler, &shader_nir_options, nir);

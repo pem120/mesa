@@ -381,17 +381,34 @@ union ta5_color
    uint32_t u32[4];
 };
 
+/**
+ * Linear -> sRGB, the curve Vulkan's clear color arrives in.  The clear path
+ * writes raw dwords through RB_BLIT, which does not run the fixed-function
+ * COLOR_SRGB converter, so an sRGB attachment gets the encode applied here --
+ * the same thing util_pack_color() does for GL's blit clears on sRGB formats.
+ */
+static float
+ta5_linear_to_srgb(float v)
+{
+   if (v <= 0.0f)
+      return 0.0f;
+   if (v >= 1.0f)
+      return 1.0f;
+   return v < 0.0031308f ? v * 12.92f
+                         : 1.055f * powf(v, 1.0f / 2.4f) - 0.055f;
+}
+
 /** Convert a VkClearColorValue into RB_CLEAR_COLOR_DW0..3 order. */
 static union ta5_color
-ta5_color_from_clear(VkClearColorValue c)
+ta5_color_from_clear(VkClearColorValue c, bool srgb)
 {
    union ta5_color out;
 
    /* The RB wants RGBA in dword 0..3 for an RGBA8 target. */
-   out.u32[0] = _mesa_float_to_unorm(c.float32[0], 8);
-   out.u32[1] = _mesa_float_to_unorm(c.float32[1], 8);
-   out.u32[2] = _mesa_float_to_unorm(c.float32[2], 8);
-   out.u32[3] = _mesa_float_to_unorm(c.float32[3], 8);
+   for (uint32_t i = 0; i < 4; i++) {
+      float v = srgb ? ta5_linear_to_srgb(c.float32[i]) : c.float32[i];
+      out.u32[i] = _mesa_float_to_unorm(v, 8);
+   }
    return out;
 }
 
@@ -2157,11 +2174,27 @@ ta5_emit_sysmem_prep(struct ta5_cmd_buffer *cmd,
    ta5_pkt7(cmd, CP_SET_VISIBILITY_OVERRIDE, 1);
    ta5_cs_push(cmd, 0x1);
 
+   /*
+    * Colour format plumbing.  Every colour format this driver accepts is an
+    * 8_8_8_8 with a different channel order or gamma, and the hardware
+    * expresses both here: COLOR_SWAP rotates the channels (fd5_format.c
+    * gives B8G8R8A8_* WXYZ and R8G8B8A8_* WZYX) and COLOR_SRGB turns on the
+    * fixed-function sRGB encode, which fd5_gmem.c mirrors on SP_FS_MRT_REG
+    * so the fragment output is converted too.  The hardware format enum
+    * itself has no sRGB variant; it stays 8_8_8_8_UNORM.
+    */
+   enum a3xx_color_swap swap = (img->format == VK_FORMAT_B8G8R8A8_UNORM ||
+                                img->format == VK_FORMAT_B8G8R8A8_SRGB)
+                                  ? WXYZ : WZYX;
+   bool srgb = (img->format == VK_FORMAT_B8G8R8A8_SRGB ||
+                img->format == VK_FORMAT_R8G8B8A8_SRGB);
+
    /* Color attachment 0.  BASE_LO/BASE_HI is a 64 bit reloc. */
    ta5_pkt4(cmd, REG_A5XX_RB_MRT_BUF_INFO(0), 5);
    ta5_cs_push(cmd, A5XX_RB_MRT_BUF_INFO_COLOR_FORMAT(RB5_R8G8B8A8_UNORM) |
                      A5XX_RB_MRT_BUF_INFO_COLOR_TILE_MODE(TILE5_LINEAR) |
-                     A5XX_RB_MRT_BUF_INFO_COLOR_SWAP(WZYX));
+                     A5XX_RB_MRT_BUF_INFO_COLOR_SWAP(swap) |
+                     (srgb ? A5XX_RB_MRT_BUF_INFO_COLOR_SRGB : 0));
    ta5_cs_push(cmd, A5XX_RB_MRT_PITCH(stride));
    ta5_cs_push(cmd, A5XX_RB_MRT_ARRAY_PITCH(stride * h));
    ret = ta5_cs_reloc(cmd, bo, img->offset, 0);
@@ -2169,7 +2202,8 @@ ta5_emit_sysmem_prep(struct ta5_cmd_buffer *cmd,
       return ret;
 
    ta5_pkt4(cmd, REG_A5XX_SP_FS_MRT_REG(0), 1);
-   ta5_cs_push(cmd, A5XX_SP_FS_MRT_REG_COLOR_FORMAT(RB5_R8G8B8A8_UNORM));
+   ta5_cs_push(cmd, A5XX_SP_FS_MRT_REG_COLOR_FORMAT(RB5_R8G8B8A8_UNORM) |
+                     (srgb ? A5XX_SP_FS_MRT_REG_COLOR_SRGB : 0));
 
    ta5_pkt4(cmd, REG_A5XX_RB_MRT_FLAG_BUFFER(0), 4);
    ta5_cs_push(cmd, 0);
@@ -3645,7 +3679,10 @@ ta5_CmdBeginRenderPass(VkCommandBuffer _cmd,
           * a second colour attachment would be cleared with the first one's
           * value.  Only one colour attachment is supported.
           */
-         union ta5_color c = ta5_color_from_clear(clear[i].color);
+         union ta5_color c = ta5_color_from_clear(
+            clear[i].color,
+            att->format == VK_FORMAT_B8G8R8A8_SRGB ||
+               att->format == VK_FORMAT_R8G8B8A8_SRGB);
          if (ta5_emit_clear(cmd, cmd->device, &c) != VK_SUCCESS)
             return;
       } else {

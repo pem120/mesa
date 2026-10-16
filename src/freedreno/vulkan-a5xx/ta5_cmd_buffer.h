@@ -186,6 +186,19 @@ struct ta5_cmd_buffer
    uint32_t draw_first_instance;
    uint32_t draw_index_size;
 
+   /**
+    * The bound index buffer, for vkCmdDrawIndexed.
+    *
+    * vkcube draws its cube from an index buffer, so without this it issued a
+    * draw the driver had nowhere to fetch indices from: the frame came out as
+    * the clear colour and nothing else.  A NULL buffer means no index buffer is
+    * bound, which is what vkCmdDraw uses (it synthesises vertex ids instead).
+    */
+   struct ta5_bo *index_bo;
+   uint64_t index_buffer_offset;
+   uint32_t index_type;   /* enum VkIndexType */
+   uint32_t index_count;  /* indices in the whole buffer, for MaxIndices */
+
    /** Fence to signal when this submission completes. */
    struct ta5_fence *fence;
 

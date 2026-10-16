@@ -141,6 +141,9 @@ if ta5_wayland_opt.enabled() or ta5_wayland_opt.auto()
     wl_protos = [
       ['xdg_shell', join_paths(wl_protos_dir, 'stable', 'xdg-shell', 'xdg-shell.xml')],
       ['linux_dmabuf', join_paths(wl_protos_dir, 'stable', 'linux-dmabuf', 'linux-dmabuf-v1.xml')],
+      # The GL implementation's import path on this compositor: buffers by GEM
+      # name rather than by fd.  The XML lives in-tree under egl/wayland.
+      ['wayland_drm', meson.project_source_root() / 'src/egl/wayland/wayland-drm/wayland-drm.xml'],
     ]
 
     foreach proto : wl_protos
