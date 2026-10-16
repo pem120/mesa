@@ -103,13 +103,13 @@ ta5_stage_bo_alloc(struct ta5_device *device,
 
    *out = ta5_bo_alloc(device, size ? size : 4, MSM_BO_WC);
    if (*out == NULL)
-      return vk_error(&device->instance->vk, VK_ERROR_OUT_OF_DEVICE_MEMORY);
+      return vk_error(&device->physical_device->vk, VK_ERROR_OUT_OF_DEVICE_MEMORY);
 
    map = ta5_bo_map(*out);
    if (map == NULL) {
       ta5_bo_unref(*out);
       *out = NULL;
-      return vk_error(&device->instance->vk, VK_ERROR_OUT_OF_HOST_MEMORY);
+      return vk_error(&device->physical_device->vk, VK_ERROR_OUT_OF_HOST_MEMORY);
    }
 
    ta5_copy_variant(map, shader, v);
@@ -242,12 +242,12 @@ ta5_CreateGraphicsPipelines(VkDevice _device, VkPipelineCache pipelineCache,
       /* VK_EXT fail_on_pipeline_compile_required is not advertised, so the
        * caller must not pre-fill the handles. */
       if (pPipelines[i] != VK_NULL_HANDLE)
-         return vk_error(&device->instance->vk, VK_ERROR_INITIALIZATION_FAILED);
+         return vk_error(&device->physical_device->vk, VK_ERROR_INITIALIZATION_FAILED);
 
       pipe = (struct ta5_pipeline *)vk_zalloc(pAllocator, sizeof(*pipe), 8,
                                               VK_SYSTEM_ALLOCATION_SCOPE_OBJECT);
       if (!pipe)
-         return vk_error(&device->instance->vk, VK_ERROR_OUT_OF_HOST_MEMORY);
+         return vk_error(&device->physical_device->vk, VK_ERROR_OUT_OF_HOST_MEMORY);
 
       vk_object_base_init(&device->vk, &pipe->base, VK_OBJECT_TYPE_PIPELINE);
       pipe->device = device;
@@ -301,7 +301,7 @@ ta5_CreateGraphicsPipelines(VkDevice _device, VkPipelineCache pipelineCache,
             if (pipe->has_fragment)
                ta5_compiled_shader_free(&pipe->fragment);
             vk_free(pAllocator, pipe);
-            return vk_error(&device->instance->vk, result);
+            return vk_error(&device->physical_device->vk, result);
          }
 
          *dst = compiled;
@@ -501,7 +501,7 @@ ta5_CreateGraphicsPipelines(VkDevice _device, VkPipelineCache pipelineCache,
                     "ta5[pipe] stencil and depthBounds are not implemented "
                     "(stencilTestEnable=%u depthBoundsTestEnable=%u)\n",
                     ds->stencilTestEnable, ds->depthBoundsTestEnable);
-            return vk_error(&device->instance->vk,
+            return vk_error(&device->physical_device->vk,
                             VK_ERROR_FEATURE_NOT_PRESENT);
          }
 
@@ -511,14 +511,14 @@ ta5_CreateGraphicsPipelines(VkDevice _device, VkPipelineCache pipelineCache,
             fprintf(stderr,
                     "ta5[pipe] depth format %d has no hardware code\n",
                     pipe->render_pass->attachments[didx].format);
-            return vk_error(&device->instance->vk,
+            return vk_error(&device->physical_device->vk,
                             VK_ERROR_FORMAT_NOT_SUPPORTED);
          }
 
          if (ds && ds->depthTestEnable == VK_TRUE && didx < 0) {
             fprintf(stderr,
                     "ta5[pipe] depthTestEnable with no depth attachment\n");
-            return vk_error(&device->instance->vk,
+            return vk_error(&device->physical_device->vk,
                             VK_ERROR_FEATURE_NOT_PRESENT);
          }
 
@@ -531,7 +531,7 @@ ta5_CreateGraphicsPipelines(VkDevice _device, VkPipelineCache pipelineCache,
          if (ds && ds->depthWriteEnable == VK_TRUE && didx < 0) {
             fprintf(stderr,
                     "ta5[pipe] depthWriteEnable with no depth attachment\n");
-            return vk_error(&device->instance->vk,
+            return vk_error(&device->physical_device->vk,
                             VK_ERROR_FEATURE_NOT_PRESENT);
          }
 
@@ -543,7 +543,7 @@ ta5_CreateGraphicsPipelines(VkDevice _device, VkPipelineCache pipelineCache,
           */
          if (rs && rs->depthClampEnable == VK_TRUE) {
             fprintf(stderr, "ta5[pipe] depthClampEnable is not implemented\n");
-            return vk_error(&device->instance->vk,
+            return vk_error(&device->physical_device->vk,
                             VK_ERROR_FEATURE_NOT_PRESENT);
          }
       }

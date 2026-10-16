@@ -61,8 +61,15 @@ ta5_sampler_wrap(VkSamplerAddressMode mode)
 static enum a5xx_tex_filter
 ta5_sampler_filter(VkFilter filter, float maxAnisotropy, bool magnification)
 {
-   if (filter == VK_FILTER_LINEAR && maxAnisotropy > 1.0f && magnification)
+   /*
+    * With aniso on, LINEAR becomes the hardware's ANISO filter for
+    * magnification *and* minification -- that is what fd5's tex_filter() does
+    * (fd5_texture.c:46), and aniso on minification is the entire point of
+    * the feature.
+    */
+   if (filter == VK_FILTER_LINEAR && maxAnisotropy > 1.0f)
       return A5XX_TEX_ANISO;
+   (void)magnification;
    return filter == VK_FILTER_LINEAR ? A5XX_TEX_LINEAR : A5XX_TEX_NEAREST;
 }
 
@@ -168,17 +175,18 @@ ta5_CreateSampler(VkDevice _device, const VkSamplerCreateInfo *pCreateInfo,
       pAllocator = vk_default_allocator();
 
    if (pCreateInfo->mipLodBias > 14.0f || pCreateInfo->mipLodBias < -14.0f)
-      return vk_error(&device->instance->vk, VK_ERROR_FEATURE_NOT_PRESENT);
+      return vk_error(&device->physical_device->vk, VK_ERROR_FEATURE_NOT_PRESENT);
 
-   /* Aniso filtering is not implemented: the register exists and is
-    * programmed, but the shader lowering for it is not wired up, and
-    * pretending otherwise would give the wrong answer silently. */
-   if (pCreateInfo->maxAnisotropy > 1.0f)
-      return vk_error(&device->instance->vk, VK_ERROR_FEATURE_NOT_PRESENT);
+   /*
+    * Aniso is accepted: the sampler descriptor carries it (TEX_SAMP_0_ANISO
+    * plus the ANISO filter, the way fd5_sampler_state_create() encodes it for
+    * GL) and the shader needs nothing -- on a5xx aniso is sampler state, not
+    * a texture-instruction modifier.
+    */
 
    if (pCreateInfo->compareEnable &&
        pCreateInfo->compareOp != VK_COMPARE_OP_NEVER)
-      return vk_error(&device->instance->vk, VK_ERROR_FEATURE_NOT_PRESENT);
+      return vk_error(&device->physical_device->vk, VK_ERROR_FEATURE_NOT_PRESENT);
 
    sampler = (struct ta5_sampler *)vk_zalloc(
       pAllocator, sizeof(*sampler), 8, VK_SYSTEM_ALLOCATION_SCOPE_DEVICE);

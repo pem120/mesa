@@ -209,6 +209,13 @@ ta5_get_features(struct ta5_physical_device *pdevice,
    features->largePoints = false;
    features->alphaToOne = false;
    features->multiViewport = false;
+   /*
+    * Advertised because it is implemented: the sampler descriptor carries
+    * aniso (TEX_SAMP_0_ANISO + the ANISO filter for mag and min, the way
+    * fd5_sampler_state_create() encodes it for GL) and the shader needs
+    * nothing -- on a5xx aniso is sampler state, not a texture-instruction
+    * modifier.
+    */
    features->samplerAnisotropy = true;
    features->textureCompressionETC2 = true;
    features->textureCompressionASTC_LDR = true;

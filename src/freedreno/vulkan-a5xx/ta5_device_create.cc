@@ -122,7 +122,7 @@ ta5_CreateDevice(VkPhysicalDevice physicalDevice,
    if (result != VK_SUCCESS) {
       TA5_DBG("vk_device_init failed: %d", result);
       vk_free(pAllocator, device);
-      return vk_error(&pdevice->instance->vk, result);
+      return vk_error(&pdevice->vk, result);
    }
 
    /*

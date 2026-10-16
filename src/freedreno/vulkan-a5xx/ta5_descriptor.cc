@@ -144,7 +144,7 @@ ta5_CreateDescriptorSetLayout(
    layout = (struct ta5_descriptor_set_layout *)vk_zalloc(
       pAllocator, sizeof(*layout), 8, VK_SYSTEM_ALLOCATION_SCOPE_DEVICE);
    if (!layout)
-      return vk_error(&device->instance->vk, VK_ERROR_OUT_OF_HOST_MEMORY);
+      return vk_error(&device->physical_device->vk, VK_ERROR_OUT_OF_HOST_MEMORY);
 
    vk_object_base_init(&device->vk, &layout->base,
                        VK_OBJECT_TYPE_DESCRIPTOR_SET_LAYOUT);
@@ -157,7 +157,7 @@ ta5_CreateDescriptorSetLayout(
       VK_SYSTEM_ALLOCATION_SCOPE_DEVICE);
    if (!layout->bindings) {
       vk_free(pAllocator, layout);
-      return vk_error(&device->instance->vk, VK_ERROR_OUT_OF_HOST_MEMORY);
+      return vk_error(&device->physical_device->vk, VK_ERROR_OUT_OF_HOST_MEMORY);
    }
 
    for (uint32_t i = 0; i < pCreateInfo->bindingCount; i++) {
@@ -171,7 +171,7 @@ ta5_CreateDescriptorSetLayout(
           * rejected rather than silently given no capabilities. */
          vk_free(pAllocator, layout->bindings);
          vk_free(pAllocator, layout);
-         return vk_error(&device->instance->vk,
+         return vk_error(&device->physical_device->vk,
                          VK_ERROR_FEATURE_NOT_PRESENT);
       }
 
@@ -237,7 +237,7 @@ ta5_CreateDescriptorPool(VkDevice _device,
    pool = (struct ta5_descriptor_pool *)vk_zalloc(
       pAllocator, sizeof(*pool), 8, VK_SYSTEM_ALLOCATION_SCOPE_OBJECT);
    if (!pool)
-      return vk_error(&device->instance->vk, VK_ERROR_OUT_OF_HOST_MEMORY);
+      return vk_error(&device->physical_device->vk, VK_ERROR_OUT_OF_HOST_MEMORY);
 
    vk_object_base_init(&device->vk, &pool->base,
                        VK_OBJECT_TYPE_DESCRIPTOR_POOL);
@@ -329,7 +329,7 @@ ta5_AllocateDescriptorSets(
             continue;
 
          if (pool->remaining[bind->type] < bind->descriptor_count)
-            return vk_error(&device->instance->vk,
+            return vk_error(&device->physical_device->vk,
                             VK_ERROR_OUT_OF_POOL_MEMORY);
       }
    }
@@ -348,7 +348,7 @@ ta5_AllocateDescriptorSets(
          &device->vk.alloc, sizeof(*set), 8,
          VK_SYSTEM_ALLOCATION_SCOPE_OBJECT);
       if (!set)
-         return vk_error(&device->instance->vk, VK_ERROR_OUT_OF_HOST_MEMORY);
+         return vk_error(&device->physical_device->vk, VK_ERROR_OUT_OF_HOST_MEMORY);
 
       vk_object_base_init(&device->vk, &set->base,
                           VK_OBJECT_TYPE_DESCRIPTOR_SET);
@@ -361,7 +361,7 @@ ta5_AllocateDescriptorSets(
          VK_SYSTEM_ALLOCATION_SCOPE_OBJECT);
       if (!set->descriptors) {
          vk_free(&device->vk.alloc, set);
-         return vk_error(&device->instance->vk, VK_ERROR_OUT_OF_HOST_MEMORY);
+         return vk_error(&device->physical_device->vk, VK_ERROR_OUT_OF_HOST_MEMORY);
       }
 
       for (uint32_t b = 0; b < layout->binding_count; b++) {
