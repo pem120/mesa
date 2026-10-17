@@ -4110,10 +4110,10 @@ ta5_CmdCopyBuffer(VkCommandBuffer _cmd, VkBuffer srcBuffer,
  * CmdClearImage2/CmdClearMemory, neither of which is implemented here -- the
  * dispatch slot was NULL and vkmark died jumping to address 0.
  *
- * Like every transfer in this driver the work happens at record time: one
- * system-memory heap, the image host-visible and laid out linearly, so a
- * clear is a memcpy.  The fill is a repeating 32-bit word because the clear
- * colour is solid and every format this driver renders is 4 bytes per texel.
+ * This limited host implementation runs at record time, not submission time.
+ * Host-visible memory does not make that ordering Vulkan-correct: command
+ * buffer replay and synchronization with GPU accesses remain unsupported.
+ * Only the four 32-bit formats listed below are supported.
  */
 VKAPI_ATTR void VKAPI_CALL
 ta5_CmdClearColorImage(VkCommandBuffer _cmd, VkImage _image,
@@ -4134,9 +4134,7 @@ ta5_CmdClearColorImage(VkCommandBuffer _cmd, VkImage _image,
    if (!image || !image->bound_memory || !pColor || !pRanges || rangeCount == 0)
       return;
 
-   /* The four colour formats this driver renders, as a byte order and a
-    * gamma.  Anything else -- depth included -- is not a colour clear and
-    * is left alone rather than filled with a wrong answer. */
+   /* Limited to RGBA8/BGRA8 UNORM and sRGB; alpha remains linear. */
    switch (image->format) {
    case VK_FORMAT_R8G8B8A8_UNORM:
       word = ((uint32_t)_mesa_float_to_unorm(pColor->float32[0], 8)) |
@@ -4148,7 +4146,7 @@ ta5_CmdClearColorImage(VkCommandBuffer _cmd, VkImage _image,
       word = ((uint32_t)_mesa_float_to_unorm(ta5_linear_to_srgb(pColor->float32[0]), 8)) |
              ((uint32_t)_mesa_float_to_unorm(ta5_linear_to_srgb(pColor->float32[1]), 8) << 8) |
              ((uint32_t)_mesa_float_to_unorm(ta5_linear_to_srgb(pColor->float32[2]), 8) << 16) |
-             ((uint32_t)_mesa_float_to_unorm(ta5_linear_to_srgb(pColor->float32[3]), 8) << 24);
+             ((uint32_t)_mesa_float_to_unorm(pColor->float32[3], 8) << 24);
       break;
    case VK_FORMAT_B8G8R8A8_UNORM:
       word = ((uint32_t)_mesa_float_to_unorm(pColor->float32[2], 8)) |
@@ -4160,11 +4158,11 @@ ta5_CmdClearColorImage(VkCommandBuffer _cmd, VkImage _image,
       word = ((uint32_t)_mesa_float_to_unorm(ta5_linear_to_srgb(pColor->float32[2]), 8)) |
              ((uint32_t)_mesa_float_to_unorm(ta5_linear_to_srgb(pColor->float32[1]), 8) << 8) |
              ((uint32_t)_mesa_float_to_unorm(ta5_linear_to_srgb(pColor->float32[0]), 8) << 16) |
-             ((uint32_t)_mesa_float_to_unorm(ta5_linear_to_srgb(pColor->float32[3]), 8) << 24);
+             ((uint32_t)_mesa_float_to_unorm(pColor->float32[3], 8) << 24);
       break;
    default:
       if (getenv("TA5_TRACE_CLEAR"))
-         fprintf(stderr, "ta5[clear] format %d is not a colour clear\n",
+         fprintf(stderr, "ta5[clear] unsupported color-clear format %d\n",
                  image->format);
       return;
    }
@@ -4179,22 +4177,23 @@ ta5_CmdClearColorImage(VkCommandBuffer _cmd, VkImage _image,
    for (uint32_t r = 0; r < rangeCount; r++) {
       const VkImageSubresourceRange *range = &pRanges[r];
 
-      for (uint32_t level = range->baseMipLevel;
-           level < range->baseMipLevel + range->levelCount &&
-           level < image->mip_levels;
-           level++) {
-         const struct ta5_image_level *lvl = &image->levels[level];
-         uint64_t offset = image->offset + lvl->offset;
-         uint64_t size = lvl->level_size;
+      if (!(range->aspectMask & VK_IMAGE_ASPECT_COLOR_BIT) ||
+          range->baseMipLevel >= image->mip_levels ||
+          range->baseArrayLayer >= image->array_layers)
+         continue;
 
-         /* Clamp the layer span against the image, the same way the other
-          * host transfers clamp: an application bug must not become an
-          * out-of-bounds write. */
-         if (range->baseArrayLayer >= image->array_layers)
-            continue;
-         if (range->baseArrayLayer + range->layerCount > image->array_layers)
-            size = lvl->layer_pitch *
-                   (image->array_layers - range->baseArrayLayer);
+      /* Subtract before clamping so VK_REMAINING_* cannot overflow an end
+       * index.  A 3D mip has one array layer containing all depth slices. */
+      const uint32_t levels = MIN2(range->levelCount,
+                                  image->mip_levels - range->baseMipLevel);
+      const uint32_t layers = MIN2(range->layerCount,
+                                  image->array_layers - range->baseArrayLayer);
+      for (uint32_t l = 0; l < levels; l++) {
+         const struct ta5_image_level *lvl =
+            &image->levels[range->baseMipLevel + l];
+         const uint64_t offset = image->offset + lvl->offset +
+            (uint64_t)range->baseArrayLayer * lvl->layer_pitch;
+         const uint64_t size = (uint64_t)lvl->layer_pitch * layers * lvl->depth;
 
          for (uint64_t i = 0; i < size / 4; i++)
             ((uint32_t *)((char *)map + offset))[i] = word;
