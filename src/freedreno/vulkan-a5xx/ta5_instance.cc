@@ -195,8 +195,7 @@ ta5_destroy_physical_device(struct vk_physical_device *vk_pdevice)
    struct ta5_physical_device *device =
       container_of(vk_pdevice, struct ta5_physical_device, vk);
 
-   ta5_wsi_display_finish(device);
-   simple_mtx_destroy(&device->wsi_mtx);
+   ta5_wsi_finish(device);
 
    if (device->dev_fd >= 0)
       close(device->dev_fd);
@@ -334,37 +333,20 @@ ta5_GetInstanceProcAddr(VkInstance _instance, const char *pName)
    func = vk_instance_get_proc_addr(instance ? &instance->vk : NULL,
                                     &ta5_instance_entrypoints, pName);
 
-   /*
-    * The physical-device half of VK_KHR_wayland_surface.
+/*
+    * The physical-device half of VK_KHR_wayland_surface used to be answered
+    * here by hand.  vkGetPhysicalDeviceWaylandPresentationSupportKHR resolves
+    * through a trampoline table guarded by VK_USE_PLATFORM_WAYLAND_KHR, which
+    * only libvulkan_wsi compiles; with the bespoke WSI that was off, so the
+    * loader was handed NULL for a function the driver advertises.  vkgears
+    * refused the surface and vulkaninfo segfaulted on the NULL it was given.
     *
-    * vkGetPhysicalDeviceWaylandPresentationSupportKHR belongs to the
-    * physical-device table, not the instance one, and the runtime resolves
-    * physical-device names through a static trampoline table whose entries are
-    * themselves guarded by `#ifdef VK_USE_PLATFORM_WAYLAND_KHR`.  That macro
-    * reaches libvulkan_runtime only from the with_platform_wayland build
-    * option, which is what drives libvulkan_wsi -- and this driver implements
-    * the extension itself rather than through that library, so the option is
-    * off, the trampoline is not compiled, and the loader gets NULL back for a
-    * function the driver plainly advertises and plainly implements.
-    *
-    * That is not cosmetic.  vkgears refuses the surface outright:
-    *
-    *     [Vulkan Loader] ERROR: ICD for selected physical device does not
-    *     export vkGetPhysicalDeviceWaylandPresentationSupportKHR!
-    *     Vulkan not supported on given Wayland surface
-    *
-    * and vulkaninfo segfaults, calling the pointer it was handed.  Both were
-    * the same missing answer.  vkcube never hit it: it does not query
-    * presentation support.
-    *
-    * Answering here is the whole fix.  The alternative -- turning on
-    * with_platform_wayland to get the trampoline -- would build libvulkan_wsi
-    * as well, which is a second Wayland implementation that nothing would call.
+    * Linking libvulkan_wsi compiles the trampoline, so the real implementation
+    * is found normally and the special case is gone -- including the earlier
+    * reasoning here, which called turning the option on "a second Wayland
+    * implementation that nothing would call".  That was true while
+    * ta5_wayland.cc existed.  It does not describe the driver now.
     */
-   if (func == NULL && pName &&
-       !strcmp(pName, "vkGetPhysicalDeviceWaylandPresentationSupportKHR"))
-      return (PFN_vkVoidFunction)
-         ta5_GetPhysicalDeviceWaylandPresentationSupportKHR;
 
    /*
     * Diagnostic: the Vulkan loader calls the driver entry point for every

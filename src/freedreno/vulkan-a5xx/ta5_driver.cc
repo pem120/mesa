@@ -417,9 +417,9 @@ ta5_physical_device_init(struct ta5_physical_device *device,
 
    device->instance = instance;
    device->dev_fd = dev_fd;
-   device->wsi_display = NULL;
-   device->wsi_mode = NULL;
-   simple_mtx_init(&device->wsi_mtx, mtx_plain);
+   /* No DRM master node is opened: the render node cannot do modesetting, and
+    * wsi_common only wants the master fd for the KMS path.  -1 disables it. */
+   device->master_fd = -1;
 
    snprintf(device->device_name, sizeof(device->device_name), "%s",
             ta5_device_name(device->dev_id.gpu_id));
@@ -456,6 +456,17 @@ ta5_physical_device_init(struct ta5_physical_device *device,
    device->heap_size = os_get_gpu_heap_size(heap_percent, &heap_percent);
    if (!device->heap_size)
       device->heap_size = (uint64_t)device->gpu_info.gmem_size;
+
+   /*
+    * Bring up libvulkan_wsi last: wsi_device_init() resolves a large set of
+    * device entry points through the dispatch table, so it needs the table and
+    * the memory/queue properties above to be in place first.
+    */
+   result = ta5_wsi_init(device);
+   if (result != VK_SUCCESS) {
+      vk_physical_device_finish(&device->vk);
+      return result;
+   }
 
    return VK_SUCCESS;
 }

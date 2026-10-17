@@ -33,6 +33,7 @@
 #include "vk_sync.h"
 
 #include "util/simple_mtx.h"
+#include "wsi_common.h"
 
 #include "ta5_device.h"
 
@@ -71,22 +72,20 @@ struct ta5_physical_device
    char device_name[VK_MAX_PHYSICAL_DEVICE_NAME_SIZE];
 
    /*
-    * Cached VK_KHR_display objects, created on the first display query and
-    * kept for the life of the physical device.
+    * The shared window-system-integration device.
     *
-    * They have to be cached rather than built per call because an application
-    * compares the handles from two different queries: it takes the display
-    * list from vkGetPhysicalDeviceDisplayPropertiesKHR and the per-plane
-    * display list from vkGetDisplayPlaneSupportedDisplaysKHR, then matches
-    * them with pointer equality.  A freshly allocated object per query gives
-    * two different pointers for the same panel and the match never happens --
-    * vkcube reports "Cannot find a plane compatible with the display!" and
-    * exits.  Both objects live as long as the physical device, so the mutex
-    * only guards the lazy creation.
+    * Wayland, KMS/display and headless surfaces and swapchains are all
+    * libvulkan_wsi's, reached through the common entrypoints that
+    * vk_device_init() merges in without overwriting driver-provided ones.
+    * Turnip's tu_wsi.cc is 67 lines for the same thing: this struct, one
+    * wsi_device_init() call, and two flags.
+    *
+    * master_fd is the DRM master node, which wsi_common needs for the KMS
+    * path; -1 means "no KMS on this device" and is what the Wayland path
+    * wants.
     */
-   struct ta5_display *wsi_display;
-   struct ta5_display_mode *wsi_mode;
-   simple_mtx_t wsi_mtx;
+   struct wsi_device wsi_device;
+   int master_fd;
 };
 VK_DEFINE_HANDLE_CASTS(ta5_physical_device, vk.base, VkPhysicalDevice,
                        VK_OBJECT_TYPE_PHYSICAL_DEVICE)
@@ -147,8 +146,8 @@ VK_DEFINE_HANDLE_CASTS(ta5_device, vk.base, VkDevice, VK_OBJECT_TYPE_DEVICE)
 extern const struct vk_instance_extension_table ta5_instance_extensions_supported;
 extern const struct vk_device_extension_table ta5_device_extensions_supported;
 
-VkResult ta5_wsi_display_init(struct ta5_physical_device *device);
-void ta5_wsi_display_finish(struct ta5_physical_device *device);
+VkResult ta5_wsi_init(struct ta5_physical_device *pdevice);
+void ta5_wsi_finish(struct ta5_physical_device *pdevice);
 
 VkResult ta5_physical_device_init(struct ta5_physical_device *device,
                                   struct ta5_instance *instance, int dev_fd);

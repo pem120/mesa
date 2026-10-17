@@ -267,15 +267,42 @@ the meson gate without checking what the WSI actually uses. The user's question
 
 ### 7.3 Remaining
 
-1. Add `struct wsi_device wsi_device` + `master_fd` to `struct ta5_physical_device`.
-2. `ta5_wsi_init()` / `ta5_wsi_finish()` mirroring `tu_wsi_init`.
-3. `ta5_GetMemoryFdKHR` / `ta5_GetMemoryFdPropertiesKHR`.
-4. Delete the remaining ~1478 lines of `ta5_wsi.cc` and all of `ta5_wayland.cc`
-   so the common entrypoints take over.
-5. Drop the `vkGetPhysicalDeviceWaylandPresentationSupportKHR` hack in
-   `ta5_instance.cc:364-367` — with `VK_USE_PLATFORM_WAYLAND_KHR` compiled the
-   real trampoline exists.
-6. **Log phoc's advertised `wl_dmabuf` format/modifier table early.**
+**The driver port is written and compiles. It is NOT deployed and NOT tested.**
+
+Done in the working tree (uncommitted at time of writing):
+- `struct wsi_device wsi_device` + `int master_fd` in `struct ta5_physical_device`
+- `ta5_wsi_init()` / `ta5_wsi_finish()` mirroring `tu_wsi_init`;
+  `supports_modifiers = true`, `master_fd = -1` (no KMS master node)
+- `ta5_GetMemoryFdKHR` / `ta5_GetMemoryFdPropertiesKHR` — also closes the
+  §6 bug
+- `ta5_wsi.cc` cut from 1478 to ~215 lines; `ta5_wayland.cc` deleted (1021 lines)
+- proc-addr hack removed from `ta5_instance.cc`
+
+Verified by inspection of the built `.so`:
+- `ta5_GetMemoryFdKHR` / `ta5_GetMemoryFdPropertiesKHR` are **defined** (`t`)
+- `ta5_CreateSwapchainKHR` is **undefined** (`U`) — our implementation is gone
+- `CreateWaylandSurfaceKHR`, `DestroySurfaceKHR`,
+  `GetPhysicalDeviceSurfaceCapabilitiesKHR`, `...FormatsKHR`,
+  `...PresentModesKHR`, `CreateDisplayPlaneSurfaceKHR`,
+  `GetPhysicalDeviceDisplayPropertiesKHR`,
+  `GetPhysicalDeviceWaylandPresentationSupportKHR` — **none defined by us**
+
+The mechanism is sound: the generated entrypoints declare unimplemented
+functions `extern template` weak, which alias to address 0 on ELF;
+`vk_device_dispatch_table_from_entrypoints(..., true)` skips `NULL` entries
+(`vk_dispatch_table.c:9881`), and `vk_device_init` then fills those slots
+from `vk_common_device_entrypoints` because it merges with `overwrite=false`
+(`vk_device.c:179`). Turnip relies on exactly this.
+
+Still to do:
+1. **Deploy and test** — blocked on the Wayland session being healthy.
+2. **Log phoc's advertised `wl_dmabuf` format/modifier table** (see §7.4).
+3. Confirm headless vkmark still passes 13/13 — `wsi_common_headless.c` now
+   serves that path instead of our own code, so this is a real regression risk,
+   not a formality.
+4. Verify `vkcube --wsi kms` still works: the old KMS path is gone, replaced by
+   `wsi_common_drm.c`, and we pass `master_fd = -1`. **Expect this to have
+   regressed** — it is untested and may well not work without a master node.
 
 ### 7.4 Known risk
 
