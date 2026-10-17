@@ -39,6 +39,8 @@
 #include "vk_object.h"
 #include "vk_physical_device.h"
 #include "vk_common_entrypoints.h"
+#include "vk_drm_syncobj.h"
+#include "wsi_common.h"
 
 #include "ta5_instance.h"
 #include "ta5_device.h"
@@ -428,6 +430,18 @@ ta5_physical_device_init(struct ta5_physical_device *device,
       &dispatch_table, &ta5_physical_device_entrypoints, true);
 
    /*
+    * Add the WSI physical-device entrypoints on top, without overwriting.
+    *
+    * The surface queries (capabilities, formats, present modes) live on the
+    * physical-device table, not the device one, so the overwrite=false merge
+    * in vk_device_init does not reach them -- they have to be added here or
+    * they stay NULL.  vulkaninfo jumped to address 0 on the first surface
+    * query until this was added.  Turnip does the same at tu_device.cc:1846.
+    */
+   vk_physical_device_dispatch_table_from_entrypoints(
+      &dispatch_table, &wsi_physical_device_entrypoints, false);
+
+   /*
     * Most physical-device queries have generic implementations in the Vulkan
     * runtime (vk_common_*): features, properties, queue families, memory,
     * format properties, sparse, external handles.  They read back what is
@@ -446,6 +460,22 @@ ta5_physical_device_init(struct ta5_physical_device *device,
    /* one universal graphics/compute/transfer queue family */
    device->queue_props[0] = ta5_gfx_queue_properties;
    device->num_queue_families = 1;
+
+   /*
+    * Publish the DRM syncobj provider before anything can ask for a sync type.
+    *
+    * wsi_device_init() calls vkGetPhysicalDeviceExternalSemaphoreProperties,
+    * which walks pdevice->supported_sync_types (vk_semaphore.c:108).  With that
+    * still NULL it dereferences NULL and vkEnumeratePhysicalDevices dies with
+    * a segfault in get_semaphore_sync_type -- which is what happened.
+    *
+    * The array lives in the physical device because supported_sync_types is a
+    * pointer to it.  Same shape as asahi's hk_physical_device.c:1360.
+    */
+   device->syncobj_sync_type = vk_drm_syncobj_get_type(device->dev_fd);
+   device->sync_types[0] = &device->syncobj_sync_type;
+   device->sync_types[1] = NULL;
+   device->vk.supported_sync_types = device->sync_types;
 
    /*
     * Single system-memory heap.  os_get_gpu_heap_size() applies the same

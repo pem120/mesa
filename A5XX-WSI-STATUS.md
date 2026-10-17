@@ -377,6 +377,82 @@ Local: `/tmp/opencode/`. Device: `/home/ishu/a5xx-test-tmp/`.
 
 ---
 
+## 10. Port runtime findings (2026-10-17, post-commit, UNCOMMITTED at time of writing)
+
+The port was built, deployed and tested. Two crashes found and fixed; one issue
+still open.
+
+### 10.1 Fixed: `vkEnumeratePhysicalDevices` segfaulted
+
+Backtrace:
+
+```
+#0  get_semaphore_sync_type (pdevice=...) at vk_semaphore.c:108
+#1  vk_common_GetPhysicalDeviceExternalSemaphoreProperties
+#2  wsi_device_init (...) at wsi_common.c:153
+#3  ta5_wsi_init (pdevice=...) at ta5_wsi.cc:114
+#4  ta5_physical_device_init (...) at ta5_driver.cc:465
+```
+
+`wsi_device_init()` queries external semaphore properties, which walks
+`pdevice->supported_sync_types` (`vk_semaphore.c:108`). That was NULL, so it
+dereferenced NULL. Turnip publishes the DRM syncobj type before `tu_wsi_init`
+(`tu_device.cc:1859`); we never did.
+
+Fix, following asahi's `hk_physical_device.c:1360`: add `syncobj_sync_type` and a
+`sync_types[2]` array to `struct ta5_physical_device`, fill from
+`vk_drm_syncobj_get_type(dev_fd)`, and set `vk.supported_sync_types`. Must
+happen **before** `ta5_wsi_init`.
+
+### 10.2 Fixed: `vulkaninfo` jumped to address 0
+
+After 10.1, `vulkaninfo --summary` segfaulted at `#0 0x0000000000000000`.
+
+The surface queries (capabilities, formats, present modes) live on the
+**physical-device** dispatch table, which `vk_device_init`'s `overwrite=false`
+merge never touches — that only merges device-level entries. Turnip adds
+`wsi_physical_device_entrypoints` explicitly (`tu_device.cc:1846`); we did not.
+
+Fix: a second
+`vk_physical_device_dispatch_table_from_entrypoints(&dispatch_table, &wsi_physical_device_entrypoints, false)`
+after ours, plus `#include "wsi_common.h"`.
+
+### 10.3 OPEN: headless surface capabilities returns ErrorExtensionNotPresent
+
+After both fixes:
+
+```
+$ vkmark --winsys headless -b clear:duration=1
+ta5: found a5xx device '/dev/dri/renderD128' gpu_id=506 ...
+Error: vk::PhysicalDevice::getSurfaceCapabilitiesKHR: ErrorExtensionNotPresent
+```
+
+`vulkaninfo --summary` works. The dispatch slot is no longer NULL, so this is a
+real return value from wsi_common, not a missing entry point.
+
+**Unfinished lead:** `struct wsi_interface` (`wsi_common_private.h:509`) exposes
+only `get_capabilities2` — there is no non-`2` member. vkmark calls the non-`2`
+`vkGetPhysicalDeviceSurfaceCapabilitiesKHR`. Unresolved questions:
+* where does the non-`2` wrapper live and what does it require?
+* is the headless path supposed to support the non-`2` query at all?
+* does `VK_ICD_WSI_PLATFORM_HEADLESS` get registered on this surface?
+
+**Do not treat this as diagnosed.** That was the thread in progress.
+
+### 10.4 Test matrix as of pause
+
+| Test | Result |
+|---|---|
+| build | clean, exit status propagated |
+| `vulkaninfo --summary` | **PASS** |
+| `vkmark --winsys headless -b clear` | **FAIL** — §10.3 |
+| full headless vkmark | **not run** — 13/13 predates the port and is at risk |
+| `vkcube --wsi wayland` | **not run** |
+| `vkcube --wsi kms` | **not run** — expect regression, `master_fd = -1` |
+| GPU fault storm | **not re-measured**, still unexplained |
+
+---
+
 ## 11. Discipline reminders
 
 * `main` must stay pristine; `git diff main -- src/gallium/` must be empty.

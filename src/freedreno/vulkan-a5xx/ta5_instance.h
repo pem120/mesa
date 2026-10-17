@@ -86,6 +86,16 @@ struct ta5_physical_device
     */
    struct wsi_device wsi_device;
    int master_fd;
+
+   /*
+    * DRM syncobj provider, published as vk_physical_device.supported_sync_types.
+    *
+    * The array must be storage rather than a temporary because
+    * supported_sync_types is a pointer to a NULL-terminated list of types that
+    * lives as long as the physical device.
+    */
+   struct vk_sync_type syncobj_sync_type;
+   const struct vk_sync_type *sync_types[2];
 };
 VK_DEFINE_HANDLE_CASTS(ta5_physical_device, vk.base, VkPhysicalDevice,
                        VK_OBJECT_TYPE_PHYSICAL_DEVICE)
