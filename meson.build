@@ -2245,7 +2245,15 @@ endif
 with_wayland_bind_display = with_platform_wayland and get_option('legacy-wayland').contains('bind-wayland-display')
 if with_platform_wayland
   dep_wayland_client = dependency('wayland-client', version : '>=1.18')
-  dep_wayland_server = dependency('wayland-server', version : '>=1.18')
+  # wayland-server is only used by the EGL wayland platform, gbm's dri backend
+  # and egl/wayland/wayland-drm, none of which are built when egl and gbm are
+  # disabled.  The Vulkan WSI (libvulkan_wsi) does not use it at all --
+  # wsi_common_wayland.c includes only <wayland-client.h> and calls only client
+  # symbols -- so requiring it here forces cross builds that want the Vulkan
+  # Wayland WSI to build a library they never link.  If something that does
+  # need it is enabled, the failure moves to that subproject, which is where
+  # the missing dependency is actually meaningful.
+  dep_wayland_server = dependency('wayland-server', version : '>=1.18', required : false)
   if with_egl
     dep_wayland_egl = dependency('wayland-egl-backend', version : '>= 3')
     dep_wayland_egl_headers = dep_wayland_egl.partial_dependency(compile_args : true)
