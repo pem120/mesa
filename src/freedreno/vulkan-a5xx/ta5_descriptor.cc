@@ -185,6 +185,29 @@ ta5_CreateDescriptorSetLayout(
 
       total += b->descriptorCount;
       layout->total_slots += dst->slot_cost;
+      dst->dynamic_offset_index = UINT32_MAX;
+      if (b->descriptorType == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC ||
+          b->descriptorType == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC)
+         layout->dynamic_offset_count += b->descriptorCount;
+   }
+
+   /* pBindings need not be sorted.  Dynamic offsets are always consumed in
+    * increasing binding number and array-element order, across all stages.
+    */
+   for (uint32_t i = 0; i < layout->binding_count; i++) {
+      struct ta5_descriptor_layout_binding *b = &layout->bindings[i];
+      if (b->type != VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC &&
+          b->type != VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC)
+         continue;
+
+      b->dynamic_offset_index = 0;
+      for (uint32_t j = 0; j < layout->binding_count; j++) {
+         const struct ta5_descriptor_layout_binding *prev = &layout->bindings[j];
+         if (prev->binding < b->binding &&
+             (prev->type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC ||
+              prev->type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC))
+            b->dynamic_offset_index += prev->descriptor_count;
+      }
    }
 
    *pSetLayout = ta5_descriptor_set_layout_to_handle(layout);
@@ -614,6 +637,11 @@ ta5_pipeline_layout_buffer_bindings(
          switch (b->type) {
          case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER:
          case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER:
+         /* Dynamic buffers use the same shader pointer slots.  Their dynamic
+          * offsets are command-buffer state, not part of shader lowering.
+          */
+         case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC:
+         case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC:
             break;
          default:
             continue;

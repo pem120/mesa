@@ -318,6 +318,11 @@ ta5_BeginCommandBuffer(VkCommandBuffer _cmd,
    cmd->submitted = 0;
    cmd->fence = NULL;
    cmd->state = MESA_VK_COMMAND_BUFFER_STATE_RECORDING;
+   cmd->record_result = VK_SUCCESS;
+   cmd->trace_framebuffer = NULL;
+   memset(cmd->bound_sets, 0, sizeof(cmd->bound_sets));
+   memset(cmd->dynamic_offsets, 0, sizeof(cmd->dynamic_offsets));
+   memset(cmd->blend_constants, 0, sizeof(cmd->blend_constants));
 
    /*
     * No stream header is emitted: an a5xx command stream is a bare sequence
@@ -338,6 +343,11 @@ ta5_EndCommandBuffer(VkCommandBuffer _cmd)
    struct ta5_cmd_buffer *cmd = ta5_cmd_buffer_from_handle(_cmd);
 
    assert(cmd->state == MESA_VK_COMMAND_BUFFER_STATE_RECORDING);
+
+   if (cmd->record_result != VK_SUCCESS) {
+      cmd->state = MESA_VK_COMMAND_BUFFER_STATE_INVALID;
+      return cmd->record_result;
+   }
 
    /*
     * A command buffer that recorded nothing is legal and becomes executable.
@@ -425,7 +435,7 @@ ta5_color_from_clear(VkClearColorValue c, bool srgb)
 
    /* The RB wants RGBA in dword 0..3 for an RGBA8 target. */
    for (uint32_t i = 0; i < 4; i++) {
-      float v = srgb ? ta5_linear_to_srgb(c.float32[i]) : c.float32[i];
+      float v = srgb && i < 3 ? ta5_linear_to_srgb(c.float32[i]) : c.float32[i];
       out.u32[i] = _mesa_float_to_unorm(v, 8);
    }
    return out;
@@ -767,6 +777,22 @@ ta5_instrlen(const struct ta5_compiled_shader *shader)
 }
 
 static void
+ta5_shader_instruction_lengths(const struct ta5_pipeline *pipe,
+                               uint32_t *vs_len, uint32_t *fs_len)
+{
+   *vs_len = ta5_instrlen(&pipe->vertex);
+   *fs_len = ta5_instrlen(&pipe->fragment);
+   if (*vs_len + *fs_len > 64) {
+      if (*fs_len < 64)
+         *vs_len = 0;
+      else if (*vs_len < 64)
+         *fs_len = 0;
+      else
+         *vs_len = *fs_len = 0;
+   }
+}
+
+static void
 ta5_emit_program_state(struct ta5_cmd_buffer *cmd, struct ta5_pipeline *pipe)
 {
    const struct ir3_shader_variant *vs =
@@ -779,8 +805,8 @@ ta5_emit_program_state(struct ta5_cmd_buffer *cmd, struct ta5_pipeline *pipe)
    uint32_t fs_constlen = pipe->fragment.constlen / 4;
    uint32_t vs_constoff = 0;
    uint32_t fs_constoff = vs_constlen;
-   uint32_t vs_instrlen = ta5_instrlen(&pipe->vertex);
-   uint32_t fs_instrlen = ta5_instrlen(&pipe->fragment);
+   uint32_t vs_instrlen, fs_instrlen;
+   ta5_shader_instruction_lengths(pipe, &vs_instrlen, &fs_instrlen);
    uint32_t fs_instroff = 64 - fs_instrlen;
 
    struct ir3_shader_linkage l = {0};
@@ -932,7 +958,7 @@ ta5_emit_program_state(struct ta5_cmd_buffer *cmd, struct ta5_pipeline *pipe)
    ta5_cs_push(cmd,
                A5XX_SP_VS_CTRL_REG0_HALFREGFOOTPRINT(vs->info.max_half_reg + 1) |
                   A5XX_SP_VS_CTRL_REG0_FULLREGFOOTPRINT(vs->info.max_reg + 1) |
-                  A5XX_SP_VS_CTRL_REG0_BUFFER | 0x2 |
+                  (vs_instrlen ? A5XX_SP_VS_CTRL_REG0_BUFFER : 0) | 0x2 |
                   A5XX_SP_VS_CTRL_REG0_BRANCHSTACK(
                      ir3_shader_branchstack_hw(vs)));
 
@@ -940,7 +966,7 @@ ta5_emit_program_state(struct ta5_cmd_buffer *cmd, struct ta5_pipeline *pipe)
    ta5_cs_push(cmd,
                (fs->total_in > 0 ? A5XX_SP_FS_CTRL_REG0_VARYING : 0) |
                   0x40002 /* XXX set pretty much everywhere */ |
-                  A5XX_SP_FS_CTRL_REG0_BUFFER |
+                  (fs_instrlen ? A5XX_SP_FS_CTRL_REG0_BUFFER : 0) |
                   A5XX_SP_FS_CTRL_REG0_THREADSIZE(fssz) |
                   A5XX_SP_FS_CTRL_REG0_HALFREGFOOTPRINT(
                      fs->info.max_half_reg + 1) |
@@ -1447,7 +1473,13 @@ ta5_emit_ubo_pointers(struct ta5_cmd_buffer *cmd, struct ta5_pipeline *pipe,
                buf = ta5_buffer_from_handle(desc->data.buffer.buffer);
                if (buf && buf->bound_memory) {
                   bo = buf->bound_memory->bo;
-                  bo_offset = desc->data.buffer.offset;
+                  bo_offset = buf->offset + desc->data.buffer.offset;
+                  if (bind->dynamic_offset_index != UINT32_MAX) {
+                     const uint32_t index =
+                        bind->dynamic_offset_index + order[i].element;
+                     assert(index < ARRAY_SIZE(cmd->dynamic_offsets[order[i].set]));
+                     bo_offset += cmd->dynamic_offsets[order[i].set][index];
+                  }
                }
                break;
             }
@@ -1456,11 +1488,12 @@ ta5_emit_ubo_pointers(struct ta5_cmd_buffer *cmd, struct ta5_pipeline *pipe,
 
       if (getenv("TA5_TRACE_UBO")) {
          fprintf(stderr,
-                 "ta5[ubo] %s block %u set=%u binding=%u elem=%u bo=%p\n",
+                 "ta5[ubo] %s block %u set=%u binding=%u elem=%u bo=%p offset=%llu\n",
                  stage == VK_SHADER_STAGE_VERTEX_BIT ? "vs" : "fs", i,
                  i < num_order ? order[i].set : 0,
                  i < num_order ? order[i].binding : 0,
-                 i < num_order ? order[i].element : 0, (void *)bo);
+                 i < num_order ? order[i].element : 0, (void *)bo,
+                 (unsigned long long)bo_offset);
 
          /*
           * The first 64 bytes as the CPU sees them.  This is the question
@@ -1582,6 +1615,11 @@ ta5_emit_shader(struct ta5_cmd_buffer *cmd, struct ta5_pipeline *pipe,
    ret = ta5_emit_shader_obj(cmd, pipe, obj_reg, bo);
    if (ret != VK_SUCCESS)
       return ret;
+
+   uint32_t vs_instrlen, fs_instrlen;
+   ta5_shader_instruction_lengths(pipe, &vs_instrlen, &fs_instrlen);
+   if (!(state_block == SB4_VS_SHADER ? vs_instrlen : fs_instrlen))
+      return VK_SUCCESS;
 
    /*
     * TA5_SKIP_FS suppresses only the program load, not the object address.
@@ -1996,7 +2034,7 @@ ta5_emit_textures(struct ta5_cmd_buffer *cmd, enum a4xx_state_block sb,
    return num_textures;
 }
 
-static void ta5_emit_draw_state(struct ta5_cmd_buffer *cmd,
+static VkResult ta5_emit_draw_state(struct ta5_cmd_buffer *cmd,
                                unsigned vs_tex_count, unsigned fs_tex_count,
                                uint32_t vertex_count,
                                const struct ta5_pipeline *pipe);
@@ -2469,9 +2507,65 @@ ta5_emit_sysmem_prep(struct ta5_cmd_buffer *cmd,
    ta5_emit_msaa(cmd);
    /* No pipeline is bound yet: this arms the frame, and every draw
     * re-emits this state with the pipeline that owns it. */
-   ta5_emit_draw_state(cmd, 0, 0, 0, NULL);
+   return ta5_emit_draw_state(cmd, 0, 0, 0, NULL);
+}
 
-   return VK_SUCCESS;
+static enum adreno_rb_blend_factor
+ta5_blend_factor(VkBlendFactor factor)
+{
+   switch (factor) {
+   case VK_BLEND_FACTOR_ZERO:
+      return FACTOR_ZERO;
+   case VK_BLEND_FACTOR_ONE:
+      return FACTOR_ONE;
+   case VK_BLEND_FACTOR_SRC_COLOR:
+      return FACTOR_SRC_COLOR;
+   case VK_BLEND_FACTOR_ONE_MINUS_SRC_COLOR:
+      return FACTOR_ONE_MINUS_SRC_COLOR;
+   case VK_BLEND_FACTOR_DST_COLOR:
+      return FACTOR_DST_COLOR;
+   case VK_BLEND_FACTOR_ONE_MINUS_DST_COLOR:
+      return FACTOR_ONE_MINUS_DST_COLOR;
+   case VK_BLEND_FACTOR_SRC_ALPHA:
+      return FACTOR_SRC_ALPHA;
+   case VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA:
+      return FACTOR_ONE_MINUS_SRC_ALPHA;
+   case VK_BLEND_FACTOR_DST_ALPHA:
+      return FACTOR_DST_ALPHA;
+   case VK_BLEND_FACTOR_ONE_MINUS_DST_ALPHA:
+      return FACTOR_ONE_MINUS_DST_ALPHA;
+   case VK_BLEND_FACTOR_CONSTANT_COLOR:
+      return FACTOR_CONSTANT_COLOR;
+   case VK_BLEND_FACTOR_ONE_MINUS_CONSTANT_COLOR:
+      return FACTOR_ONE_MINUS_CONSTANT_COLOR;
+   case VK_BLEND_FACTOR_CONSTANT_ALPHA:
+      return FACTOR_CONSTANT_ALPHA;
+   case VK_BLEND_FACTOR_ONE_MINUS_CONSTANT_ALPHA:
+      return FACTOR_ONE_MINUS_CONSTANT_ALPHA;
+   case VK_BLEND_FACTOR_SRC_ALPHA_SATURATE:
+      return FACTOR_SRC_ALPHA_SATURATE;
+   default:
+      return (enum adreno_rb_blend_factor)-1;
+   }
+}
+
+static enum a3xx_rb_blend_opcode
+ta5_blend_op(VkBlendOp op)
+{
+   switch (op) {
+   case VK_BLEND_OP_ADD:
+      return BLEND_DST_PLUS_SRC;
+   case VK_BLEND_OP_SUBTRACT:
+      return BLEND_SRC_MINUS_DST;
+   case VK_BLEND_OP_REVERSE_SUBTRACT:
+      return BLEND_DST_MINUS_SRC;
+   case VK_BLEND_OP_MIN:
+      return BLEND_MIN_DST_SRC;
+   case VK_BLEND_OP_MAX:
+      return BLEND_MAX_DST_SRC;
+   default:
+      return (enum a3xx_rb_blend_opcode)-1;
+   }
 }
 
 /**
@@ -2483,11 +2577,78 @@ ta5_emit_sysmem_prep(struct ta5_cmd_buffer *cmd,
  * colour pipe at all.  Values are the no-blend, no-depth, one-target case,
  * matching a default VkPipelineColorBlendState with an R8G8B8A8_UNORM target.
  */
-static void
+static VkResult
 ta5_emit_draw_state(struct ta5_cmd_buffer *cmd, unsigned vs_tex_count,
                      unsigned fs_tex_count, uint32_t vertex_count,
                      const struct ta5_pipeline *pipe)
 {
+   const struct vk_color_blend_state *cb =
+      pipe ? pipe->graphics_state.cb : NULL;
+   const struct vk_color_blend_attachment_state *att =
+      cb && cb->attachment_count ? &cb->attachments[0] : NULL;
+   const bool blend_enable = att && att->blend_enable;
+   const uint32_t blend_mask = blend_enable ? 1 : 0;
+   uint32_t write_mask = pipe ? 0 : 0xf;
+   uint32_t blend_control = 0;
+   bool uses_blend_constants = false;
+
+   if (cb && (cb->attachment_count > 1 || cb->logic_op_enable))
+      return vk_errorf(&cmd->device->instance->vk, VK_ERROR_FEATURE_NOT_PRESENT,
+                      "only single-target blending without logic operations is supported");
+
+   if (blend_enable &&
+       (att->src_color_blend_factor > VK_BLEND_FACTOR_SRC_ALPHA_SATURATE ||
+        att->dst_color_blend_factor > VK_BLEND_FACTOR_SRC_ALPHA_SATURATE ||
+        att->src_alpha_blend_factor > VK_BLEND_FACTOR_SRC_ALPHA_SATURATE ||
+        att->dst_alpha_blend_factor > VK_BLEND_FACTOR_SRC_ALPHA_SATURATE ||
+        (unsigned)att->color_blend_op > VK_BLEND_OP_MAX ||
+        (unsigned)att->alpha_blend_op > VK_BLEND_OP_MAX))
+      return vk_errorf(&cmd->device->instance->vk, VK_ERROR_FEATURE_NOT_PRESENT,
+                      "unsupported blend factor or operation");
+
+   if (att && (cb->color_write_enables & 1))
+      write_mask = att->write_mask & 0xf;
+
+   if (blend_enable) {
+      blend_control =
+         A5XX_RB_MRT_BLEND_CONTROL_RGB_SRC_FACTOR(
+            ta5_blend_factor((VkBlendFactor)att->src_color_blend_factor)) |
+         A5XX_RB_MRT_BLEND_CONTROL_RGB_BLEND_OPCODE(
+            ta5_blend_op(att->color_blend_op)) |
+         A5XX_RB_MRT_BLEND_CONTROL_RGB_DEST_FACTOR(
+            ta5_blend_factor((VkBlendFactor)att->dst_color_blend_factor)) |
+         A5XX_RB_MRT_BLEND_CONTROL_ALPHA_SRC_FACTOR(
+            ta5_blend_factor((VkBlendFactor)att->src_alpha_blend_factor)) |
+         A5XX_RB_MRT_BLEND_CONTROL_ALPHA_BLEND_OPCODE(
+            ta5_blend_op(att->alpha_blend_op)) |
+         A5XX_RB_MRT_BLEND_CONTROL_ALPHA_DEST_FACTOR(
+            ta5_blend_factor((VkBlendFactor)att->dst_alpha_blend_factor));
+
+      const uint8_t factors[] = {
+         att->src_color_blend_factor, att->dst_color_blend_factor,
+         att->src_alpha_blend_factor, att->dst_alpha_blend_factor,
+      };
+      for (unsigned i = 0; i < ARRAY_SIZE(factors); i++) {
+         const VkBlendOp op = i < 2 ? att->color_blend_op : att->alpha_blend_op;
+         uses_blend_constants |=
+            op != VK_BLEND_OP_MIN && op != VK_BLEND_OP_MAX &&
+            factors[i] >= VK_BLEND_FACTOR_CONSTANT_COLOR &&
+            factors[i] <= VK_BLEND_FACTOR_ONE_MINUS_CONSTANT_ALPHA;
+      }
+   }
+
+   const float *blend_constants = cb ? cb->blend_constants : NULL;
+   if (uses_blend_constants &&
+       BITSET_TEST(pipe->graphics_state.dynamic,
+                   MESA_VK_DYNAMIC_CB_BLEND_CONSTANTS))
+      blend_constants = cmd->blend_constants;
+
+   const uint32_t mrt_control =
+      A5XX_RB_MRT_CONTROL_ROP_CODE(ROP_COPY) |
+      A5XX_RB_MRT_CONTROL_COMPONENT_ENABLE(write_mask) |
+      (blend_enable ? A5XX_RB_MRT_CONTROL_BLEND | A5XX_RB_MRT_CONTROL_BLEND2 : 0) |
+      (getenv("TA5_ROP_ENABLE") ? A5XX_RB_MRT_CONTROL_ROP_ENABLE : 0);
+
    /* fd5_emit_render_cntl(blit = false, binning = false) */
    ta5_pkt4(cmd, REG_A5XX_RB_RENDER_CNTL, 1);
    ta5_cs_push(cmd, 0x00000008);
@@ -2535,16 +2696,13 @@ ta5_emit_draw_state(struct ta5_cmd_buffer *cmd, unsigned vs_tex_count,
                         A5XX_SP_FS_OUTPUT_CNTL_DEPTH_REGID(regid(63, 0)) |
                         A5XX_SP_FS_OUTPUT_CNTL_SAMPLEMASK_REGID(regid(63, 0)));
 
-   /*
-    * No attachment blends, so both enable masks are zero -- but fd5 still
-    * carries the driver's UNK8 bit on the shader side and the full default
-    * sample mask on the RB side (fd5_blend.c:110-119, fd5_emit.c:848-850).
-    */
    ta5_pkt4(cmd, REG_A5XX_SP_BLEND_CNTL, 1);
-   ta5_cs_push(cmd, A5XX_SP_BLEND_CNTL_UNK8);
+   ta5_cs_push(cmd, A5XX_SP_BLEND_CNTL_ENABLE_BLEND(blend_mask) |
+                     A5XX_SP_BLEND_CNTL_UNK8);
 
    ta5_pkt4(cmd, REG_A5XX_RB_BLEND_CNTL, 1);
-   ta5_cs_push(cmd, A5XX_RB_BLEND_CNTL_SAMPLE_MASK(0xffff));
+   ta5_cs_push(cmd, A5XX_RB_BLEND_CNTL_ENABLE_BLEND(blend_mask) |
+                     A5XX_RB_BLEND_CNTL_SAMPLE_MASK(0xffff));
 
    /*
     * Per-attachment ROP.  RB_MRT_CONTROL_COMPONENT_ENABLE is a *mask of colour
@@ -2561,14 +2719,10 @@ ta5_emit_draw_state(struct ta5_cmd_buffer *cmd, unsigned vs_tex_count,
     */
    for (int i = 0; i < 8; i++) {
       ta5_pkt4(cmd, REG_A5XX_RB_MRT_CONTROL(i), 1);
-      ta5_cs_push(cmd, A5XX_RB_MRT_CONTROL_ROP_CODE(ROP_COPY) |
-                        A5XX_RB_MRT_CONTROL_COMPONENT_ENABLE(0xf) |
-                        (getenv("TA5_ROP_ENABLE")
-                             ? A5XX_RB_MRT_CONTROL_ROP_ENABLE
-                             : 0));
+      ta5_cs_push(cmd, i == 0 ? mrt_control : 0);
 
       ta5_pkt4(cmd, REG_A5XX_RB_MRT_BLEND_CONTROL(i), 1);
-      ta5_cs_push(cmd, 0x00000000);
+      ta5_cs_push(cmd, i == 0 ? blend_control : 0);
    }
 
    /*
@@ -2680,8 +2834,17 @@ ta5_emit_draw_state(struct ta5_cmd_buffer *cmd, unsigned vs_tex_count,
 
    /* Blend colour, even with blending disabled. */
    ta5_pkt4(cmd, REG_A5XX_RB_BLEND_RED, 8);
-   for (int i = 0; i < 8; i++)
-      ta5_cs_push(cmd, 0x00000000);
+   for (unsigned i = 0; i < 4; i++) {
+      const float value = uses_blend_constants ? blend_constants[i] : 0.0f;
+      const uint32_t unorm = (uint32_t)(CLAMP(value, 0.0f, 1.0f) * 255.0f);
+      const uint32_t snorm =
+         (uint32_t)(int32_t)(CLAMP(value, -1.0f, 1.0f) * 127.0f) & 0xff;
+      ta5_cs_push(cmd, A5XX_RB_BLEND_RED_FLOAT(value) |
+                        A5XX_RB_BLEND_RED_UINT(unorm) |
+                        A5XX_RB_BLEND_RED_SINT(snorm));
+      ta5_cs_push(cmd, A5XX_RB_BLEND_RED_F32(value));
+   }
+   return VK_SUCCESS;
 }
 
 /** Clear every colour attachment. */
@@ -3630,6 +3793,15 @@ ta5_CmdPushConstants(VkCommandBuffer _cmd, VkPipelineLayout layout,
  * turn a rejected call into a silently accepted one.
  */
 VKAPI_ATTR void VKAPI_CALL
+ta5_CmdSetBlendConstants(VkCommandBuffer _cmd, const float blendConstants[4])
+{
+   struct ta5_cmd_buffer *cmd = ta5_cmd_buffer_from_handle(_cmd);
+   if (cmd->state != MESA_VK_COMMAND_BUFFER_STATE_RECORDING)
+      return;
+   memcpy(cmd->blend_constants, blendConstants, sizeof(cmd->blend_constants));
+}
+
+VKAPI_ATTR void VKAPI_CALL
 ta5_CmdSetViewport(VkCommandBuffer _cmd, uint32_t firstViewport,
                    uint32_t viewportCount, const VkViewport *pViewports)
 {
@@ -3748,20 +3920,34 @@ ta5_CmdBindDescriptorSets(VkCommandBuffer _cmd,
                           const uint32_t *pDynamicOffsets)
 {
    struct ta5_cmd_buffer *cmd = ta5_cmd_buffer_from_handle(_cmd);
-   uint32_t i;
+   const struct ta5_pipeline_layout *layout =
+      ta5_pipeline_layout_from_handle(_layout);
+   uint32_t dynamic_index = 0;
 
-   (void)_layout;
    (void)pipelineBindPoint;
-   (void)dynamicOffsetCount;
-   (void)pDynamicOffsets;
 
-   if (firstSet + descriptorSetCount > ARRAY_SIZE(cmd->bound_sets))
+   if (cmd->state != MESA_VK_COMMAND_BUFFER_STATE_RECORDING ||
+       firstSet > ARRAY_SIZE(cmd->bound_sets) ||
+       descriptorSetCount > ARRAY_SIZE(cmd->bound_sets) - firstSet)
       return;
 
-   for (i = 0; i < descriptorSetCount; i++) {
-      cmd->bound_sets[firstSet + i] =
-         ta5_descriptor_set_from_handle(pDescriptorSets[i]);
+   for (uint32_t i = 0; i < descriptorSetCount; i++) {
+      const uint32_t set = firstSet + i;
+      const uint32_t count = layout->set_layouts[set]->dynamic_offset_count;
+      if (count > ARRAY_SIZE(cmd->dynamic_offsets[set]) ||
+          count > dynamicOffsetCount - dynamic_index) {
+         cmd->record_result = vk_errorf(&cmd->device->instance->vk,
+            VK_ERROR_UNKNOWN, "CmdBindDescriptorSets: invalid dynamic offset count");
+         return;
+      }
+
+      cmd->bound_sets[set] = ta5_descriptor_set_from_handle(pDescriptorSets[i]);
+      if (count)
+         memcpy(cmd->dynamic_offsets[set], pDynamicOffsets + dynamic_index,
+                count * sizeof(*pDynamicOffsets));
+      dynamic_index += count;
    }
+   assert(dynamic_index == dynamicOffsetCount);
 }
 
 VKAPI_ATTR void VKAPI_CALL
@@ -3784,6 +3970,8 @@ ta5_CmdBeginRenderPass(VkCommandBuffer _cmd,
    cmd->bound_render_pass = pass;
    cmd->bound_framebuffer =
       ta5_framebuffer_from_handle(pRenderPassBegin->framebuffer);
+   if (getenv("TA5_DUMP_FB"))
+      cmd->trace_framebuffer = cmd->bound_framebuffer;
 
    /* The scissor is clipped to the render area, so the area has to be known
     * before any draw is recorded.  Stored rather than emitted: it only affects
@@ -3906,6 +4094,173 @@ ta5_CmdBeginRenderPass(VkCommandBuffer _cmd,
          if (ta5_emit_clear_depth(cmd, cmd->device, att, fb->attachments[i],
                                   clear[i].depthStencil.depth) != VK_SUCCESS)
             return;
+      }
+   }
+}
+
+/* Record exact linear-image row writes in bounded IBs, not the 64 KiB main
+ * stream.  Each IB and its relocations live until command-buffer reset, so
+ * replay does not depend on host writes to the attachment.
+ */
+static VkResult
+ta5_emit_clear_rows(struct ta5_cmd_buffer *cmd, const struct ta5_image *image,
+                    uint32_t x0, uint32_t y0, uint32_t x1, uint32_t y1,
+                    uint32_t color)
+{
+   const uint32_t capacity = 16384;
+   const struct ta5_image_level *level = &image->levels[0];
+   struct ta5_cmd_buffer rows = {};
+   rows.device = cmd->device;
+   VkResult ret = ta5_cmd_buffer_alloc_cs(&rows, capacity);
+   if (ret != VK_SUCCESS)
+      return ret;
+
+   for (uint32_t y = y0; y < y1; y++) {
+      for (uint32_t x = x0; x < x1;) {
+         const uint32_t count = MIN2(x1 - x, capacity - rows.cs_count - 3);
+         const uint64_t offset = image->offset + level->offset +
+                                 (uint64_t)y * level->row_pitch + (uint64_t)x * 4;
+         ta5_pkt7(&rows, CP_MEM_WRITE, count + 2);
+         ret = ta5_cs_reloc(&rows, image->bound_memory->bo, offset, 0);
+         if (ret != VK_SUCCESS)
+            goto done;
+         for (uint32_t i = 0; i < count; i++)
+            ta5_cs_push(&rows, color);
+         x += count;
+
+         if (capacity - rows.cs_count < 4 || (y + 1 == y1 && x == x1)) {
+            ret = ta5_cmd_buffer_add_ib(cmd, &rows);
+            if (ret != VK_SUCCESS)
+               goto done;
+            ret = ta5_cmd_buffer_alloc_cs(cmd, cmd->cs_count + 6);
+            if (ret != VK_SUCCESS)
+               goto done;
+            const struct ta5_ib *ib = &cmd->ibs[cmd->ib_count - 1];
+            ta5_pkt7(cmd, CP_INDIRECT_BUFFER, 3);
+            ret = ta5_cs_reloc(cmd, ib->bo, 0, 0);
+            if (ret != VK_SUCCESS)
+               goto done;
+            ta5_cs_push(cmd, ib->size);
+            ta5_pkt7(cmd, CP_SKIP_IB2_ENABLE_GLOBAL, 1);
+            ta5_cs_push(cmd, 0);
+            rows.cs_count = 0;
+         }
+      }
+   }
+
+done:
+   vk_free(&cmd->device->vk.alloc, rows.relocs);
+   vk_free(&cmd->device->vk.alloc, rows.reloc_bos);
+   vk_free(&cmd->device->vk.alloc, rows.cs);
+   return ret;
+}
+
+/*
+ * In-pass colour clears must be recorded in the GPU stream: neither a host
+ * fill at record time nor a pre-submit fill preserves draw/clear ordering.
+ * The current render path supports one colour target and one framebuffer
+ * layer.  Reject other cases rather than silently clearing the wrong target.
+ */
+VKAPI_ATTR void VKAPI_CALL
+ta5_CmdClearAttachments(VkCommandBuffer _cmd, uint32_t attachmentCount,
+                         const VkClearAttachment *pAttachments,
+                         uint32_t rectCount, const VkClearRect *pRects)
+{
+   struct ta5_cmd_buffer *cmd = ta5_cmd_buffer_from_handle(_cmd);
+   const struct ta5_framebuffer *fb = cmd->bound_framebuffer;
+
+   if (cmd->state != MESA_VK_COMMAND_BUFFER_STATE_RECORDING ||
+       cmd->record_result != VK_SUCCESS || !fb || !attachmentCount || !rectCount)
+      return;
+
+   if (getenv("TA5_SKIP_CLEAR") || getenv("TA5_SKIP_CLEAR_COLOR"))
+      return;
+
+   for (uint32_t a = 0; a < attachmentCount; a++) {
+      const VkClearAttachment *att = &pAttachments[a];
+      const struct ta5_image_view *view = fb->attachments[0];
+      if (att->aspectMask != VK_IMAGE_ASPECT_COLOR_BIT ||
+          att->colorAttachment != 0 || !view ||
+          !ta5_format_is_color(view->format) || view->base_mip_level ||
+          view->base_array_layer) {
+         cmd->record_result = vk_errorf(&cmd->device->instance->vk,
+            VK_ERROR_FEATURE_NOT_PRESENT,
+            "CmdClearAttachments: only colour target 0, mip/layer 0 is supported");
+         return;
+      }
+
+      union ta5_color color = ta5_color_from_clear(att->clearValue.color,
+         view->format == VK_FORMAT_B8G8R8A8_SRGB ||
+         view->format == VK_FORMAT_R8G8B8A8_SRGB);
+
+      for (uint32_t r = 0; r < rectCount; r++) {
+         const VkClearRect *rect = &pRects[r];
+         if (rect->baseArrayLayer || rect->layerCount != 1) {
+            cmd->record_result = vk_errorf(&cmd->device->instance->vk,
+               VK_ERROR_FEATURE_NOT_PRESENT,
+               "CmdClearAttachments: layered clears are not implemented");
+            return;
+         }
+
+         /* Clear rectangles are independent of the pipeline's scissor. */
+         const int64_t x0 = MAX3((int64_t)rect->rect.offset.x,
+                                (int64_t)cmd->render_area.offset.x, 0);
+         const int64_t y0 = MAX3((int64_t)rect->rect.offset.y,
+                                (int64_t)cmd->render_area.offset.y, 0);
+         const int64_t x1 = MIN3((int64_t)rect->rect.offset.x +
+                                   rect->rect.extent.width,
+                                (int64_t)cmd->render_area.offset.x +
+                                   cmd->render_area.extent.width,
+                                (int64_t)fb->width);
+         const int64_t y1 = MIN3((int64_t)rect->rect.offset.y +
+                                   rect->rect.extent.height,
+                                (int64_t)cmd->render_area.offset.y +
+                                   cmd->render_area.extent.height,
+                                (int64_t)fb->height);
+         if (x1 <= x0 || y1 <= y0)
+            continue;
+
+         const bool full = x0 == 0 && y0 == 0 &&
+                           x1 == fb->width && y1 == fb->height;
+         cmd->record_result = ta5_cmd_buffer_alloc_cs(cmd, cmd->cs_count + 128);
+         if (cmd->record_result != VK_SUCCESS)
+            return;
+
+         ta5_wfi(cmd);
+         if (full) {
+            cmd->record_result = ta5_emit_clear(cmd, cmd->device, &color);
+            if (cmd->record_result != VK_SUCCESS)
+               return;
+            ta5_wfi(cmd);
+            continue;
+         }
+
+         /* CCU fast clears miss non-tile-aligned rectangle edges.  For the
+          * linear RGBA8 targets supported here, emit exact row writes instead.
+          * This is deliberately slow but remains ordered with GPU draws and
+          * replays; no image contents are modified while recording.
+          */
+         cmd->record_result = ta5_event_write_ts(cmd, cmd->device->blit_bo,
+                                                 PC_CCU_FLUSH_COLOR_TS);
+         if (cmd->record_result != VK_SUCCESS)
+            return;
+         ta5_wfi(cmd);
+
+         const bool bgra = view->format == VK_FORMAT_B8G8R8A8_UNORM ||
+                           view->format == VK_FORMAT_B8G8R8A8_SRGB;
+         const uint32_t word = color.u32[bgra ? 2 : 0] |
+                               (color.u32[1] << 8) |
+                               (color.u32[bgra ? 0 : 2] << 16) |
+                               (color.u32[3] << 24);
+         cmd->record_result = ta5_emit_clear_rows(cmd, view->image,
+                                                  x0, y0, x1, y1, word);
+         if (cmd->record_result != VK_SUCCESS)
+            return;
+         cmd->record_result = ta5_cmd_buffer_alloc_cs(cmd, cmd->cs_count + 3);
+         if (cmd->record_result != VK_SUCCESS)
+            return;
+         ta5_pkt7(cmd, CP_WAIT_MEM_WRITES, 0);
+         ta5_event_write(cmd, PC_CCU_INVALIDATE_COLOR);
       }
    }
 }
@@ -4212,10 +4567,10 @@ ta5_CmdUpdateBuffer(VkCommandBuffer _cmd, VkBuffer dstBuffer,
     * rather than scribble past the allocation. */
    if (dstOffset >= buffer->size)
       return;
-   if (dstOffset + dataSize > buffer->size)
+   if (dataSize > buffer->size - dstOffset)
       dataSize = buffer->size - dstOffset;
 
-   memcpy((char *)map + dstOffset, pData, dataSize);
+   memcpy((char *)map + buffer->offset + dstOffset, pData, dataSize);
 }
 
 /*
@@ -4264,8 +4619,8 @@ ta5_CmdCopyBuffer(VkCommandBuffer _cmd, VkBuffer srcBuffer,
       size = MIN3(size, src->size - reg->srcOffset,
                   dst->size - reg->dstOffset);
 
-      memcpy((char *)dst_map + reg->dstOffset, (char *)src_map + reg->srcOffset,
-             size);
+      memcpy((char *)dst_map + dst->offset + reg->dstOffset,
+             (char *)src_map + src->offset + reg->srcOffset, size);
    }
 }
 
@@ -4453,8 +4808,8 @@ ta5_CmdCopyBufferToImage(VkCommandBuffer _cmd, VkBuffer srcBuffer,
          continue;
 
       dst_pitch = lvl->row_pitch;
-      src_pitch = reg->bufferRowLength ? reg->bufferRowLength * block_size
-                                       : dst_pitch;
+      src_pitch = (VkDeviceSize)(reg->bufferRowLength ? reg->bufferRowLength
+                                                     : cols) * block_size;
 
       dst_base = image->offset + lvl->offset +
                  (VkDeviceSize)reg->imageSubresource.baseArrayLayer *
@@ -4463,8 +4818,8 @@ ta5_CmdCopyBufferToImage(VkCommandBuffer _cmd, VkBuffer srcBuffer,
                  (VkDeviceSize)reg->imageOffset.x * block_size;
 
       for (uint32_t y = 0; y < rows; y++) {
-         const uint8_t *s = (const uint8_t *)src_map + reg->bufferOffset +
-                            (VkDeviceSize)y * src_pitch;
+         const uint8_t *s = (const uint8_t *)src_map + buffer->offset +
+                            reg->bufferOffset + (VkDeviceSize)y * src_pitch;
          uint8_t *d = (uint8_t *)dst_map + dst_base + (VkDeviceSize)y * dst_pitch;
 
          /* Row by row: the two pitches are independent, and only when they
@@ -4558,9 +4913,9 @@ ta5_cmd_buffer_run_deferred_i2b(struct ta5_cmd_buffer *cmd)
          const uint32_t depth = reg->imageExtent.depth;
          const uint32_t layers = reg->imageSubresource.layerCount;
          const VkDeviceSize src_pitch = row_pitch;
-         const VkDeviceSize dst_pitch = reg->bufferRowLength
-                                           ? reg->bufferRowLength * block_size
-                                           : src_pitch;
+         const VkDeviceSize dst_pitch =
+            (VkDeviceSize)(reg->bufferRowLength ? reg->bufferRowLength : cols) *
+            block_size;
          const VkDeviceSize dst_layer_pitch =
             reg->bufferImageHeight
                ? (VkDeviceSize)reg->bufferImageHeight * dst_pitch
@@ -4583,7 +4938,8 @@ ta5_cmd_buffer_run_deferred_i2b(struct ta5_cmd_buffer *cmd)
                const uint8_t *src_row = (const uint8_t *)src_map +
                                         src_layer_base +
                                         (VkDeviceSize)z * layer_pitch;
-               uint8_t *dst_row = (uint8_t *)dst_map + dst_layer_base +
+               uint8_t *dst_row = (uint8_t *)dst_map + buffer->offset +
+                                  dst_layer_base +
                                   (VkDeviceSize)z * dst_layer_pitch;
 
                for (uint32_t y = 0; y < rows; y++) {
@@ -4848,18 +5204,18 @@ ta5_CmdBindIndexBuffer(VkCommandBuffer _cmd, VkBuffer buffer,
       fprintf(stderr, "ta5: BindIndexBuffer buffer=%p buf=%p mem=%p off=%llu type=%d\n",
               (void *)buffer, (void *)buf, (void *)(buf ? (void *)buf->bound_memory : NULL),
               (unsigned long long)offset, (int)indexType);
-   if (!buf || !buf->bound_memory)
+   if (!buf || !buf->bound_memory || !buf->bound_memory->bo || offset >= buf->size)
       return;
 
    cmd->index_bo = buf->bound_memory->bo;
-   cmd->index_buffer_offset = offset;
+   cmd->index_buffer_offset = buf->offset + offset;
    /*
     * MaxIndices is how many indices the buffer holds, which is what fd5 hands
     * the hardware (fd5_draw.h:109: idx_buffer->width0 / index_size).  It bounds
     * the fetch; nothing in vkcube's draw reaches it, but a wrong value here is
     * how the VFD ends up walking off the end of the buffer.
     */
-   cmd->index_count = (uint32_t)((buf->bound_memory->bo->size - offset) /
+   cmd->index_count = (uint32_t)((buf->size - offset) /
                                  (indexType == VK_INDEX_TYPE_UINT16 ? 2 : 4));
 }
 
@@ -4890,7 +5246,8 @@ ta5_record_draw(struct ta5_cmd_buffer *cmd, uint32_t vertexCount,
    cmd->draw_first_instance = firstInstance;
    cmd->draw_index_size = index_size;
 
-   if (cmd->state != MESA_VK_COMMAND_BUFFER_STATE_RECORDING || pipe == NULL)
+   if (cmd->state != MESA_VK_COMMAND_BUFFER_STATE_RECORDING ||
+       cmd->record_result != VK_SUCCESS || pipe == NULL)
       return;
 
    if (getenv("TA5_SKIP_DRAW"))
@@ -4942,6 +5299,8 @@ ta5_record_draw(struct ta5_cmd_buffer *cmd, uint32_t vertexCount,
          return;
       }
    }
+
+   ta5_wfi(draw);
 
    /*
     * Viewport transform.  The vertex shader produces NDC, so this is the
@@ -5161,7 +5520,7 @@ ta5_record_draw(struct ta5_cmd_buffer *cmd, uint32_t vertexCount,
          size = buf->size - base;
 
          ta5_pkt4(draw, REG_A5XX_VFD_FETCH(fetch_cnt), 4);
-         ret = ta5_cs_reloc(draw, bo, base, 0);
+         ret = ta5_cs_reloc(draw, bo, buf->offset + base, 0);
          if (ret != VK_SUCCESS)
             goto draw_error;
          ta5_cs_push(draw, (uint32_t)size); /* VFD_FETCH[].SIZE */
@@ -5177,6 +5536,8 @@ ta5_record_draw(struct ta5_cmd_buffer *cmd, uint32_t vertexCount,
          ta5_cs_push(draw, A5XX_VFD_DECODE_INSTR_IDX(fetch_cnt) |
                               A5XX_VFD_DECODE_INSTR_FORMAT(
                                  (enum a5xx_vtx_fmt)fmt) |
+                              (bstate->input_rate == VK_VERTEX_INPUT_RATE_INSTANCE
+                                  ? A5XX_VFD_DECODE_INSTR_INSTANCED : 0) |
                               A5XX_VFD_DECODE_INSTR_UNK30 |
                               A5XX_VFD_DECODE_INSTR_FLOAT);
          /*
@@ -5340,9 +5701,12 @@ ta5_record_draw(struct ta5_cmd_buffer *cmd, uint32_t vertexCount,
          fprintf(stderr, "  cs[%2u] = %08x\n", i, draw->cs[i]);
    }
 
-   if (!getenv("TA5_SKIP_DRAWSTATE"))
-      ta5_emit_draw_state(draw, vs_tex_count, fs_tex_count,
-                            vertexCount, pipe);
+   if (!getenv("TA5_SKIP_DRAWSTATE")) {
+      ret = ta5_emit_draw_state(draw, vs_tex_count, fs_tex_count,
+                                vertexCount, pipe);
+      if (ret != VK_SUCCESS)
+         goto draw_error;
+   }
 
    /*
     * Depth state goes in *after* the draw state, not before it.
@@ -5494,9 +5858,12 @@ no_consts:
       ret = ta5_cmd_buffer_alloc_cs(draw, draw->cs_count + 4096);
       if (ret != VK_SUCCESS)
          goto draw_error;
-      if (!getenv("TA5_SKIP_DRAWSTATE"))
-      ta5_emit_draw_state(draw, vs_tex_count, fs_tex_count,
-                            vertexCount, pipe);
+      if (!getenv("TA5_SKIP_DRAWSTATE")) {
+         ret = ta5_emit_draw_state(draw, vs_tex_count, fs_tex_count,
+                                   vertexCount, pipe);
+         if (ret != VK_SUCCESS)
+            goto draw_error;
+      }
       ta5_emit_program_state(draw, pipe);
       ret = ta5_emit_shader(draw, pipe, &pipe->vertex, SB4_VS_SHADER,
                             REG_A5XX_SP_VS_OBJ_START, pipe->vs_bo);
@@ -5618,6 +5985,7 @@ no_drawpkt:
    return;
 
 draw_error:
+   cmd->record_result = ret;
    if (use_ib) {
       vk_free(&cmd->device->vk.alloc, draw->relocs);
       vk_free(&cmd->device->vk.alloc, draw->reloc_bos);

@@ -151,12 +151,15 @@ ta5_FreeMemory(VkDevice _device, VkDeviceMemory _memory,
     * stay usable (their memory is this process's own allocation either way),
     * and their Destroy* sees bound_memory == NULL and skips the list_del.
     */
+   struct ta5_device *device = (struct ta5_device *)_device;
+
    while (!list_is_empty(&memory->bound_buffers)) {
       struct ta5_buffer *buffer = list_first_entry(&memory->bound_buffers,
                                                    struct ta5_buffer,
                                                    memory_binding);
       list_del(&buffer->memory_binding);
       buffer->bound_memory = NULL;
+      buffer->offset = 0;
    }
 
    while (!list_is_empty(&memory->bound_images)) {
@@ -792,7 +795,7 @@ ta5_fill_image_subresource_layout(const struct ta5_image *image,
                        MAX2(image->mip_levels, 1u) - 1);
    const struct ta5_image_level *lvl = &image->levels[mip];
 
-   layout->offset = image->offset + lvl->offset +
+   layout->offset = lvl->offset +
                     (VkDeviceSize)subresource->arrayLayer * lvl->layer_pitch;
    layout->rowPitch = lvl->row_pitch;
    layout->depthPitch = lvl->layer_pitch;
@@ -853,6 +856,7 @@ ta5_CreateBuffer(VkDevice _device, const VkBufferCreateInfo *pCreateInfo,
 
    buffer->device = device;
    buffer->size = pCreateInfo->size;
+   buffer->offset = 0;
    buffer->usage = pCreateInfo->usage;
    buffer->flags = pCreateInfo->flags;
    /* memory_binding is a list *item*, not a head: it is only ever linked
@@ -937,12 +941,25 @@ ta5_BindBufferMemory(VkDevice _device, VkBuffer _buffer, VkDeviceMemory _memory,
 {
    struct ta5_buffer *buffer = ta5_buffer_from_handle(_buffer);
    struct ta5_memory *memory = ta5_memory_from_handle(_memory);
+   VkMemoryRequirements reqs;
+
+   ta5_fill_buffer_memory_requirements(buffer->size, &reqs);
+
+   /* Validate the range before replacing a binding; subtract to avoid overflow. */
+   if (!memory || !memory->bo || reqs.size < buffer->size ||
+       memoryOffset > memory->size ||
+       reqs.size > memory->size - memoryOffset ||
+       memoryOffset > memory->bo->size ||
+       reqs.size > memory->bo->size - memoryOffset)
+      return vk_error(&buffer->device->instance->vk,
+                      VK_ERROR_OUT_OF_DEVICE_MEMORY);
 
    if (buffer->bound_memory)
       list_del(&buffer->memory_binding);
 
    list_addtail(&buffer->memory_binding, &memory->bound_buffers);
    buffer->bound_memory = memory;
+   buffer->offset = memoryOffset;
 
    return VK_SUCCESS;
 }
@@ -952,8 +969,11 @@ ta5_BindBufferMemory2(VkDevice _device, uint32_t bindInfoCount,
                       const VkBindBufferMemoryInfo *pBindInfos)
 {
    for (uint32_t i = 0; i < bindInfoCount; i++) {
-      ta5_BindBufferMemory(_device, pBindInfos[i].buffer, pBindInfos[i].memory,
-                           pBindInfos[i].memoryOffset);
+      VkResult result = ta5_BindBufferMemory(
+         _device, pBindInfos[i].buffer, pBindInfos[i].memory,
+         pBindInfos[i].memoryOffset);
+      if (result != VK_SUCCESS)
+         return result;
    }
    return VK_SUCCESS;
 }

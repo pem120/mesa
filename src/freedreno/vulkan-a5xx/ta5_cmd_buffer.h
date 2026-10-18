@@ -192,6 +192,7 @@ struct ta5_cmd_buffer
    struct ta5_cmd_pool *pool;
 
    enum mesa_vk_command_buffer_state state;
+   VkResult record_result;
 
    /** Recorded command stream. */
    uint32_t *cs;
@@ -249,8 +250,13 @@ struct ta5_cmd_buffer
    /** Bound state at the point of recording. */
    struct ta5_pipeline *bound_pipeline;
    struct ta5_framebuffer *bound_framebuffer;
+   struct ta5_framebuffer *trace_framebuffer;
    struct ta5_render_pass *bound_render_pass;
    struct ta5_descriptor_set *bound_sets[4];
+   /* Eight dynamic UBOs plus eight dynamic SSBOs, matching the device limits.
+    * Kept per set so binding another set preserves these offsets.
+    */
+   uint32_t dynamic_offsets[4][16];
 
    /**
     * Push constant values, as written by vkCmdPushConstants().
@@ -288,6 +294,7 @@ struct ta5_cmd_buffer
     */
    VkViewport viewport;
    VkRect2D scissor;
+   float blend_constants[4];
    bool viewport_set;
    bool scissor_set;
 

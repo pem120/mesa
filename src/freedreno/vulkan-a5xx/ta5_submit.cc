@@ -431,6 +431,8 @@ ta5_submit_cmd_relocs(struct ta5_queue *queue, const uint32_t *cs,
 
    for (i = 0; i < bo_count; i++) {
       bos[i].flags = MSM_SUBMIT_BO_READ | MSM_SUBMIT_BO_WRITE;
+      if (getenv("TA5_DUMP_BO") && all_bos[i]->size <= 1024 * 1024)
+         bos[i].flags |= MSM_SUBMIT_BO_DUMP;
       bos[i].handle = all_bos[i]->handle;
       bos[i].presumed = 0;
    }

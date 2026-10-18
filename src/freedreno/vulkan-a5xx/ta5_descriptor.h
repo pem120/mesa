@@ -105,6 +105,9 @@ struct ta5_descriptor_layout_binding
 
    /** Hardware slots this binding consumes. */
    uint32_t slot_cost;
+
+   /** First dynamic offset in binding/array-element order, or UINT32_MAX. */
+   uint32_t dynamic_offset_index;
 };
 
 struct ta5_descriptor_set_layout
@@ -116,6 +119,7 @@ struct ta5_descriptor_set_layout
 
    uint32_t binding_count;
    struct ta5_descriptor_layout_binding *bindings;
+   uint32_t dynamic_offset_count;
 
    /** Total hardware slots the whole layout needs. */
    uint32_t total_slots;
@@ -234,8 +238,8 @@ unsigned ta5_pipeline_layout_tex_bindings(
  * The list is also what decides a shader's UBO block count, so both have to
  * take it from the pipeline layout rather than sorting their own copies.
  *
- * UNIFORM_BUFFER_DYNAMIC is deliberately absent: a dynamic offset would have
- * to be added by the shader, and nothing here lowers that.
+ * Dynamic buffers occupy the same slots as ordinary buffers.  Their offsets
+ * are applied to the pointers emitted from command-buffer binding state.
  *
  * Returns the number of entries written, capped at `max`.
  */

@@ -179,6 +179,7 @@ struct ta5_buffer
    struct ta5_device *device;
 
    VkDeviceSize size;
+   VkDeviceSize offset; /**< Byte offset in bound_memory. */
    VkBufferUsageFlags usage;
    VkBufferCreateFlags flags;
 

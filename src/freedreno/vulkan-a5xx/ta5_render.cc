@@ -390,6 +390,20 @@ ta5_CreateFramebuffer(VkDevice _device,
                          VK_ERROR_FORMAT_NOT_SUPPORTED);
       }
 
+      const struct ta5_image_level *level =
+         &view->image->levels[view->base_mip_level];
+      if (fb->width > level->width || fb->height > level->height ||
+          pCreateInfo->layers > view->layer_count) {
+         VkResult result = vk_errorf(&device->instance->vk,
+            VK_ERROR_INITIALIZATION_FAILED,
+            "framebuffer %ux%ux%u exceeds attachment %u mip %u (%ux%ux%u)",
+            fb->width, fb->height, pCreateInfo->layers, i,
+            view->base_mip_level, level->width, level->height, view->layer_count);
+         vk_object_base_finish(&fb->base);
+         vk_free(pAllocator, fb);
+         return result;
+      }
+
       fb->attachments[i] = view;
    }
 

@@ -53,6 +53,8 @@
 #include "ta5_device.h"
 #include "ta5_sync.h"
 #include "ta5_cmd_buffer.h"
+#include "ta5_render.h"
+#include "ta5_memory.h"
 #include <time.h>
 
 #include "ta5_queue.h"
@@ -553,6 +555,76 @@ ta5_queue_signal_syncs(struct ta5_device *device, uint32_t count,
    return result;
 }
 
+static void
+ta5_dump_framebuffer(struct ta5_cmd_buffer *cmd)
+{
+   const char *directory = getenv("TA5_DUMP_FB");
+   const struct ta5_framebuffer *fb = cmd->trace_framebuffer;
+   if (!directory || !fb || !fb->attachment_count || !fb->width || !fb->height)
+      return;
+   const struct ta5_image_view *view = fb->attachments[0];
+   const struct ta5_image *image = view->image;
+   if (view->format != VK_FORMAT_R8G8B8A8_UNORM &&
+       view->format != VK_FORMAT_R8G8B8A8_SRGB &&
+       view->format != VK_FORMAT_B8G8R8A8_UNORM &&
+       view->format != VK_FORMAT_B8G8R8A8_SRGB)
+      return;
+   if (!image->bound_memory || !image->bound_memory->bo)
+      return;
+   static int sequence;
+   const unsigned index = p_atomic_inc_return(&sequence) - 1;
+   if (index >= 12)
+      return;
+   struct ta5_bo *bo = image->bound_memory->bo;
+   const struct ta5_image_level *level = &image->levels[view->base_mip_level];
+   const uint64_t base = image->offset + level->offset +
+                         (uint64_t)view->base_array_layer * level->layer_pitch;
+   const uint64_t row_bytes = (uint64_t)fb->width * 4;
+   const uint64_t end = base + (fb->height - 1) * level->row_pitch + row_bytes;
+   if (row_bytes > level->row_pitch || end > bo->size) {
+      fprintf(stderr, "ta5[fb]: invalid capture bounds\n");
+      return;
+   }
+   const uint8_t *map = (const uint8_t *)ta5_bo_map(bo);
+   if (!map)
+      return;
+   char path[4096];
+   int length = snprintf(path, sizeof(path), "%s/fb-%03u-%ux%u-fmt%u.raw",
+                         directory, index, fb->width, fb->height, view->format);
+   if (length < 0 || (size_t)length >= sizeof(path))
+      return;
+   FILE *file = fopen(path, "wb");
+   if (!file) {
+      fprintf(stderr, "ta5[fb]: fopen failed: %s\n", strerror(errno));
+      return;
+   }
+   /* Ordering question: is the image still being written while the app waits?
+    * Copying per frame answers it only by being wrong when it is.
+    */
+   if (getenv("TA5_TRACE_FB")) {
+      const uint8_t *again = (const uint8_t *)ta5_bo_map(bo);
+      unsigned changed = 0;
+      if (again) {
+         for (uint32_t y = 0; y < fb->height; y++)
+            changed += memcmp(again + base + y * level->row_pitch,
+                              map + base + y * level->row_pitch, row_bytes) != 0;
+      }
+      fprintf(stderr, "ta5[fb]: rows changing after fence wait: %u\n", changed);
+   }
+   bool complete = true;
+   for (uint32_t y = 0; y < fb->height; y++) {
+      if (fwrite(map + base + y * level->row_pitch, 1, row_bytes, file) != row_bytes) {
+         complete = false;
+         break;
+      }
+   }
+   if (fclose(file))
+      complete = false;
+   fprintf(stderr, "ta5[fb]: %s handle=%u offset=%llu pitch=%llu complete=%u\n",
+           path, bo->handle, (unsigned long long)base,
+           (unsigned long long)level->row_pitch, complete);
+}
+
 /**
  * Run one batch: wait its dependencies, submit, wait for the GPU, then signal.
  */
@@ -622,8 +694,11 @@ ta5_queue_submit_one(struct ta5_queue *queue, const VkCommandBuffer *cmds,
     * blit wsi records at swapchain-creation time produce the rendered frame
     * instead of the image's initial zeros.
     */
-   for (uint32_t i = 0; i < cmd_count; i++)
-      ta5_cmd_buffer_run_deferred_i2b(ta5_cmd_buffer_from_handle(cmds[i]));
+   for (uint32_t i = 0; i < cmd_count; i++) {
+      struct ta5_cmd_buffer *cmd = ta5_cmd_buffer_from_handle(cmds[i]);
+      ta5_cmd_buffer_run_deferred_i2b(cmd);
+      ta5_dump_framebuffer(cmd);
+   }
 
    return ta5_queue_signal_syncs(device, signal_count, signal_sems,
                                  signal_values, fence);
