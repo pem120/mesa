@@ -46,6 +46,7 @@
 #include "vk_sync.h"
 #include "vk_semaphore.h"
 #include "vk_fence.h"
+#include "vk_queue.h"
 #include "vk_common_entrypoints.h"
 
 #include "ta5_instance.h"
@@ -74,6 +75,8 @@ ta5_GetDeviceQueue(VkDevice _device, uint32_t queueFamilyIndex,
 {
    struct ta5_device *device = (struct ta5_device *)_device;
    struct ta5_queue *queue;
+   /* vk_queue_init only reads this, so a local is enough. */
+   const float default_priority = 1.0f;
 
    /*
     * The spec requires the same handle for the same (family, index).  Look
@@ -92,7 +95,33 @@ ta5_GetDeviceQueue(VkDevice _device, uint32_t queueFamilyIndex,
       return;
    }
 
-   vk_object_base_init(&device->vk, &queue->base, VK_OBJECT_TYPE_QUEUE);
+   /*
+    * vk_queue_init, not just an object-base init: it records
+    * queue_family_index and index_in_family, which is what libvulkan_wsi
+    * indexes image->blit.cmd_buffers[] with during present
+    * (wsi_common.c:2757), and it links the queue into vk_device::queues.
+    *
+    * The queue is created lazily rather than from
+    * VkDeviceCreateInfo::pQueueCreateInfos, which is not what the spec asks
+    * for: the spec requires every requested queue to exist at device
+    * creation.  Synthesising the create info here is the minimal version of
+    * that; moving creation into ta5_CreateDevice is the correct follow-up.
+    */
+   const VkDeviceQueueCreateInfo queue_info = {
+      .sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
+      .flags = 0,
+      .queueFamilyIndex = queueFamilyIndex,
+      .queueCount = 1,
+      .pQueuePriorities = &default_priority,
+   };
+   VkResult result =
+      vk_queue_init(&queue->vk, &device->vk, &queue_info, queueIndex);
+   if (result != VK_SUCCESS) {
+      free(queue);
+      *pQueue = VK_NULL_HANDLE;
+      return;
+   }
+
    queue->device = device;
    queue->family = queueFamilyIndex;
    queue->index = queueIndex;

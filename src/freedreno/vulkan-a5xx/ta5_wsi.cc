@@ -133,7 +133,34 @@ ta5_wsi_init(struct ta5_physical_device *pdevice)
     * import dma-bufs; see A5XX-WSI-STATUS.md section 10.8 for the probes that
     * established the compositor advertises no formats at all.
     */
-   const struct wsi_device_options options = { .sw_device = false };
+   /*
+    * sw_device = true: present through wl_shm.
+    *
+    * Both paths were measured on this device:
+    *
+    *   false (native dma-buf): the client works end to end -- vkcube --wsi
+    *     wayland --c 30 exits 0 -- but phoc cannot import the buffer and
+    *     segfaults, because it advertises zero dma-buf formats.
+    *   true  (wl_shm): phoc can always import a shm buffer.
+    *
+    * See A5XX-WSI-STATUS.md section 10.8 for the two probes behind that:
+    * eglQueryDmaBufFormatsEXT returns num=0 on this device, and phoc derives
+    * its whole wl_dmabuf list from that query.
+    *
+    * The shm path needs nothing from the compositor that Vulkan does not
+    * already provide, but it does need one entry point from us:
+    * wsi records an image -> buffer blit per swapchain image
+    * (wsi_finish_create_blit_context, wsi_common.c:3419), and without
+    * vkCmdCopyImageToBuffer that went to vk_common_CmdCopyImageToBuffer, which
+    * dispatches CmdCopyImageToMemoryKHR -- a VK_KHR_external_memory_fd image
+    * import we do not have.  ta5_CmdCopyImageToBuffer replaces it.
+    *
+    * The cost is a full-frame memcpy per present.  Our swapchain images are
+    * linear host memory already, so this is not a translation, but it is not
+    * free either, and it gives up zero-copy presentation.  If the GBM
+    * dma-buf import list is ever fixed, revisit this.
+    */
+   const struct wsi_device_options options = { .sw_device = true };
    VkResult result;
 
    result = wsi_device_init(&pdevice->wsi_device,
