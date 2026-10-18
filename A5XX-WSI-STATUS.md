@@ -523,3 +523,40 @@ from `wsi_destroy_image`. Not yet identified which entry point.
 * Inspect rendered images; do not infer correctness from FPS or pixel counts.
   **No visual-correctness claim has been made for anything in this document.**
 * Report measurements, not conjecture.
+### 10.7 OPEN: Wayland never reaches swapchain creation (2026-10-18)
+
+**vkcube --wsi wayland --c 3 now:** surface is created, GPU is selected, then
+SIGSEGV. phoc survives (the compositor crash from §4 is gone).
+
+gdb, breaking on both the loader trampoline and the wsi implementations:
+
+```
+HIT wsi_CreateWaylandSurfaceKHR          <- surface creation
+HIT wsi_GetSwapchainImagesKHR swapchain=(nil)
+#0  wsi_GetSwapchainImagesKHR (device=..., _swapchain=0x0, ...)  wsi_common.c:2183
+```
+
+**`vkCreateSwapchainKHR` is never called by the application at all** — the loader
+breakpoint never fires, and `wsi_CreateSwapchainKHR` / `wsi_swapchain_init` are
+never entered. vkcube bails before swapchain creation and then queries images on
+a NULL swapchain.
+
+Also fixed this round: `VK_KHR_wayland_surface` was still gated behind
+`#ifdef TA5_HAVE_WAYLAND`, whose define disappeared with the bespoke Wayland
+build, so the driver silently stopped advertising it and the loader refused the
+platform outright. Now unconditional (`5e7fc91`). Nothing about a missing
+extension advertisement is a compile-time error.
+
+**Next step, not yet started:** find why vkcube bails before swapchain creation.
+The earlier headless `vkQueuePresentKHR: ErrorInvalidExternalHandle` is probably
+the same root cause — something in the surface/swapchain setup the driver must
+satisfy for wsi_common. Prime suspects, in order:
+1. `GetImageSubresourceLayout` — its returned `offset` includes `image->offset`,
+   which looks like a double-count of the binding offset (noted in §5-era notes).
+2. `GetMemoryFdKHR` — new, and wsi_common calls it for every swapchain image.
+3. Modifier negotiation: whether phoc advertises `DRM_FORMAT_MOD_LINEAR` for
+   ARGB8888. wsi_common's `find_format` may pick nothing, leaving the chain
+   unconfigured.
+
+Item 3 is directly observable: log the formats/modifiers phoc advertises over
+`wl_dmabuf` and compare against what the swapchain picks.
