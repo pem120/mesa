@@ -66,7 +66,10 @@
 
 #include "ta5_instance.h"
 #include "ta5_formats.h"
+#include "ta5_memory.h"
 #include "ta5_entrypoints.h"
+
+#include "drm-uapi/drm_fourcc.h"
 
 /*
  * Feature bundles.  a5xx has a tiler, so colour formats are blendable and
@@ -287,11 +290,80 @@ ta5_GetPhysicalDeviceFormatProperties2(VkPhysicalDevice _pdevice,
    pFormatProperties->formatProperties.linearTilingFeatures = caps->linear;
    pFormatProperties->formatProperties.optimalTilingFeatures = caps->optimal;
    pFormatProperties->formatProperties.bufferFeatures = caps->buffer;
+
+   /*
+    * VK_EXT_image_drm_format_modifier.
+    *
+    * wsi_common_wayland.c reads this list to decide whether the compositor's
+    * advertised (fourcc, modifier) pairs have anything to match against, and
+    * wsi_drm_configure_image() filters the driver's modifiers through it.  With
+    * drmFormatModifierCount left at 0 no modifier survives, swapchain creation
+    * falls through to an assert and returns VK_ERROR_OUT_OF_HOST_MEMORY, and
+    * Wayland presentation cannot start at all.
+    *
+    * Every image this driver allocates is linear, so the only honest entry is
+    * DRM_FORMAT_MOD_LINEAR.  It is reported only for formats that are linear
+    * *and* usable as a colour attachment, which is what a swapchain image needs;
+    * advertising it for everything would let wsi pick a format it cannot
+    * present.
+    */
+   {
+      VkDrmFormatModifierPropertiesListEXT *list = vk_find_struct(
+         pFormatProperties,
+         DRM_FORMAT_MODIFIER_PROPERTIES_LIST_EXT);
+
+      if (list) {
+         /*
+          * drmFormatModifierCount arrives as the caller's capacity.  wsi_common
+          * asks with it set to *zero* and asserts on the result
+          * (wsi_common_drm.c:614: assert(modifier_props_list.drmFormatModifierCount
+          * > 0)), which reads the field as "report how many you have" -- so
+          * treating zero as "no room, write nothing" makes the whole native
+          * path impossible and swapchain creation fail with a misleading
+          * VK_ERROR_OUT_OF_HOST_MEMORY.  Zero is written to as well as read
+          * from; only a nonzero capacity is a genuine bound.
+          *
+          * pDrmFormatModifierProperties may be NULL in that case too, and the
+          * entry is still counted, because the count is what the caller reads.
+          */
+         if (list->drmFormatModifierCount > 0 &&
+             !list->pDrmFormatModifierProperties)
+            return; /* caller passed capacity but no array: leave it alone */
+
+         uint32_t want = list->drmFormatModifierCount;
+
+         if (want == 0 || want > 1)
+            want = 1;
+
+         if (caps->linear & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT) {
+            if (list->pDrmFormatModifierProperties) {
+               list->pDrmFormatModifierProperties[0].drmFormatModifier =
+                  DRM_FORMAT_MOD_LINEAR;
+               list->pDrmFormatModifierProperties[0]
+                  .drmFormatModifierPlaneCount = 1;
+            }
+
+            list->drmFormatModifierCount = 1;
+         } else {
+            list->drmFormatModifierCount = 0;
+         }
+      }
+   }
+
    return;
 unsupported:
    pFormatProperties->formatProperties.linearTilingFeatures = 0;
    pFormatProperties->formatProperties.optimalTilingFeatures = 0;
    pFormatProperties->formatProperties.bufferFeatures = 0;
+
+   {
+      VkDrmFormatModifierPropertiesListEXT *list = vk_find_struct(
+         pFormatProperties,
+         DRM_FORMAT_MODIFIER_PROPERTIES_LIST_EXT);
+
+      if (list)
+         list->drmFormatModifierCount = 0;
+   }
 }
 
 VKAPI_ATTR VkResult VKAPI_CALL
@@ -342,7 +414,8 @@ ta5_GetPhysicalDeviceImageFormatProperties2(
               1;
 
    if (pImageFormatInfo->tiling != VK_IMAGE_TILING_LINEAR &&
-       pImageFormatInfo->tiling != VK_IMAGE_TILING_OPTIMAL)
+       pImageFormatInfo->tiling != VK_IMAGE_TILING_OPTIMAL &&
+       pImageFormatInfo->tiling != VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT)
       return VK_ERROR_FORMAT_NOT_SUPPORTED;
 
    caps = ta5_format_caps_get(pImageFormatInfo->format);
@@ -352,10 +425,36 @@ ta5_GetPhysicalDeviceImageFormatProperties2(
    if (block_size == 0)
       return VK_ERROR_FORMAT_NOT_SUPPORTED;
 
-   feats = (pImageFormatInfo->tiling == VK_IMAGE_TILING_LINEAR)
+   feats = (pImageFormatInfo->tiling == VK_IMAGE_TILING_LINEAR ||
+              pImageFormatInfo->tiling ==
+                 VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT)
               ? caps->linear
               : caps->optimal;
    if (feats == 0)
+      return VK_ERROR_FORMAT_NOT_SUPPORTED;
+
+   /*
+    * VK_EXT_image_drm_format_modifier, as this tree's headers spell it.
+    *
+    * The modifier comes in VkPhysicalDeviceImageDrmFormatModifierInfoEXT on the
+    * query, and wsi_drm_configure_image() asks once per modifier it is
+    * considering.  DRM_FORMAT_MOD_LINEAR is the only one this driver has, so a
+    * query for anything else is unsupported rather than quietly answered with
+    * linear properties -- that mismatch is what produced buffers the
+    * compositor could not import.
+    *
+    * (These headers predate the finalised extension: there is no
+    * VkImageFormatProperties2::modifierToProperties array and no
+    * VkImageDrmFormatModifierInfoEXT, so the per-modifier properties that the
+    * released API carries alongside imageFormatProperties simply do not exist
+    * here.  VkImageDrmFormatModifierPropertiesEXT below is the only place a
+    * per-image answer is possible, and it is what wsi calls before export.)
+    */
+   const VkPhysicalDeviceImageDrmFormatModifierInfoEXT *modifier_info =
+      vk_find_struct_const(pImageFormatInfo,
+                           PHYSICAL_DEVICE_IMAGE_DRM_FORMAT_MODIFIER_INFO_EXT);
+
+   if (modifier_info && modifier_info->drmFormatModifier != DRM_FORMAT_MOD_LINEAR)
       return VK_ERROR_FORMAT_NOT_SUPPORTED;
 
    /*
@@ -419,5 +518,48 @@ ta5_GetPhysicalDeviceImageFormatProperties2(
                   max_extent.depth * block_size;
    props->maxResourceSize = max_resource;
 
+   return VK_SUCCESS;
+}
+
+/**
+ * vkGetImageDrmFormatModifierPropertiesEXT.
+ *
+ * Reports the layout of a particular image, which is what wsi_common_wayland.c
+ * calls immediately before export: the fd, the offset, the row pitch and *this*
+ * modifier are what go into zwp_linux_dmabuf_v1_create_params().
+ *
+ * The row pitch comes from the same layout the image was created with, so the
+ * pitch the compositor is told is the pitch the memory actually has -- which is
+ * the whole point of the call, and why recomputing it independently would
+ * reintroduce exactly the mismatch this path exists to prevent.
+ */
+VKAPI_ATTR VkResult VKAPI_CALL
+ta5_GetImageDrmFormatModifierPropertiesEXT(VkDevice _device, VkImage _image,
+                                            VkImageDrmFormatModifierPropertiesEXT
+                                               *pProperties)
+{
+   (void)_image;
+
+   if (!pProperties)
+      return VK_ERROR_INITIALIZATION_FAILED;
+
+   pProperties->drmFormatModifier = DRM_FORMAT_MOD_LINEAR;
+
+   /*
+    * Deliberately does not consult the image, and least of all its
+    * bound memory.
+    *
+    * wsi_create_native_image_mem() calls this right after creating the image
+    * and *before* it allocates the memory that will back it
+    * (wsi_common_drm.c:810), so bound_memory is NULL on the only call that
+    * happens on the success path.  Requiring it here returned
+    * VK_ERROR_INITIALIZATION_FAILED from a perfectly good image, which
+    * wsi_CreateSwapchainKHR passed straight through -- so every native
+    * swapchain failed, vkcube ignored the error and called
+    * wsi_GetSwapchainImagesKHR with a NULL swapchain and segfaulted.
+    *
+    * The layout in the struct is the image's own, computed at creation and
+    * independent of which allocation ends up behind it.
+    */
    return VK_SUCCESS;
 }

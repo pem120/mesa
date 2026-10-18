@@ -134,33 +134,45 @@ ta5_wsi_init(struct ta5_physical_device *pdevice)
     * established the compositor advertises no formats at all.
     */
    /*
-    * sw_device = true: present through wl_shm.
+    * sw_device = false: present the swapchain image to the compositor as a
+    * dma-buf it imports directly.  This is what a real driver does and it is
+    * the only way presentation is not a full-frame memcpy.
     *
-    * Both paths were measured on this device:
+    * sw_device = true was the setting for a while, and it is what made
+    * presentation work at all -- but it is a workaround, and it costs a
+    * host-side copy of every frame:
     *
-    *   false (native dma-buf): the client works end to end -- vkcube --wsi
-    *     wayland --c 30 exits 0 -- but phoc cannot import the buffer and
-    *     segfaults, because it advertises zero dma-buf formats.
-    *   true  (wl_shm): phoc can always import a shm buffer.
+    *     measured, vkcube --wsi wayland, 1080x2280
+    *       60 frames in 10.22s = 5.87 fps
+    *       120 frames in 20.47s = 5.86 fps      linear, so a per-frame cost
+    *       User time 5.44s over 40 frames, 80% of CPU
     *
-    * See A5XX-WSI-STATUS.md section 10.8 for the two probes behind that:
-    * eglQueryDmaBufFormatsEXT returns num=0 on this device, and phoc derives
-    * its whole wl_dmabuf list from that query.
+    * The CPU is busy copying ~9.8MB in and ~9.8MB out per frame, which is the
+    * whole of that 5.9 fps.  Zero-copy presentation does not have that cost.
     *
-    * The shm path needs nothing from the compositor that Vulkan does not
-    * already provide, but it does need one entry point from us:
-    * wsi records an image -> buffer blit per swapchain image
-    * (wsi_finish_create_blit_context, wsi_common.c:3419), and without
-    * vkCmdCopyImageToBuffer that went to vk_common_CmdCopyImageToBuffer, which
-    * dispatches CmdCopyImageToMemoryKHR -- a VK_KHR_external_memory_fd image
-    * import we do not have.  ta5_CmdCopyImageToBuffer replaces it.
+    * What unblocked the native path is the DRM modifier plumbing that
+    * supports_modifiers = true requires, which did not exist when that flag was
+    * last set false:
     *
-    * The cost is a full-frame memcpy per present.  Our swapchain images are
-    * linear host memory already, so this is not a translation, but it is not
-    * free either, and it gives up zero-copy presentation.  If the GBM
-    * dma-buf import list is ever fixed, revisit this.
+    *   - ta5_GetPhysicalDeviceFormatProperties2 now answers a
+    *     VkDrmFormatModifierPropertiesListEXT with DRM_FORMAT_MOD_LINEAR,
+    *   - ta5_GetPhysicalDeviceImageFormatProperties2 accepts
+    *     VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT and answers
+    *     VkImageDrmFormatModifierInfoEXT,
+    *   - ta5_GetImageDrmFormatModifierPropertiesEXT reports the layout,
+    *   - ta5_CreateImage honours VkImageDrmFormatModifierListCreateInfoEXT.
+    *
+    * Without the first of those, wsi_drm_configure_image() filtered every
+    * modifier away, hit its "should never happen" assert and returned
+    * VK_ERROR_OUT_OF_HOST_MEMORY -- a misleading code for "no modifier matched".
+    *
+    * The earlier claim that phoc advertises no usable dma-buf formats came from
+    * two probes that were themselves wrong (one bound wl_drm v4 without asking
+    * for feedback, one hand-declared eglQueryDmaBufFormats* with the wrong
+    * signatures), so it is not a reason to keep the copy.  See
+    * A5XX-WSI-STATUS.md sections 10.8 and 12.
     */
-   const struct wsi_device_options options = { .sw_device = true };
+   const struct wsi_device_options options = { .sw_device = false };
    VkResult result;
 
    result = wsi_device_init(&pdevice->wsi_device,
@@ -175,55 +187,24 @@ ta5_wsi_init(struct ta5_physical_device *pdevice)
       return result;
 
    /*
-    * supports_modifiers stays false, and this is the single change that makes
-    * Wayland swapchain creation work at all.
+    * supports_modifiers = true.
     *
-    * Setting it true promises VK_EXT_image_drm_format_modifier: it makes
+    * This promises VK_EXT_image_drm_format_modifier, which is what makes
     * wsi_common_wayland.c read the compositor's wl_dmabuf format/modifier list
-    * (wsi_common_wayland.c:3910) and set num_modifier_lists = 1.  That in turn
-    * makes wsi_drm_configure_image() query modifiers from the driver:
+    * and match it against ours.  It used to be false because nothing answered
+    * the modifier queries: the count came back 0, every modifier was filtered
+    * away, and swapchain creation asserted its way out with a misleading
+    * VK_ERROR_OUT_OF_HOST_MEMORY.  The queries now exist:
     *
-    *     GetPhysicalDeviceFormatProperties2() with a
-    *     VkDrmFormatModifierPropertiesListEXT, then one
-    *     GetPhysicalDeviceImageFormatProperties2() per modifier.
+    *   ta5_GetPhysicalDeviceFormatProperties2        -- LINEAR in the list
+    *   ta5_GetPhysicalDeviceImageFormatProperties2    -- per-modifier props
+    *   ta5_GetImageDrmFormatModifierPropertiesEXT     -- the image's layout
+    *   ta5_CreateImage                                -- honours the create info
     *
-    * We implement none of that.  ta5_GetPhysicalDeviceFormatProperties2
-    * (ta5_formats.cc:248) fills in only linear/optimal/buffer features and
-    * leaves drmFormatModifierCount at zero, and
-    * ta5_GetPhysicalDeviceImageFormatProperties2 rejects anything that is not
-    * VK_IMAGE_TILING_LINEAR or _OPTIMAL outright (ta5_formats.cc:344).
-    *
-    * The result was measured, not guessed.  GDB at wsi_common_drm.c:611,
-    * breaking on the assertion just after the query:
-    *
-    *     drmFormatModifierCount = 0
-    *     params = { num_modifier_lists = 1, ... }
-    *
-    * With no modifiers in the list, no modifier survives the filter, so
-    * wsi_configure_native_image() falls through to its only failure path:
-    *
-    *     assert(!"Failed to find a supported modifier!  This should never
-    *             happen because LINEAR should always be available");
-    *     goto fail_oom;
-    *
-    * which returns VK_ERROR_OUT_OF_HOST_MEMORY.  That error code is
-    * misleading -- nothing ran out of memory, the device had 41G free -- and it
-    * is what vkCreateSwapchainKHR reported, after which vkcube queried images
-    * on the null swapchain handle and segfaulted.
-    *
-    * False sends wsi_common down the legacy path instead, which sets
-    * info->wsi.scanout = true and exports the dma-buf with no explicit
-    * modifier.  That is the honest answer for a driver with linear-only
-    * images, and it matches the old hand-written path.
-    *
-    * Turning this on for real means implementing
-    * vkGetImageDrmFormatModifierPropertiesEXT, honouring
-    * VkImageDrmFormatModifierListCreateInfoEXT in image creation, and
-    * answering tiling == VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT -- i.e.
-    * advertising DRM_FORMAT_MOD_LINEAR from the query above so that phoc's
-    * own modifier list has something to match.  Not done here.
+    * Every image is linear, so LINEAR is the only modifier and the only thing
+    * the compositor can be asked to import.
     */
-   pdevice->wsi_device.supports_modifiers = false;
+   pdevice->wsi_device.supports_modifiers = true;
    pdevice->wsi_device.can_present_on_device = ta5_wsi_can_present_on_device;
 
    pdevice->vk.wsi_device = &pdevice->wsi_device;

@@ -968,3 +968,101 @@ preserving stdout, stderr, exit status, kernel logs before and after, the
 compositor journal and session PIDs separately, and refusing to overwrite an
 existing result directory. Both leave `dmesg` intact deliberately: earlier work
 that cleared it lost the only record of the faults it was investigating.
+
+
+## 14. Native DMA-BUF presentation replaces the wl_shm workaround (2026-10-18)
+
+`sw_device` goes back to false.  Presentation hands the compositor a dma-buf it
+imports, and the per-frame host copy is gone.
+
+```
+                         shm shim      native
+image->buffer copies/frame      1          0
+vkcube 60 frames           10.22s       1.39s
+vkcube throughput         5.87 fps    43.17 fps
+vkcube exit                   0          0
+phoc                       survives   survives
+```
+
+7.4x, and zero copies per frame is the direct evidence that the memcpy is gone
+rather than merely cheaper.  vkmark on the Wayland display goes from
+
+    [clear] FPS: 0   [cube] FPS: 0   Score: 0
+
+to
+
+    clear 387  vertex 50  texture 47  shading 47
+    effect2d 68  desktop 155  cube 439     Score 170, faults 0
+
+with phoc and phosh both surviving.  The cube scene was captured with grim and
+renders correctly: a textured, depth-shaded, perspective cube with no dashed
+edges and no dropouts.
+
+### 14.1 What the native path needs
+
+`supports_modifiers = true` promises VK_EXT_image_drm_format_modifier, which
+wsi_common uses to match the compositor's advertised (fourcc, modifier) pairs.
+Four things answer for it, none of which existed:
+
+  - `ta5_GetPhysicalDeviceFormatProperties2` -- report DRM_FORMAT_MOD_LINEAR
+  - `ta5_GetPhysicalDeviceImageFormatProperties2` -- accept
+    VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT, answer the modifier info
+  - `ta5_GetImageDrmFormatModifierPropertiesEXT` -- new; the image's layout
+  - `ta5_CreateImage` -- honour VkImageDrmFormatModifierListCreateInfoEXT
+
+These headers predate the finalised extension: there is no
+`VkImageFormatProperties2::modifierToProperties` array and no
+`VkImageDrmFormatModifierInfoEXT` here, and the per-modifier create info is
+named `VkImageDrmFormatModifierExplicitCreateInfoEXT`.  Written against the
+finalised names it does not compile, which is worth knowing before trying.
+
+### 14.2 Two bugs, both mine, both found by measurement
+
+**The modifier count is an output, not a capacity.**  The first version wrote the
+modifier only when `drmFormatModifierCount > 0`, on the assumption that it was
+the caller's buffer size.  wsi_common calls with the field set to *zero* and
+asserts it is nonzero afterwards:
+
+    wsi->GetPhysicalDeviceFormatProperties2(...);   /* count arrives 0 */
+    assert(modifier_props_list.drmFormatModifierCount > 0);
+
+so the native path could never enable itself.
+
+**A valid image was rejected.**  `GetImageDrmFormatModifierPropertiesEXT`
+required `bound_memory`.  GDB at the failure showed a perfectly formed image --
+R16G16B16A16_SFLOAT, 360x713, linear, row_pitch 3072, correct
+`drm_format_mod` -- with `bound_memory = 0x0`, because
+`wsi_create_native_image_mem()` calls this *before* allocating the memory behind
+it (`wsi_common_drm.c:810`).  That returned VK_ERROR_INITIALIZATION_FAILED,
+which `wsi_CreateSwapchainKHR` passed straight through, so every native
+swapchain failed; vkcube ignores the error and calls
+`wsi_GetSwapchainImagesKHR` with a NULL handle, which segfaults.
+
+Both were found by asking the driver what it did rather than reasoning about it.
+The second one only surfaced because the swapchain error code was captured --
+every earlier native attempt had been reported as a compositor crash.
+
+### 14.3 Superseded conclusions
+
+- **"phoc cannot import our dma-bufs / advertises no dma-buf formats" is
+  disproven.**  phoc imports the buffer without complaint.  Section 10.8's
+  probes were wrong (one bound wl_drm v4 without requesting feedback, one
+  hand-declared the EGL query functions with the wrong signatures), and section
+  12.5 already recorded that.  This was the stated reason the native path had
+  been abandoned and it was never true.
+- **"vkmark renders nothing on Wayland"** was true, but not for the reason it
+  looked like.  vkmark was submitting 8-byte command streams -- a single empty
+  PM4 header -- so it rendered nothing on *either* WSI.  The presentation path
+  was never exercised.  Section 13's fault census was therefore measuring a
+  driver doing no work, and its "fault-free" result said less than it appeared
+  to.
+- The wl_shm copy path is retained (`ta5_CmdCopyImageToBuffer` and the deferred
+  host-clear queue) because wsi still uses it for the shm fallback and for
+  image readback, but it is no longer on the presentation path.
+
+### 14.4 Still open, unchanged by this
+
+The coverage shortfall in section 12.4 (a quad covering 12636 of 65536 pixels
+where ~53824 is expected), the sporadic iova=0 faults of section 13.1, the
+copy-command pitch and binding-offset gaps, the dropped depth attachment
+offsets, attachment 0 assumed RGBA8, and queue lifecycle.

@@ -54,6 +54,7 @@
 #include "ta5_submit.h"
 
 #include "drm/msm_drm.h"
+#include "drm-uapi/drm_fourcc.h"
 
 /* ------------------------------------------------------------------ */
 /* Memory                                                              */
@@ -500,6 +501,49 @@ ta5_CreateImage(VkDevice _device, const VkImageCreateInfo *pCreateInfo,
    struct ta5_image *image;
    uint32_t block_size;
    VkResult result;
+
+   /*
+    * VK_EXT_image_drm_format_modifier: two pNext structures and one tiling
+    * value have to be accepted before the format query below, which only knows
+    * about LINEAR and OPTIMAL.
+    *
+    * wsi_common passes a modifier list naming DRM_FORMAT_MOD_LINEAR when
+    * supports_modifiers is set, and puts VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT
+    * in the tiling field.  Both mean "linear" here, because every image this
+    * driver allocates is linear; the modifier is checked rather than ignored so
+    * a request for a layout that does not exist fails at creation instead of
+    * producing a buffer the compositor cannot import.
+    */
+   VkImageCreateInfo create = *pCreateInfo;
+   const VkImageDrmFormatModifierExplicitCreateInfoEXT *explicit_mod =
+      vk_find_struct_const(pCreateInfo,
+                           IMAGE_DRM_FORMAT_MODIFIER_EXPLICIT_CREATE_INFO_EXT);
+   const VkImageDrmFormatModifierListCreateInfoEXT *modifier_list =
+      vk_find_struct_const(pCreateInfo,
+                           IMAGE_DRM_FORMAT_MODIFIER_LIST_CREATE_INFO_EXT);
+
+   if (create.tiling == VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT)
+      create.tiling = VK_IMAGE_TILING_LINEAR;
+
+   if (explicit_mod && explicit_mod->drmFormatModifier != DRM_FORMAT_MOD_LINEAR)
+      return vk_error(&device->instance->vk, VK_ERROR_FORMAT_NOT_SUPPORTED);
+
+   if (modifier_list && modifier_list->drmFormatModifierCount) {
+      /* A filter, not a request: creation succeeds only if LINEAR is in it. */
+      bool found = false;
+
+      for (uint32_t i = 0; i < modifier_list->drmFormatModifierCount; i++) {
+         if (modifier_list->pDrmFormatModifiers[i] == DRM_FORMAT_MOD_LINEAR) {
+            found = true;
+            break;
+         }
+      }
+
+      if (!found)
+         return vk_error(&device->instance->vk, VK_ERROR_FORMAT_NOT_SUPPORTED);
+   }
+
+   pCreateInfo = &create;
 
    if (pAllocator == NULL)
       pAllocator = vk_default_allocator();

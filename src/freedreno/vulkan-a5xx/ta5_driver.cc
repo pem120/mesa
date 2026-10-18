@@ -111,6 +111,16 @@ const struct vk_instance_extension_table ta5_instance_extensions_supported = {
  */
 const struct vk_device_extension_table ta5_device_extensions_supported = {
    .table = {
+      /*
+       * Required for native (dma-buf) Wayland presentation: wsi_common
+       * negotiates the compositor's advertised modifiers through this extension
+       * and only takes the WSI_WL_BUFFER_NATIVE path when supports_modifiers is
+       * set, which promises it.  Answered by
+       * ta5_GetImageDrmFormatModifierPropertiesEXT and the modifier branches of
+       * the two format-properties entry points; DRM_FORMAT_MOD_LINEAR is the
+       * only modifier, because every image here is linear.
+       */
+      .EXT_image_drm_format_modifier = true,
       .KHR_16bit_storage = true,
       .KHR_bind_memory2 = true,
       .KHR_create_renderpass2 = true,
