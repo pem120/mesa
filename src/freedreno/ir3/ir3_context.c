@@ -251,7 +251,18 @@ struct ir3_instruction *const *
 ir3_get_src_maybe_shared(struct ir3_context *ctx, nir_src *src)
 {
    struct hash_entry *entry;
+
+   if (!ctx || !ctx->def_ht)
+      return NULL;
+
    entry = _mesa_hash_table_search(ctx->def_ht, src->ssa);
+
+   if (!entry) {
+      /* Preserve the missing definition before entering the error reporter. */
+      fprintf(stderr, "ir3: missing SSA def %p in %s()\n",
+              (void *)src->ssa, __func__);
+   }
+
    compile_assert(ctx, entry);
    return entry->data;
 }
