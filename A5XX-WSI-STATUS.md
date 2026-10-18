@@ -890,3 +890,81 @@ failing path.
 - Attachment 0 is unconditionally bound as RGBA8 colour.
 - Queue lifecycle: queues created lazily, no matching `vk_queue_finish`.
 - KMS presentation, unvalidated since the private WSI was removed.
+
+
+## 13. vkmark fault census: the storm is closed (2026-10-18)
+
+Measured on `93d6a78`, deployed library sha256 `f88f4b55...`, device at
+`172.16.42.1`. One vkmark process per scene, 300x300, headless WSI,
+`MESA_SHADER_CACHE_DISABLE=true`, `duration=3`. `dmesg` is never cleared;
+faults are attributed by the monotonic timestamp of each fault line against the
+`/proc/uptime` window sampled around each run, so a fault belongs to exactly
+one run.
+
+```
+scene       exit   fps      scene       exit   fps
+clear         0     22       effect2d      0     16
+vertex        0     18       desktop       0     18
+texture       0     18       cube          0     21
+shading       0     19
+```
+
+Per-scene fault attribution printed nothing. Verified as silence rather than
+suppression: **zero kernel lines of any kind** inside the run window
+(10402..10424), while the newest fault line in the whole log is at 10008 --
+several hundred seconds earlier -- and no suppression counters fired in it.
+
+Repeated, to show it is not a one-off:
+
+```
+3x  vertex texture shading cube   300x300   exit=0 each, faults=0
+```
+
+Then twelve isolated runs, each in its own window, across four workloads:
+
+```
+probe (cubemap)  x3   exit=0   faults=0
+probe (plain)    x3   exit=0   faults=0
+vkcube wayland   x3   exit=0   faults=0
+vkmark cube      x3   exit=0   faults=0
+```
+
+**The GPU fault storm while running vkmark is fixed.** It was the out-of-bounds
+write in `22781a1`: the guard-region test measured overruns of +256..+1152 bytes
+past each attachment, which is the same range as the original fault cluster
+around `0x0304c000` that section 3 recorded and could not explain. With the row
+pitch aligned to 64 texels and the last mip padded to a 32-row envelope, the
+overrun is gone and the faults with it.
+
+### 13.1 Not faults during vkmark
+
+**Two things this does not establish.** Throughput is 16-22 FPS. And exit 0
+with no faults says nothing about pixels -- section 12.4's coverage shortfall
+(a quad covering 12636 of 65536 pixels where ~53824 is expected) is still open,
+so vkmark is rendering without faulting, not rendering correctly.
+
+**A separate, sporadic fault remains undiagnosed.** Three faults of a different
+kind exist in the log:
+
+```
+[9753.913379] gpu fault: iova=0000000000000000   fsynr=0x2
+[9958.838827] gpu fault: iova=0000000000000000   fsynr=0x2
+[10008.340630] gpu fault: iova=0000000000000000  fsynr=0x2
+```
+
+`fsynr=0x2` against the old cluster's `fsynr=0x13`, and address zero rather than
+an overrun past a buffer: a different mechanism, not a recurrence of the fixed
+one. One was reproduced in a window covering three commands; it did not
+reproduce in twelve subsequent isolated runs. Its source is **not** established.
+An earlier note in this file attributing it to cube-map sampling was withdrawn:
+the window covered three commands and only one fault fired, so nothing supported
+picking the texture path.
+
+### 13.2 Tooling
+
+`/home/ishu/a5xx-test-tmp/fault-census.sh` runs the per-scene census with
+timestamp-window attribution. `a5xx-fault-run.sh` runs one supervised client,
+preserving stdout, stderr, exit status, kernel logs before and after, the
+compositor journal and session PIDs separately, and refusing to overwrite an
+existing result directory. Both leave `dmesg` intact deliberately: earlier work
+that cleared it lost the only record of the faults it was investigating.
