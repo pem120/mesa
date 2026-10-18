@@ -101,12 +101,37 @@ VkResult
 ta5_wsi_init(struct ta5_physical_device *pdevice)
 {
    /*
-    * sw_device = false: this is a real GPU.  That matters, because it is what
-    * selects WSI_WL_BUFFER_NATIVE -- the compositor-imports-our-dma-buf path --
-    * rather than WSI_WL_BUFFER_SHM_MEMCPY, which upstream only ever uses for
-    * a software device.  Turning shm on here would "fix" the import by never
-    * attempting it, at the cost of a CPU copy per frame, and would diverge
-    * from what every other Mesa driver does.
+    * sw_device = false: this is a real GPU, and it selects
+    * WSI_WL_BUFFER_NATIVE -- the compositor-imports-our-dma-buf path.
+    *
+    * sw_device = true was tried here and is NOT the answer, for a reason worth
+    * recording.  It moves presentation to WSI_WL_BUFFER_SHM_MEMCPY, where wsi
+    * renders into a CPU image and copies it into a wl_shm buffer the compositor
+    * can always import.  On this device that does keep phoc alive -- the
+    * client stopped provoking "createImageFromDmaBufs failed" and the
+    * compositor stopped dying.  But swapchain creation then crashed the client
+    * instead:
+    *
+    *     vk_common_CmdCopyImageToBuffer2 -> disp->CmdCopyImageToMemoryKHR = NULL
+    *     wsi_cmd_blit_image_to_buffer (wsi_common.c:3275)
+    *
+    * because the blit needs VK_KHR_external_memory_fd *image* import and we
+    * have none: ta5_memory.cc handles no VkImportMemoryInfoKHR at all, even
+    * though VK_KHR_external_memory_fd is advertised (ta5_driver.cc:123) and
+    * only its export half exists.
+    *
+    * So the honest state of this device, measured:
+    *
+    *   - native path (false): the client works end to end -- vkcube --wsi
+    *     wayland --c 30 exits 0 -- but phoc cannot import the buffer and
+    *     segfaults, because it advertises zero dma-buf formats.
+    *   - shm path (true): the compositor survives, but the client cannot
+    *     create a swapchain until external-memory image import exists.
+    *
+    * Neither is a working desktop.  false is kept because it is the path a
+    * real driver takes and the one that will work once the compositor can
+    * import dma-bufs; see A5XX-WSI-STATUS.md section 10.8 for the probes that
+    * established the compositor advertises no formats at all.
     */
    const struct wsi_device_options options = { .sw_device = false };
    VkResult result;
