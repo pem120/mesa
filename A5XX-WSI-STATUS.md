@@ -417,39 +417,75 @@ Fix: a second
 `vk_physical_device_dispatch_table_from_entrypoints(&dispatch_table, &wsi_physical_device_entrypoints, false)`
 after ours, plus `#include "wsi_common.h"`.
 
-### 10.3 OPEN: headless surface capabilities returns ErrorExtensionNotPresent
+### 10.3 FIXED: three WSI entrypoint tables were never merged
 
-After both fixes:
+The `overwrite=false` merge in `vk_device_init` only covers **device-level**
+entries, and `vk_common_*` are weak aliases that do **not** link statically —
+in the built `.so`, `vk_common_CreateSwapchainKHR` and
+`vk_common_AcquireNextImageKHR` both stay `U` (undefined) while
+`wsi_CreateSwapchainKHR` sits beside them, defined and unreferenced.
+
+So all three tables need an explicit merge. Each was missing, each produced a
+different failure:
+
+| Table | File | Symptom when missing |
+|---|---|---|
+| instance | `ta5_instance.cc` | `vkCreateHeadlessSurfaceKHR` → NULL; loader returns a **stub surface**, which is not an error at creation. Later: `getSurfaceCapabilitiesKHR: ErrorExtensionNotPresent`. gdb confirmed none of `wsi_CreateHeadlessSurfaceEXT`, `...CapabilitiesKHR`, `...Capabilities2KHR` was ever entered. |
+| physical device | `ta5_driver.cc` | `vulkaninfo` jumped to **address 0** on the first surface query. |
+| device | `ta5_device_create.cc` | Loader: `vkCreateSwapchainKHR: Driver's function pointer was NULL, returning VK_SUCCESS`, then segfault. |
+
+Turnip does all three (`tu_device.cc:1989`, `:1846`, `:2874`); so does every
+other Mesa driver. Fixed in `18e67b5`.
+
+Lesson worth keeping: **weak-undefined ≠ stub-in-table silently falls through.**
+An entry that resolves to NULL is skipped by `..._from_entrypoints`, so a
+missing merge shows up as a NULL dispatch slot or a loader stub, not a build
+error.
+
+### 10.4 OPEN: headless segfaults on the first frame
+
+After the three merges:
 
 ```
-$ vkmark --winsys headless -b clear:duration=1
-ta5: found a5xx device '/dev/dri/renderD128' gpu_id=506 ...
-Error: vk::PhysicalDevice::getSurfaceCapabilitiesKHR: ErrorExtensionNotPresent
+[clear] duration=1: Segmentation fault (core dumped)
 ```
 
-`vulkaninfo --summary` works. The dispatch slot is no longer NULL, so this is a
-real return value from wsi_common, not a missing entry point.
+Backtrace (line info unreliable — no debug info in the build):
 
-**Unfinished lead:** `struct wsi_interface` (`wsi_common_private.h:509`) exposes
-only `get_capabilities2` — there is no non-`2` member. vkmark calls the non-`2`
-`vkGetPhysicalDeviceSurfaceCapabilitiesKHR`. Unresolved questions:
-* where does the non-`2` wrapper live and what does it require?
-* is the headless path supposed to support the non-`2` query at all?
-* does `VK_ICD_WSI_PLATFORM_HEADLESS` get registered on this surface?
+```
+#0  ta5_GetDeviceQueue (_device=0xfffff76d3220, queueFamilyIndex=4151128608,
+                        queueIndex=0, pQueue=0x0)
+#1  vk_sync_finish     (vk_sync.c:110)
+#2  vk_sync_destroy    (vk_sync.c:142)
+#3  vk_fence_reset_temporary (vk_fence.c:173)
+#4  wsi_signal_fence_for_image (wsi_common.c:2257)
+#5  wsi_common_acquire_next_image2 (wsi_common.c:2304)
+#6  wsi_AcquireNextImageKHR (wsi_common.c:2212)
+#7  SwapchainWindowSystem::next_vulkan_image()  [vkmark/headless.so]
+```
 
-**Do not treat this as diagnosed.** That was the thread in progress.
+**Observations, not a diagnosis:**
+* `queueFamilyIndex = 4151128608 = 0xF76D2E40` — that contains a *pointer
+  fragment*, and `_device = 0xfffff76d3220`. The arguments look shifted.
+* `pQueue = 0x0`.
+* `_device` differs between frames #6 (`0xfffff76cfde0`) and #5
+  (`0xfffff76d3220`).
+* `vk_sync_finish` calling `vkGetDeviceQueue` is not something it should do, so
+  at least some frames are misattributed.
 
-### 10.4 Test matrix as of pause
+**Open hypotheses, none tested:**
+1. Argument/ABI mismatch on the loader↔ICD boundary — `VkIcdSurfaceBase` is a
+   loader-ABI struct and wsi_common reads `surface->platform` to index
+   `wsi->wsi[]`. The on-device `/lib/libvulkan.so.1` may be a different version
+   from this tree.
+2. A genuine bad call in the acquire path.
+3. Red herring from unreliable unwinding — needs a debug-info build to rule out.
 
-| Test | Result |
-|---|---|
-| build | clean, exit status propagated |
-| `vulkaninfo --summary` | **PASS** |
-| `vkmark --winsys headless -b clear` | **FAIL** — §10.3 |
-| full headless vkmark | **not run** — 13/13 predates the port and is at risk |
-| `vkcube --wsi wayland` | **not run** |
-| `vkcube --wsi kms` | **not run** — expect regression, `master_fd = -1` |
-| GPU fault storm | **not re-measured**, still unexplained |
+**Next step:** rebuild with debug info (`buildtype=debugoptimized` keeps
+symbols; add `-g` to ta5_flags) so the backtrace is trustworthy before
+theorising further. Do not chase this without that.
+
+### 10.5 Test matrix as of 2026-10-18 morning
 
 ---
 
