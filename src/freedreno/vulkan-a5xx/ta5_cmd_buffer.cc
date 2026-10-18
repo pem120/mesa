@@ -288,6 +288,11 @@ ta5_FreeCommandBuffers(VkDevice _device, VkCommandPool _commandPool,
       vk_free(&cmd->device->vk.alloc, cmd->cs);
       ta5_cmd_buffer_clear_ibs(cmd);
       vk_free(&cmd->device->vk.alloc, cmd->ibs);
+      /* The deferred copies own their region copies; the clear queue owns
+       * nothing but its own array. */
+      ta5_cmd_buffer_clear_deferred_i2b(cmd);
+      free(cmd->i2b);
+      free(cmd->clears);
       vk_free(&cmd->device->vk.alloc, cmd);
    }
 }
@@ -309,6 +314,7 @@ ta5_BeginCommandBuffer(VkCommandBuffer _cmd,
    cmd->reloc_bo_count = 0;
    ta5_cmd_buffer_clear_ibs(cmd);
    ta5_cmd_buffer_clear_deferred_i2b(cmd);
+   ta5_cmd_buffer_clear_deferred_clears(cmd);
    cmd->submitted = 0;
    cmd->fence = NULL;
    cmd->state = MESA_VK_COMMAND_BUFFER_STATE_RECORDING;
@@ -2700,6 +2706,53 @@ ta5_emit_clear_depth(struct ta5_cmd_buffer *cmd, struct ta5_device *device,
       return vk_error(&device->instance->vk, VK_ERROR_FORMAT_NOT_SUPPORTED);
 
    /*
+    * D32_SFLOAT is cleared on the host instead.
+    *
+    * The CCU fast clear does not clear a Z32 attachment on this part, and the
+    * working GL driver refuses to ask: fd5_clear() returns false for is_z32()
+    * (fd5_draw.c:229-231) and falls back to a GMEM blit, which this driver does
+    * not have because it renders into linear sysmem in bypass mode.
+    *
+    * Measured, a 300x300 D32 attachment, clear to 0.75, nothing else submitted.
+    * "missed" is texels that did not receive the clear, over a fill with my own
+    * 0xcd pattern, so a miss is a texel the clear never touched:
+    *
+    *    fast clear (CCU_RESOLVE)   5528 of 90000 missed (6.14%)
+    *       rows 14,15 30,31 46,47 ... every 16 rows, 192 of 300 columns wide,
+    *       plus extra damage across the padded tail rows 288-299
+    *    TA5_SLOW_CLEAR=1           90000 of 90000 missed (100%)
+    *
+    * So the fast clear skips a 16-row stripe pattern and the slow clear skips
+    * everything -- it drops FAST_CLEAR and emits no replacement trigger, and
+    * neither a fault nor an error reports either.  A depth buffer in that state
+    * is not a partly working clear: every fragment then depth-tests against
+    * whatever the attachment happened to hold, which is the dashed cube edges
+    * and the vkmark dropouts.
+    *
+    * The attachment is host-visible linear memory, so the CPU can write it,
+    * which is what ta5_CmdClearColorImage() already does for colour.  The write
+    * is *queued*, not performed here: recording runs ahead of execution, so a
+    * clear written now is undone by whatever the application does to the image
+    * before the batch is submitted.  See ta5_cmd_buffer_queue_clear().
+    */
+   if (att->format == VK_FORMAT_D32_SFLOAT) {
+      float z = depth < 0.0f ? 0.0f : (depth > 1.0f ? 1.0f : depth);
+      uint32_t word;
+
+      memcpy(&word, &z, sizeof(word));
+
+      if (!ta5_cmd_buffer_queue_clear(cmd, view->image, view->base_mip_level,
+                                      0, 4, word)) {
+         if (getenv("TA5_TRACE_DEPTH"))
+            fprintf(stderr, "ta5[depth] could not queue host clear\n");
+      } else if (getenv("TA5_TRACE_DEPTH")) {
+         fprintf(stderr, "ta5[depth] queued host clear value=%g\n", z);
+      }
+
+      return VK_SUCCESS;
+   }
+
+   /*
     * TA5_NO_DEPTH_CLEAR, TA5_NO_DEPTH_STATE and TA5_NO_FASTCLEAR are bisect
     * switches for the fault that only appears with a depth attachment at the
     * panel's size: they turn off, one at a time, the depth clear, the depth
@@ -4455,12 +4508,17 @@ ta5_cmd_buffer_run_deferred_i2b(struct ta5_cmd_buffer *cmd)
                     (unsigned long long)src_pitch,
                     (unsigned long long)dst_pitch);
       }
-
-      free(d->regions);
-      d->regions = NULL;
    }
-
-   cmd->i2b_count = 0;
+   /*
+    * The recording is kept, not consumed.  wsi records its image -> buffer blit
+    * exactly once per swapchain image and submits that same command buffer on
+    * every present, so draining the queue after the first submission leaves
+    * every later frame presenting whatever the buffer already held -- with a
+    * multi-image swapchain, one frozen frame per image.
+    *
+    * The region copies are therefore owned by the recording and released by
+    * ta5_cmd_buffer_clear_deferred_i2b() on reset or destruction, not here.
+    */
 }
 
 /** Drop any copies that were recorded but never submitted. */
@@ -4471,6 +4529,124 @@ ta5_cmd_buffer_clear_deferred_i2b(struct ta5_cmd_buffer *cmd)
       free(cmd->i2b[i].regions);
 
    cmd->i2b_count = 0;
+}
+
+/**
+ * Queue a host-side clear of one image level for submit-time execution.
+ *
+ * Shared by the depth and colour clear paths, which differ only in the packed
+ * value and the texel size.
+ */
+bool
+ta5_cmd_buffer_queue_clear(struct ta5_cmd_buffer *cmd, struct ta5_image *image,
+                           uint32_t mip_level, uint32_t layer,
+                           uint32_t texel_size, uint32_t word)
+{
+   if (!image || !image->bound_memory || !texel_size)
+      return false;
+
+   mip_level = MIN2(mip_level, MAX2(image->mip_levels, 1u) - 1);
+
+   if (cmd->clears_count == cmd->clears_size) {
+      uint32_t new_size = cmd->clears_size ? cmd->clears_size * 2 : 4;
+      struct ta5_deferred_clear *grown = (struct ta5_deferred_clear *)realloc(
+         cmd->clears, new_size * sizeof(*grown));
+
+      if (!grown)
+         return false;
+      cmd->clears = grown;
+      cmd->clears_size = new_size;
+   }
+
+   struct ta5_deferred_clear *c = &cmd->clears[cmd->clears_count];
+
+   memset(c, 0, sizeof(*c));
+   c->image = image;
+   c->row_pitch = image->levels[mip_level].row_pitch;
+   c->layer_pitch = image->levels[mip_level].layer_pitch;
+   c->level_offset = image->levels[mip_level].offset;
+   c->width = image->levels[mip_level].width;
+   c->height = image->levels[mip_level].height;
+   c->layers = layer ? layer : image->levels[mip_level].layers;
+   c->texel_size = texel_size;
+   c->word = word;
+   cmd->clears_count++;
+
+   return true;
+}
+
+/**
+ * Perform the queued host clears.
+ *
+ * Called from ta5_queue_submit_one() before the batch reaches the GPU: the clear
+ * has to land before the draws that follow it in the same stream, and it cannot
+ * land any earlier without being vulnerable to whatever the application does to
+ * the image after recording.
+ *
+ * The queue is deliberately *not* emptied here.  A command buffer may be
+ * submitted more than once -- that is ordinary Vulkan, and wsi's blit context
+ * relies on it -- and a clear consumed by the first submission means every
+ * later submission renders against an attachment nobody cleared.  Consuming it
+ * is exactly the bug the deferred image -> buffer copy had:
+ *
+ *     frame 0   wrong_depth=0/90000       clear applied
+ *     frame 1   wrong_depth=90000/90000   queue already drained
+ *
+ * The queue is released when the recording is reset or the buffer is destroyed,
+ * by ta5_cmd_buffer_clear_deferred_clears().
+ */
+void
+ta5_cmd_buffer_run_deferred_clears(struct ta5_cmd_buffer *cmd)
+{
+   const bool trace = getenv("TA5_TRACE_DEPTH") || getenv("TA5_TRACE_CLEAR");
+
+   for (uint32_t i = 0; i < cmd->clears_count; i++) {
+      const struct ta5_deferred_clear *c = &cmd->clears[i];
+      struct ta5_image *image = c->image;
+      void *map;
+
+      if (!image->bound_memory) {
+         if (trace)
+            fprintf(stderr, "ta5[clear] no memory bound\n");
+         continue;
+      }
+
+      map = ta5_bo_map(image->bound_memory->bo);
+      if (!map) {
+         if (trace)
+            fprintf(stderr, "ta5[clear] mmap failed\n");
+         continue;
+      }
+
+      uint8_t *base = (uint8_t *)map + image->offset + c->level_offset;
+
+      for (uint32_t layer = 0; layer < c->layers; layer++) {
+         uint8_t *layer_base = base + (VkDeviceSize)layer * c->layer_pitch;
+
+         /*
+          * Visible rows, not reserved ones: layer_pitch covers the padded
+          * envelope (see ta5_image_layout_levels()), and the rows beyond the
+          * extent are not part of the image.
+          */
+         for (uint32_t y = 0; y < c->height; y++) {
+            uint8_t *row = layer_base + (VkDeviceSize)y * c->row_pitch;
+
+            for (uint32_t x = 0; x < c->width; x++)
+               memcpy(row + (size_t)x * c->texel_size, &c->word, c->texel_size);
+         }
+      }
+
+      if (trace)
+         fprintf(stderr, "ta5[clear] host clear word=0x%08x %ux%u pitch=%llu\n",
+                 c->word, c->width, c->height,
+                 (unsigned long long)c->row_pitch);
+   }
+}
+
+void
+ta5_cmd_buffer_clear_deferred_clears(struct ta5_cmd_buffer *cmd)
+{
+   cmd->clears_count = 0;
 }
 
 VKAPI_ATTR void VKAPI_CALL

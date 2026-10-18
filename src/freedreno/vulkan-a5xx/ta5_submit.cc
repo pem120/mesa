@@ -156,29 +156,10 @@ ta5_bo_alloc(struct ta5_device *device, uint32_t size, uint32_t flags)
       return NULL;
    }
 
-   /*
-    * TA5_TRACE_BO prints every buffer's GPU address, not just the ones this
-    * process happens to map.  An IOMMU fault in dmesg names an address, and
-    * the full map is what turns it into "the colour target", "a fetch the CP
-    * made from the wrong place in the ring" or "nothing we allocated at all".
-    *
-    * The mmap offset is the IOVA on this driver, and this is the same
-    * ta5_gem_get_offset() ta5_bo_map() uses to map the buffer.
-    */
-   if (getenv("TA5_TRACE_BO")) {
-      uint64_t iova = 0;
-
-      if (ta5_gem_get_offset(device, bo->handle, MSM_INFO_GET_OFFSET, &iova))
-         fprintf(stderr, "ta5[bo]: handle=%u size=%-9u iova=<%s>\n",
-                 bo->handle, size, strerror(errno));
-      else
-         fprintf(stderr,
-                 "ta5[bo]: handle=%-4u size=%-9u iova=0x%08llx "
-                 "[0x%llx..0x%llx)\n",
-                 bo->handle, size, (unsigned long long)iova,
-                 (unsigned long long)iova,
-                 (unsigned long long)(iova + size));
-   }
+   /* The GPU address is assigned by the kernel and logged at submit time. */
+   if (getenv("TA5_TRACE_BO"))
+      fprintf(stderr, "ta5[bo]: alloc bo=%p handle=%u size=%u\n",
+              (void *)bo, bo->handle, bo->size);
 
    return bo;
 }
@@ -272,19 +253,11 @@ ta5_bo_map(struct ta5_bo *bo)
       return NULL;
    }
 
-   /*
-    * TA5_TRACE_BO prints each buffer's GPU address.  On this driver the mmap
-    * offset of a GPU buffer *is* its IOVA, and an IOMMU fault in dmesg names
-    * an address: this is what turns that address into "the colour target",
-    * "the depth buffer" or "nothing we allocated", which is the difference
-    * between hunting in the driver and guessing.
-    */
+   /* GEM's mmap offset is not a GPU virtual address. */
    if (getenv("TA5_TRACE_BO"))
       fprintf(stderr,
-              "ta5[bo]: handle=%u size=%-9u iova=0x%08llx [0x%llx..0x%llx)\n",
-              bo->handle, bo->size, (unsigned long long)offset,
-              (unsigned long long)offset,
-              (unsigned long long)(offset + bo->size));
+              "ta5[bo]: map bo=%p handle=%u size=%u mmap_offset=0x%llx\n",
+              (void *)bo, bo->handle, bo->size, (unsigned long long)offset);
 
    bo->map = mmap(NULL, bo->size, PROT_READ | PROT_WRITE, MAP_SHARED,
                   bo->device->fd, offset);
@@ -588,6 +561,29 @@ ta5_submit_cmd_relocs(struct ta5_queue *queue, const uint32_t *cs,
       TA5_DBG("submit failed: %d (%s)", ret, strerror(errno));
       ret = -1;
       goto cleanup;
+   }
+
+   /* Query actual IOVAs, not mmap offsets (nor the obsolete presumed field).
+    * Include every BO, including depth targets used only by the main stream.
+    */
+   if (getenv("TA5_TRACE_BO")) {
+      fprintf(stderr, "ta5[bo]: submit bos=%u words=%u ibs=%u\n",
+              bo_count, words, ib_count);
+      for (i = 0; i < bo_count; i++) {
+         struct ta5_bo *bo = all_bos[i];
+         uint64_t iova = 0;
+         if (ta5_gem_get_offset(device, bo->handle, MSM_INFO_GET_IOVA, &iova)) {
+            fprintf(stderr, "ta5[bo]: submit bo=%p handle=%u iova=<%s>\n",
+                    (void *)bo, bo->handle, strerror(errno));
+         } else {
+            fprintf(stderr,
+                    "ta5[bo]: submit bo=%p handle=%u size=%u "
+                    "iova=0x%llx end=0x%llx\n",
+                    (void *)bo, bo->handle, bo->size,
+                    (unsigned long long)iova,
+                    (unsigned long long)(iova + bo->size));
+         }
+      }
    }
 
    if (getenv("TA5_TRACE_NULL") && reloc_count) {

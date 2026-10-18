@@ -88,6 +88,24 @@ VK_DEFINE_NONDISP_HANDLE_CASTS(ta5_memory, base, VkDeviceMemory,
 #define TA5_MAX_IMAGE_MIP_LEVELS 16
 
 /**
+ * Row pitch alignment, in texels rather than bytes.
+ *
+ * Gallium aligns a linear base pitch to 64 texels (freedreno_layout.h:333), and
+ * that is the pitch at which a5xx accesses sysmem correctly.  Aligning to 64
+ * *bytes* accepted by the pitch register is a weaker condition, and letting a
+ * render target be laid out that way produced writes past the end of the
+ * allocation.  See ta5_image_layout_levels() for the measurement.
+ */
+#define TA5_TEXEL_PITCH_ALIGN 64
+
+/**
+ * Rows reserved for the last mip level, as a multiple of the 32x32 granularity
+ * at which a5xx reads and writes sysmem.  An access can over-fetch past the end
+ * of the final level, so its backing storage is rounded up to this envelope.
+ */
+#define TA5_LAST_LEVEL_HEIGHT_ALIGN 32
+
+/**
  * Linear (non-tiled) layout of one mip level of an image.
  *
  * Everything the a5xx texel descriptor needs about a sampled image comes from
@@ -102,9 +120,17 @@ struct ta5_image_level
    uint32_t height;
    uint32_t depth;      /**< slices: extent depth for 3D, otherwise 1 */
    uint32_t layers;     /**< array layers at this level */
-   VkDeviceSize row_pitch;    /**< bytes per row, 64-byte aligned */
-   VkDeviceSize layer_pitch;  /**< bytes per array layer, or per depth slice */
-   VkDeviceSize level_size;   /**< bytes for the whole level */
+   VkDeviceSize row_pitch;    /**< bytes per row, 64-texel aligned */
+   /**
+    * Bytes per array layer, or per depth slice.
+    *
+    * For the last mip level this is row_pitch times the height *rounded up to
+    * TA5_LAST_LEVEL_HEIGHT_ALIGN*, which is more than the visible rows need.
+    * Traversal that walks rows must not use it to find the end of the visible
+    * data: that is row_pitch * height.
+    */
+   VkDeviceSize layer_pitch;
+   VkDeviceSize level_size;   /**< bytes for the whole level, padding included */
    VkDeviceSize offset;       /**< byte offset of the level in the image */
 };
 

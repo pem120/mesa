@@ -1,21 +1,81 @@
 # Adreno 506 Vulkan driver — Wayland WSI port and GPU-fault investigation
 
-Status date: 2026-10-17. Branch: `a5xx-vulkan`. Last commit before this work: `62954fe`.
+Status updated: 2026-10-18. Branch: `a5xx-vulkan`.
 
-This is a handover document. It records what was measured, what was concluded, and
-what is still wrong. Claims are labelled by how they were established; conjecture is
-called out as such.
+## 1. Current findings (supersede the historical notes below)
 
----
+The driver is **not validated as working**. The older sections retain investigation
+history, including several conclusions that subsequent evidence contradicted.
 
-## 1. Where things stand
-
-| Area | State |
+| Area | Current evidence / limitation |
 |---|---|
-| Headless vkmark | **Works.** All 13 cases, exit 0. |
-| Wayland presentation | **Broken.** phoc segfaults on our buffer. |
-| GPU fault storm | **Open.** Reproduced twice, cause unknown, not reproduced since. |
-| Port to shared `wsi_common` | **Environment unblocked**, driver not yet ported. |
+| Shared WSI | Ported; wl_shm workaround selected with `sw_device=true`. Native DMA-BUF presentation previously crashed phoc and remains unsafe to retry in the live session. |
+| Copy execution | `ea58ce9` moves image-to-buffer memcpy after GPU completion, but consumes the recording on its first submission. Repeated presentation can cycle stale images; differing screenshots do not establish continuous animation. General transfer ordering is also incomplete. |
+| vkmark completion | A supervised Wayland `vertex:duration=4` run at 720x1524 completed with captured status 0; headless `vertex:duration=2` at 300x300 also completed. This is not a full post-port regression or evidence of correct pixels. Earlier detached runs have unknown termination causes. |
+| Depth clear | **Fixed.** D32 clears now pass a guard-region test on every extent measured, on repeated submission. |
+| Image layout | **Fixed.** Row pitch aligned to 64 texels and the last mip padded to a 32-row envelope, matching Gallium. No out-of-bounds writes measured. |
+| Deferred replay | **Fixed.** Clear and image-to-buffer queues persist across submissions instead of draining on first use. |
+| Cube artifacts | **Open.** A dotted diagonal across the cube faces survives the depth fix. It follows a straight line in texture space rather than a triangle edge, so the vertex/raster stage is implicated, not depth. |
+| Synchronization/lifecycle | Queue submission is synchronous and incomplete; lazy queue creation, command-pool lifecycle, query placeholders and semaphore semantics remain open. |
+| KMS | Unvalidated after removing the private WSI; `master_fd=-1` and the software-device workaround need review. |
+
+### Reproducible depth-clear overrun
+
+Using the `ea58ce9` rendering code plus tracing-only changes, `depth-clear-check`
+allocates the image's required memory plus a 256 KiB guard. After recording, it
+fills the entire allocation with `0xcd`, submits a render-pass depth clear to
+0.75, waits for completion, then checks all depth texels and the guard. It replays
+the same command buffer twice:
+
+```
+D32_SFLOAT, 300x300, linear
+memory requirement 368640 (0x5a000), rowPitch 1216, arrayPitch 364800
+frame 0: wrong_depth=3176/90000, guard_changed=768, offsets +0x100..+0x4ff
+frame 1: wrong_depth=3176/90000, guard_changed=768, offsets +0x100..+0x4ff
+exit status 3 (test mismatch)
+```
+
+The guard offsets are relative to the end of the reported memory requirement and
+match the earlier fault offsets. This demonstrates an out-of-bounds write, even
+when an adjacent mapping prevents an IOMMU fault. No-new-kernel-log observations
+must not be used as proof of correct addressing. The register/layout cause is
+still being isolated at this point in the investigation.
+
+`TA5_TRACE_BO` now labels mmap offsets correctly and queries `MSM_INFO_GET_IOVA`
+for every submitted BO, including targets used only by the primary stream. The
+old trace's `iova` label on `MSM_INFO_GET_OFFSET` was wrong.
+
+Evidence: `/home/ishu/a5xx-test-tmp/fault-20261018/` on the device, with copies under
+`/tmp/opencode/fault-20261018/` on the laptop. Each supervised run preserves the
+client's stdout, stderr, exit status, kernel logs before/after (without clearing),
+compositor journal and session PIDs separately. Tests use
+`MESA_SHADER_CACHE_DISABLE=true`. Test applications are built on the device; the
+Vulkan driver is cross-built on the laptop and deployed only to the test directory.
+
+### Corrections to earlier conclusions
+
+- Sections 10.7/10.8 do **not** establish that the compositor cannot import any
+  DMA-BUFs: the Wayland v4 probe omitted feedback, and the EGL query probe used
+  incorrect function signatures. The observed import error/crash is real; its
+  root cause remains unproven.
+- A trace aborted on an optimized-out GDB value; the claim that swapchain creation
+  was never called was wrong. A later trace reached it and found an empty modifier
+  list. `supports_modifiers=false` avoids advertising the unimplemented path.
+- The shm path uses ordinary host-visible allocations and a copy, not implemented
+  external-memory import.
+- `ea58ce9` does not establish correct animation or classify the visible artifacts
+  as independent of WSI. Its copy replay, pitch and binding-offset bugs remain.
+- Record-time buffer uploads are not generally valid merely because an application
+  happens to submit shortly afterward.
+- `VK_FORMAT_D32_SFLOAT` is format 126, not D24S8. Earlier depth-bisect script
+  results are invalid: that script exported labels instead of the intended flags.
+- GPU faults were observed, but they do not prove why an unsupervised client
+  vanished. A missing coredump does not prove SIGKILL, and an infinite `poll()`
+  does not itself kill the process.
+
+The current session could capture PNGs but its image reader could not display
+them. New measurements here are pixel/readback checks, not claims of visual
+inspection. Earlier screenshot descriptions remain historical observations.
 
 ---
 
@@ -647,3 +707,82 @@ produced -- and it is unexplained. It is the next thing to investigate.
 
 Still open from earlier: the GPU fault storm (10-30 faults per run) and the
 lazily created queues.
+
+
+## 11. GPU fault storm: root cause (2026-10-18)
+
+Three independent defects produced one symptom. The evidence is a device-built
+test (`depth-clear-check`, `depth-clear-analysis`) that clears a D32 attachment
+and nothing else, then checks every texel plus a 256 KiB guard placed after the
+image's reported memory requirement. The guard is what makes the damage visible
+at all: an overrun into mapped memory produces no kernel fault, which is why so
+many earlier runs reported "0 faults" while writing out of bounds.
+
+### 11.1 Layout: out-of-bounds writes (fixed)
+
+Row pitch was aligned to 64 **bytes**; Gallium aligns to 64 **texels**
+(`freedreno_layout.h:333`). The last mip level had no tail padding, while
+Gallium rounds it to a 32-row envelope because a5xx reads sysmem at 32x32
+granularity and over-fetches past the final level (`fd5_layout.c:67-68`).
+
+Before, D32 clear only, "wrong" is uncleared texels, "guard" is bytes clobbered
+past the reported end:
+
+```
+64x64    pitch  256  requirement  16384   wrong=0      guard=0      PASS
+128x64   pitch  512  requirement  32768   wrong=0      guard=0      PASS
+256x64   pitch 1024  requirement  65536   wrong=0      guard=0      PASS
+256x33   pitch 1024  requirement  36864   wrong=192    guard=3072   FAIL
+257x64   pitch 1088  requirement  69632   wrong=512    guard=512    FAIL
+300x300  pitch 1216  requirement 368640   wrong=3176   guard=768    FAIL
+```
+
+256x64 against 256x33 isolates height at a fixed pitch; 256x64 against 257x64
+isolates pitch at a fixed height. Both corrections were needed to fit.
+
+The historical fault offsets (256-1152 bytes past a `0x0304c000` allocation) match
+this guard damage, so the long-standing fault storm and this are the same bug.
+
+### 11.2 D32 was never actually cleared (fixed)
+
+The CCU fast clear walks a Z32 attachment in 16-row stripes and skips one of
+every two, covering 192 of 300 columns. Gallium refuses this clear outright
+(`fd5_draw.c:229-231`) and falls back to a GMEM blit, which does not exist here
+because this driver renders into linear sysmem in bypass mode. `TA5_SLOW_CLEAR`
+was worse: 100% missed, because it drops FAST_CLEAR and emits no replacement
+trigger. Neither a fault nor an error reported either.
+
+Depth now goes through a host-side clear, as `ta5_CmdClearColorImage` already
+does for colour.
+
+### 11.3 Ordering: clears and copies are on opposite sides of the fence
+
+A clear is a CPU write to memory the GPU is about to read, so it runs *before*
+the batch is submitted. An image-to-buffer copy reads what the GPU produced, so it
+runs *after* it completes. Both were initially wrong in different ways: a
+record-time clear is erased by whatever the application does to the image
+afterwards, and the test's own guard fill is designed to catch exactly that.
+
+### 11.4 Replay: deferred work must survive execution (fixed)
+
+Both queues drained themselves after executing. A command buffer may be submitted
+repeatedly -- ordinary Vulkan, and exactly what wsi's blit does, recorded once per
+swapchain image and submitted on every present. The symptom was one frozen frame
+per swapchain image:
+
+```
+frame 0   wrong_depth=0/90000       clear applied
+frame 1   wrong_depth=90000/90000   queue already drained
+```
+
+Recordings now persist until reset or destruction.
+
+### 11.5 Result
+
+All six extents, both frames, exit 0, with zero kernel lines written during the
+run window (the 30 faults still in dmesg predate it; the harness timestamps runs
+rather than clearing the log).
+
+vkcube on the Wayland display still shows a dotted diagonal across the cube
+faces. It runs in a straight line in texture space, so it is a vertex/raster
+artefact rather than the depth defect above. Not yet diagnosed.

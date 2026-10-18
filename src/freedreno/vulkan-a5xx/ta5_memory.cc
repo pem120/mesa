@@ -354,9 +354,46 @@ ta5_GetDeviceGroupPeerMemoryFeatures(
  *
  * A mip level is `layers` slices for a 1D/2D image and `depth` slices for a
  * 3D one; a 3D image has exactly one array layer, so the two never multiply.
- * Each successive level halves width, height and depth, all floor 1, and the
- * row pitch is re-aligned to 64 bytes per level because that is what the a5xx
- * linear fetch unit requires -- not merely what makes the arithmetic even.
+ * Each successive level halves width, height and depth, all floor 1.
+ *
+ * Two parts of this layout are protective rather than merely conventional, and
+ * both were missing until an out-of-bounds write was demonstrated.  This
+ * driver renders into linear system memory in bypass mode, and a5xx accesses
+ * that memory at 32x32 granularity, so an access can over-fetch past the end of
+ * the last level.  Gallium reserves that slack (fd5_layout.c:67-68, "the blits
+ * used for mem<->gmem work at a granularity of 32x32, which can cause faults
+ * due to over-fetch on the last level"), and without it the GPU writes past the
+ * end of the allocation:
+ *
+ *     D32_SFLOAT depth clear only, no draw, no shader, no presentation.
+ *     "wrong" is depth texels that missed the clear, "guard" is bytes clobbered
+ *     after the reported end of the memory requirement:
+ *
+ *         64x64    pitch  256  requirement  16384   wrong=0      guard=0
+ *         128x64   pitch  512  requirement  32768   wrong=0      guard=0
+ *         256x64   pitch 1024  requirement  65536   wrong=0      guard=0
+ *         256x33   pitch 1024  requirement  36864   wrong=192    guard=3072
+ *         257x64   pitch 1088  requirement  69632   wrong=512    guard=512
+ *         300x300  pitch 1216  requirement 368640   wrong=3176   guard=768
+ *
+ * The three clean cases are exactly those where 64-byte pitch alignment and a
+ * 32-row height envelope change nothing.  The three failures are where they do:
+ * 256x64 versus 256x33 isolates height at a fixed pitch, and 256x64 versus
+ * 257x64 isolates pitch at a fixed height.  Both variables had to be wrong for
+ * every one of them to fit.
+ *
+ * 1. The row pitch aligns to 64 *texels*, not 64 bytes.  A pitch register that
+ *    accepts 64-byte multiples is not the same as an access that is correct for
+ *    one; the working GL driver aligns the base pitch to 64 texels
+ *    (freedreno_layout.h:333) and so does this now.  The device's gmem_align_w
+ *    is 64.
+ *
+ * 2. The last level's height is rounded up to a multiple of 32 rows.  The
+ *    logical extent is unchanged -- only the backing allocation grows, which is
+ *    the whole point.
+ *
+ * Both mirror Gallium rather than inventing a layout: it is the arrangement
+ * known to work on this part.
  */
 bool
 ta5_image_layout_levels(const struct ta5_image *image,
@@ -375,13 +412,31 @@ ta5_image_layout_levels(const struct ta5_image *image,
 
    for (uint32_t i = 0; i < image->mip_levels; i++) {
       struct ta5_image_level *lvl = &out[i];
+      /* Rows actually reserved, as opposed to rows the image logically has. */
+      uint32_t stored_h;
 
       lvl->width = w;
       lvl->height = h;
       lvl->depth = d;
       lvl->layers = layers;
-      lvl->row_pitch = align64((VkDeviceSize)w * block_size, 64);
-      lvl->layer_pitch = lvl->row_pitch * h;
+      /*
+       * A power-of-two bytes-per-texel is assumed, exactly as Gallium's
+       * pitchalign does (fdl_cpp_shift()).  A compressed or packed format that
+       * breaks that assumption gets the conservative 64-byte floor instead of
+       * a silently short pitch.
+       */
+      if (util_is_power_of_two_or_zero(block_size))
+         lvl->row_pitch = align64((VkDeviceSize)w * block_size,
+                                  (VkDeviceSize)block_size *
+                                     TA5_TEXEL_PITCH_ALIGN);
+      else
+         lvl->row_pitch = align64((VkDeviceSize)w * block_size, 64);
+
+      stored_h = h;
+      if (i == image->mip_levels - 1)
+         stored_h = align(h, TA5_LAST_LEVEL_HEIGHT_ALIGN);
+
+      lvl->layer_pitch = lvl->row_pitch * stored_h;
       lvl->level_size = lvl->layer_pitch * layers * d;
       lvl->offset = offset;
       offset += lvl->level_size;

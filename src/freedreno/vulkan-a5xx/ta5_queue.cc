@@ -568,6 +568,16 @@ ta5_queue_submit_one(struct ta5_queue *queue, const VkCommandBuffer *cmds,
    struct ta5_device *device = queue->device;
    VkResult result;
 
+   /*
+    * Host clears first: they are CPU writes to attachments the GPU is about to
+    * read, so they have to land before the batch reaches the hardware.  This is
+    * the opposite side of the fence from the image -> buffer copies further
+    * down, which have to wait for the GPU because they read what it produced.
+    */
+   for (uint32_t i = 0; i < cmd_count; i++)
+      ta5_cmd_buffer_run_deferred_clears(
+         ta5_cmd_buffer_from_handle(cmds[i]));
+
    result = ta5_queue_wait_semaphores(device, wait_count, wait_sems,
                                       wait_stages, wait_values);
    if (result != VK_SUCCESS)

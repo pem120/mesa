@@ -97,6 +97,59 @@ struct ta5_ib
 /** The advertised maxPushConstantsSize (128), in dwords. */
 #define TA5_MAX_PUSH_CONST_DWORDS 32
 
+/**
+ * A host-side attachment clear, deferred to submit time.
+ *
+ * A depth clear for D32_SFLOAT is a CPU write rather than a CCU fast clear,
+ * because the fast clear does not clear a Z32 attachment on this part -- the
+ * working GL driver refuses to attempt one for the same reason (fd5_draw.c:229).
+ *
+ * Deferring is not optional.  Recording happens arbitrarily far ahead of
+ * execution, so a clear written at record time is overwritten by whatever the
+ * application does to the image next, and the render pass then begins with an
+ * attachment nobody cleared.  The depth buffer is host-visible linear memory, so
+ * performing the write just before the batch reaches the GPU is both possible
+ * and correct: the clear lands, then the draws that follow in the same stream
+ * see it.
+ *
+ * This is the opposite position from the image -> buffer copies below, which
+ * must run *after* the GPU has finished because they read its output.
+ */
+struct ta5_deferred_clear
+{
+   struct ta5_image *image;
+   VkDeviceSize row_pitch;
+   VkDeviceSize layer_pitch;
+   VkDeviceSize level_offset;
+   uint32_t width;  /**< visible width at this level */
+   uint32_t height; /**< visible height at this level */
+   uint32_t layers;
+   uint32_t texel_size; /**< bytes per texel, 2 or 4 */
+   uint32_t word;       /**< the clear value, already packed for the format */
+};
+
+/**
+ * Perform the host clears queued by a render pass begin.
+ * Called immediately before the batch is submitted.
+ *
+ * The recording is kept rather than consumed: a command buffer may be submitted
+ * repeatedly, and a clear drained by the first submission leaves every later
+ * one rendering against an uncleared attachment.
+ */
+void ta5_cmd_buffer_run_deferred_clears(struct ta5_cmd_buffer *cmd);
+
+/** Release clears no longer part of the recording. */
+void ta5_cmd_buffer_clear_deferred_clears(struct ta5_cmd_buffer *cmd);
+
+/**
+ * Queue a host-side clear of one image level.  Shared by the depth and colour
+ * paths.
+ */
+bool ta5_cmd_buffer_queue_clear(struct ta5_cmd_buffer *cmd,
+                                struct ta5_image *image, uint32_t mip_level,
+                                uint32_t layer, uint32_t texel_size,
+                                uint32_t word);
+
 /** A vkCmdCopyImageToBuffer whose host copy is deferred to submit time. */
 struct ta5_deferred_i2b
 {
@@ -121,12 +174,15 @@ struct ta5_deferred_i2b
 };
 
 /**
- * Perform (and drop) the image -> buffer copies queued by
- * ta5_CmdCopyImageToBuffer.  Called after the GPU has finished the batch.
+ * Perform the image -> buffer copies queued by ta5_CmdCopyImageToBuffer.
+ * Called after the GPU has finished the batch.
+ *
+ * The recording is kept rather than consumed: a command buffer may be submitted
+ * repeatedly, and wsi's blit is recorded once and submitted on every present.
  */
 void ta5_cmd_buffer_run_deferred_i2b(struct ta5_cmd_buffer *cmd);
 
-/** Drop copies that were recorded but never submitted. */
+/** Release copies recorded but no longer part of the recording. */
 void ta5_cmd_buffer_clear_deferred_i2b(struct ta5_cmd_buffer *cmd);
 
 struct ta5_cmd_buffer
@@ -184,6 +240,11 @@ struct ta5_cmd_buffer
    struct ta5_deferred_i2b *i2b;
    uint32_t i2b_count;
    uint32_t i2b_size;
+
+   /** Host-side attachment clears, performed just before the batch is sent. */
+   struct ta5_deferred_clear *clears;
+   uint32_t clears_count;
+   uint32_t clears_size;
 
    /** Bound state at the point of recording. */
    struct ta5_pipeline *bound_pipeline;
