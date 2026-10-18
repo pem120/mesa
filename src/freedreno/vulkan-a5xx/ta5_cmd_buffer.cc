@@ -5177,7 +5177,29 @@ ta5_record_draw(struct ta5_cmd_buffer *cmd, uint32_t vertexCount,
     * is what fd5_draw() writes (p4->vtxcnt = p->count).
     */
    {
-      uint32_t vtxcnt = fetch_cnt;
+      /*
+       * With attributes bound the field belongs to the fetch program, so it is
+       * the slot count.  Without them it is the draw's vertex count -- which is
+       * what fd5_draw() writes (p4->vtxcnt = p->count).
+       *
+       * This was fetch_cnt unconditionally, so a draw with no vertex buffers
+       * programmed VTXCNT = 0: the fetch unit processed no vertices, every
+       * attribute read as zero, and all vertices landed on (0,0,0,1) -- a
+       * zero-area triangle that rasterises no fragments and raises no fault.
+       *
+       * Measured, a six-vertex quad with positions built entirely from
+       * gl_VertexIndex, a fragment shader returning a constant, no textures:
+       *
+       *     ta5[vfd]: VTXCNT=0 (fetch slots=0, draw verts=6)
+       *     pixels: clear_only=65536 shader_only=0 both=0 black=0
+       *
+       * The clear covered every pixel and the draw covered none, with no fault
+       * and no error -- which is what made this hard to see.  Skipping the
+       * draw, the draw packet, the viewport, the VFD state, the draw state, the
+       * program state and the render mode each changed nothing, because the
+       * vertex count was the thing that was wrong.
+       */
+      uint32_t vtxcnt = fetch_cnt ? fetch_cnt : vertexCount;
 
       /* The fetch block above allocated for itself; a draw that fetched
        * nothing has not. */
