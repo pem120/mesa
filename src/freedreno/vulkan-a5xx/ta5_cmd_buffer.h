@@ -97,6 +97,38 @@ struct ta5_ib
 /** The advertised maxPushConstantsSize (128), in dwords. */
 #define TA5_MAX_PUSH_CONST_DWORDS 32
 
+/** A vkCmdCopyImageToBuffer whose host copy is deferred to submit time. */
+struct ta5_deferred_i2b
+{
+   struct ta5_image *image;
+   VkBuffer buffer;
+
+   /*
+    * A snapshot of the level layout rather than a struct ta5_image_level,
+    * because ta5_memory.h is not visible here.  The values are taken at
+    * record time, so a later rebind cannot move the data out from under the
+    * copy.
+    */
+   VkDeviceSize row_pitch;
+   VkDeviceSize layer_pitch;
+   VkDeviceSize level_offset;
+
+   uint32_t block_size;
+   uint32_t mip;
+   VkDeviceSize image_offset;
+   VkBufferImageCopy *regions;
+   uint32_t region_count;
+};
+
+/**
+ * Perform (and drop) the image -> buffer copies queued by
+ * ta5_CmdCopyImageToBuffer.  Called after the GPU has finished the batch.
+ */
+void ta5_cmd_buffer_run_deferred_i2b(struct ta5_cmd_buffer *cmd);
+
+/** Drop copies that were recorded but never submitted. */
+void ta5_cmd_buffer_clear_deferred_i2b(struct ta5_cmd_buffer *cmd);
+
 struct ta5_cmd_buffer
 {
    struct vk_object_base base;
@@ -131,6 +163,27 @@ struct ta5_cmd_buffer
    struct ta5_ib *ibs;
    uint32_t ib_count;
    uint32_t ib_size;
+
+   /**
+    * Image -> buffer copies deferred to submit time.
+    *
+    * vkCmdCopyImageToBuffer is a host memcpy here, but a host memcpy runs
+    * when the command is *recorded*, and recording can be arbitrarily far
+    * ahead of execution.  That is fatal for the wl_shm blit wsi records:
+    * wsi_finish_create_blit_context() records image -> buffer exactly once,
+    * during swapchain creation, long before the application has drawn
+    * anything.  Copying then produced the image's initial contents -- zeros --
+    * so every presented frame was solid black while the client reported
+    * success throughout.
+    *
+    * So the copy is queued here and performed by ta5_queue_submit_batch()
+    * after the kernel fence says the GPU is done.  The region data is copied
+    * rather than referenced, because the caller's arrays need not outlive the
+    * recording.
+    */
+   struct ta5_deferred_i2b *i2b;
+   uint32_t i2b_count;
+   uint32_t i2b_size;
 
    /** Bound state at the point of recording. */
    struct ta5_pipeline *bound_pipeline;

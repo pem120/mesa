@@ -604,6 +604,17 @@ ta5_queue_submit_one(struct ta5_queue *queue, const VkCommandBuffer *cmds,
       close(fence_fd);
    }
 
+   /*
+    * Now that the GPU is finished, run any image -> buffer copies this batch
+    * recorded.  ta5_CmdCopyImageToBuffer is a host memcpy in this driver, and
+    * a host memcpy taken at record time would read the image before the
+    * application had drawn into it.  Doing it here is what makes the wl_shm
+    * blit wsi records at swapchain-creation time produce the rendered frame
+    * instead of the image's initial zeros.
+    */
+   for (uint32_t i = 0; i < cmd_count; i++)
+      ta5_cmd_buffer_run_deferred_i2b(ta5_cmd_buffer_from_handle(cmds[i]));
+
    return ta5_queue_signal_syncs(device, signal_count, signal_sems,
                                  signal_values, fence);
 }

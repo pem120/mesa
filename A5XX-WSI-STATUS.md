@@ -609,3 +609,41 @@ image is copied into a wl_shm buffer that any compositor can import. Our
 swapchain images are already linear host memory, so that copy is close to
 free. It would give a genuinely working Vulkan surface on this desktop, at
 the cost of a CPU copy per frame and the loss of zero-copy presentation.
+
+### 10.9 FIXED: the blit ran at record time, so every frame was black
+
+Screenshots (grim, while vkcube ran) settled what exit codes could not.
+
+Before this fix, the vkcube window covered the screen and every pixel of it was
+**pure black** -- exactly one distinct colour across the whole client area,
+against 585 in a baseline capture. The client exited 0 throughout.
+
+**Cause.** vkCmdCopyImageToBuffer is a host memcpy in this driver. wsi records
+the image -> buffer blit for a wl_shm swapchain exactly once, inside
+wsi_finish_create_blit_context() during *swapchain creation*, long before the
+application has drawn anything. Copying at record time therefore copied the
+image's initial contents, which are zeros.
+
+This is worse than the usual record-time hazard. CmdCopyBufferToImage gets away
+with it because uploads happen immediately before the submit that needs them;
+the wsi blit is recorded once and executed every frame.
+
+**Fix.** The copy is queued on the command buffer and performed by
+ta5_queue_submit_batch() after the kernel fence reports the GPU is finished.
+The region data and the level layout are snapshotted at record time, so the
+copy cannot be moved by a later rebind, and the queue is dropped on reset or
+begin so a re-recorded buffer does not inherit a stale copy.
+
+**After, captured on screen:**
+
+  vkcube --wsi wayland --c 400   exit 0, phoc and phosh alive
+  the cube renders: correct textures (LUNAR / LUNAR GLT), correct depth
+  shading between faces, correct perspective, and it animates between frames
+
+**Remaining, visible in every capture:** black dashed lines exactly along the
+cube's triangle edges, and a corrupted vertical column down the left edge.
+That is a rendering defect, not a WSI one -- it is inside the frame the driver
+produced -- and it is unexplained. It is the next thing to investigate.
+
+Still open from earlier: the GPU fault storm (10-30 faults per run) and the
+lazily created queues.

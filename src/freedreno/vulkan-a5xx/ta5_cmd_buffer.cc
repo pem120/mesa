@@ -308,6 +308,7 @@ ta5_BeginCommandBuffer(VkCommandBuffer _cmd,
    cmd->reloc_count = 0;
    cmd->reloc_bo_count = 0;
    ta5_cmd_buffer_clear_ibs(cmd);
+   ta5_cmd_buffer_clear_deferred_i2b(cmd);
    cmd->submitted = 0;
    cmd->fence = NULL;
    cmd->state = MESA_VK_COMMAND_BUFFER_STATE_RECORDING;
@@ -4363,6 +4364,115 @@ ta5_CmdCopyBufferToImage(VkCommandBuffer _cmd, VkBuffer srcBuffer,
  * the copy is a memcpy, and it happens at record time.  Read the long comment
  * there before changing this to a real CP_MEMCPY.
  */
+/**
+ * Perform the image -> buffer copies queued on this command buffer.
+ *
+ * Called from ta5_queue_submit_batch() once the kernel fence reports the GPU
+ * is finished, which is the only point at which the destination image holds
+ * the rendered result.
+ */
+void
+ta5_cmd_buffer_run_deferred_i2b(struct ta5_cmd_buffer *cmd)
+{
+   for (uint32_t i = 0; i < cmd->i2b_count; i++) {
+      struct ta5_deferred_i2b *d = &cmd->i2b[i];
+      struct ta5_image *image = d->image;
+      struct ta5_buffer *buffer = ta5_buffer_from_handle(d->buffer);
+      const VkDeviceSize row_pitch = d->row_pitch;
+      const VkDeviceSize layer_pitch = d->layer_pitch;
+      const uint32_t block_size = d->block_size;
+      void *src_map, *dst_map;
+
+      if (!buffer || !buffer->bound_memory || !image->bound_memory) {
+         if (getenv("TA5_TRACE_COPY"))
+            fprintf(stderr, "ta5[copy] i2b deferred: no memory bound\n");
+         continue;
+      }
+
+      src_map = ta5_bo_map(image->bound_memory->bo);
+      dst_map = ta5_bo_map(buffer->bound_memory->bo);
+      if (!src_map || !dst_map) {
+         if (getenv("TA5_TRACE_COPY"))
+            fprintf(stderr, "ta5[copy] i2b deferred: mmap failed\n");
+         continue;
+      }
+
+      for (uint32_t r = 0; r < d->region_count; r++) {
+         const VkBufferImageCopy *reg = &d->regions[r];
+         const uint32_t cols = reg->imageExtent.width;
+         const uint32_t rows = reg->imageExtent.height;
+         const uint32_t depth = reg->imageExtent.depth;
+         const uint32_t layers = reg->imageSubresource.layerCount;
+         const VkDeviceSize src_pitch = row_pitch;
+         const VkDeviceSize dst_pitch = reg->bufferRowLength
+                                           ? reg->bufferRowLength * block_size
+                                           : src_pitch;
+         const VkDeviceSize dst_layer_pitch =
+            reg->bufferImageHeight
+               ? (VkDeviceSize)reg->bufferImageHeight * dst_pitch
+               : (VkDeviceSize)rows * dst_pitch;
+
+         if (!cols || !rows || !depth || !layers)
+            continue;
+
+         for (uint32_t layer = 0; layer < layers; layer++) {
+            const VkDeviceSize src_layer_base =
+               d->image_offset + d->level_offset +
+               (VkDeviceSize)(reg->imageSubresource.baseArrayLayer + layer) *
+                  layer_pitch +
+               (VkDeviceSize)reg->imageOffset.y * src_pitch +
+               (VkDeviceSize)reg->imageOffset.x * block_size;
+            const VkDeviceSize dst_layer_base =
+               reg->bufferOffset + (VkDeviceSize)layer * dst_layer_pitch;
+
+            for (uint32_t z = 0; z < depth; z++) {
+               const uint8_t *src_row = (const uint8_t *)src_map +
+                                        src_layer_base +
+                                        (VkDeviceSize)z * layer_pitch;
+               uint8_t *dst_row = (uint8_t *)dst_map + dst_layer_base +
+                                  (VkDeviceSize)z * dst_layer_pitch;
+
+               for (uint32_t y = 0; y < rows; y++) {
+                  const uint8_t *s = src_row + (VkDeviceSize)y * src_pitch;
+                  uint8_t *dd = dst_row + (VkDeviceSize)y * dst_pitch;
+
+                  if (src_pitch == dst_pitch) {
+                     memcpy(dd, s, (size_t)cols * block_size);
+                  } else {
+                     for (uint32_t x = 0; x < cols; x++)
+                        memcpy(dd + (size_t)x * block_size,
+                               s + (size_t)x * block_size, block_size);
+                  }
+               }
+            }
+         }
+
+         if (getenv("TA5_TRACE_COPY"))
+            fprintf(stderr,
+                    "ta5[copy] i2b deferred region %u mip=%u %ux%ux%u "
+                    "srcpitch=%llu dstpitch=%llu\n",
+                    r, d->mip, cols, rows, depth,
+                    (unsigned long long)src_pitch,
+                    (unsigned long long)dst_pitch);
+      }
+
+      free(d->regions);
+      d->regions = NULL;
+   }
+
+   cmd->i2b_count = 0;
+}
+
+/** Drop any copies that were recorded but never submitted. */
+void
+ta5_cmd_buffer_clear_deferred_i2b(struct ta5_cmd_buffer *cmd)
+{
+   for (uint32_t i = 0; i < cmd->i2b_count; i++)
+      free(cmd->i2b[i].regions);
+
+   cmd->i2b_count = 0;
+}
+
 VKAPI_ATTR void VKAPI_CALL
 ta5_CmdCopyImageToBuffer(VkCommandBuffer _cmd, VkImage srcImage,
                          VkImageLayout srcImageLayout, VkBuffer dstBuffer,
@@ -4371,8 +4481,6 @@ ta5_CmdCopyImageToBuffer(VkCommandBuffer _cmd, VkImage srcImage,
 {
    struct ta5_cmd_buffer *cmd = ta5_cmd_buffer_from_handle(_cmd);
    struct ta5_image *image = ta5_image_from_handle(srcImage);
-   struct ta5_buffer *buffer = ta5_buffer_from_handle(dstBuffer);
-   void *src_map, *dst_map;
    uint32_t block_size;
 
    (void)srcImageLayout;
@@ -4380,105 +4488,57 @@ ta5_CmdCopyImageToBuffer(VkCommandBuffer _cmd, VkImage srcImage,
    if (cmd->state != MESA_VK_COMMAND_BUFFER_STATE_RECORDING)
       return;
 
-   if (!buffer || !image || !pRegions || regionCount == 0)
+   if (!image || !pRegions || regionCount == 0)
       return;
 
-   if (!buffer->bound_memory || !image->bound_memory)
+   if (!image->bound_memory)
       return;
 
    block_size = ta5_format_block_size(image->format);
    if (!block_size)
       return;
 
-   src_map = ta5_bo_map(image->bound_memory->bo);
-   dst_map = ta5_bo_map(buffer->bound_memory->bo);
-   if (!src_map || !dst_map) {
+   if (cmd->i2b_count == cmd->i2b_size) {
+      uint32_t new_size = cmd->i2b_size ? cmd->i2b_size * 2 : 4;
+      struct ta5_deferred_i2b *grown = (struct ta5_deferred_i2b *)realloc(
+         cmd->i2b, new_size * sizeof(*grown));
+
+      if (!grown) {
+         if (getenv("TA5_TRACE_COPY"))
+            fprintf(stderr, "ta5[copy] i2b: out of memory queueing\n");
+         return;
+      }
+      cmd->i2b = grown;
+      cmd->i2b_size = new_size;
+   }
+
+   struct ta5_deferred_i2b *d = &cmd->i2b[cmd->i2b_count];
+
+   memset(d, 0, sizeof(*d));
+   d->image = image;
+   d->buffer = dstBuffer;
+   d->block_size = block_size;
+   d->image_offset = image->offset;
+   d->region_count = regionCount;
+   /* Snapshot the level: the application may have rebound the image between
+    * recording and submission. */
+   d->mip = MIN2(regionCount ? pRegions[0].imageSubresource.mipLevel : 0,
+                 MAX2(image->mip_levels, 1u) - 1);
+   d->row_pitch = image->levels[d->mip].row_pitch;
+   d->layer_pitch = image->levels[d->mip].layer_pitch;
+   d->level_offset = image->levels[d->mip].offset;
+
+   /* Own the region data; the caller's array need not outlive recording. */
+   d->regions = (VkBufferImageCopy *)malloc(regionCount * sizeof(*d->regions));
+   if (!d->regions) {
       if (getenv("TA5_TRACE_COPY"))
-         fprintf(stderr, "ta5[copy] mmap failed\n");
+         fprintf(stderr, "ta5[copy] i2b: out of memory copying regions\n");
       return;
    }
+   memcpy(d->regions, pRegions, regionCount * sizeof(*d->regions));
 
-   for (uint32_t r = 0; r < regionCount; r++) {
-      const VkBufferImageCopy *reg = &pRegions[r];
-      uint32_t mip, cols, rows;
-      const struct ta5_image_level *lvl;
-      VkDeviceSize src_pitch, dst_pitch, dst_layer_pitch;
-      const uint32_t layers = reg->imageSubresource.layerCount;
-      const uint32_t depth = reg->imageExtent.depth;
-
-      /* Clamp against the level, as in CmdCopyBufferToImage: a caller that
-       * gets this wrong copies less rather than walking off the allocation. */
-      mip = MIN2(reg->imageSubresource.mipLevel,
-                 MAX2(image->mip_levels, 1u) - 1);
-      lvl = &image->levels[mip];
-
-      cols = reg->imageExtent.width;
-      rows = reg->imageExtent.height;
-      if (!cols || !rows || !depth || !layers)
-         continue;
-      if (mip != reg->imageSubresource.mipLevel || cols > lvl->width ||
-          rows > lvl->height || depth > lvl->depth)
-         continue;
-
-      src_pitch = lvl->row_pitch;
-      dst_pitch = reg->bufferRowLength ? reg->bufferRowLength * block_size
-                                       : src_pitch;
-
-      /* Depth slices in the buffer are bufferImageHeight rows apart; when that
-       * is zero they are tightly packed, which is the case wsi's blit records. */
-      dst_layer_pitch = reg->bufferImageHeight
-                           ? (VkDeviceSize)reg->bufferImageHeight * dst_pitch
-                           : (VkDeviceSize)rows * dst_pitch;
-
-      for (uint32_t layer = 0; layer < layers; layer++) {
-         /* layer_pitch is per array layer for a 2D array and per depth slice
-          * for a 3D image; in both cases it is the stride between the units
-          * this loop walks. */
-         const VkDeviceSize src_layer_base =
-            image->offset + lvl->offset +
-            (VkDeviceSize)(reg->imageSubresource.baseArrayLayer + layer) *
-               lvl->layer_pitch +
-            (VkDeviceSize)reg->imageOffset.y * src_pitch +
-            (VkDeviceSize)reg->imageOffset.x * block_size;
-
-         const VkDeviceSize dst_layer_base =
-            reg->bufferOffset + (VkDeviceSize)layer * dst_layer_pitch;
-
-         for (uint32_t z = 0; z < depth; z++) {
-            const uint8_t *src_row =
-               (const uint8_t *)src_map + src_layer_base +
-               (VkDeviceSize)z * lvl->layer_pitch;
-            uint8_t *dst_row = (uint8_t *)dst_map + dst_layer_base +
-                               (VkDeviceSize)z * dst_layer_pitch;
-
-            for (uint32_t y = 0; y < rows; y++) {
-               const uint8_t *s = src_row + (VkDeviceSize)y * src_pitch;
-               uint8_t *d = dst_row + (VkDeviceSize)y * dst_pitch;
-
-               /* Row by row: the pitches are independent, and only when they
-                * agree is the whole region one contiguous move. */
-               if (src_pitch == dst_pitch) {
-                  memcpy(d, s, (size_t)cols * block_size);
-               } else {
-                  for (uint32_t x = 0; x < cols; x++)
-                     memcpy(d + (size_t)x * block_size,
-                            s + (size_t)x * block_size, block_size);
-               }
-            }
-         }
-      }
-
-      if (getenv("TA5_TRACE_COPY"))
-         fprintf(stderr,
-                 "ta5[copy] i2b region %u mip=%u %ux%ux%u layers=%u off=%u,%u "
-                 "srcpitch=%llu dstpitch=%llu dst=%llu\n",
-                 r, mip, cols, rows, depth, layers,
-                 (unsigned)reg->imageOffset.x, (unsigned)reg->imageOffset.y,
-                 (unsigned long long)src_pitch, (unsigned long long)dst_pitch,
-                 (unsigned long long)reg->bufferOffset);
-   }
+   cmd->i2b_count++;
 }
-
 
 /*
  * vkCmdBindIndexBuffer / vkCmdDrawIndexed.
