@@ -60,6 +60,7 @@ ta5_CreateImageView(VkDevice _device, const VkImageViewCreateInfo *pCreateInfo,
    struct ta5_image *image;
    uint32_t block_size;
    uint32_t layers;
+   uint32_t level_count;
 
    if (pAllocator == NULL)
       pAllocator = vk_default_allocator();
@@ -106,7 +107,29 @@ ta5_CreateImageView(VkDevice _device, const VkImageViewCreateInfo *pCreateInfo,
                                      VK_IMAGE_ASPECT_STENCIL_BIT))))
       return vk_error(&device->instance->vk, VK_ERROR_FORMAT_NOT_SUPPORTED);
 
+   /*
+    * VK_REMAINING_MIP_LEVELS and VK_REMAINING_ARRAY_LAYERS both mean "to the
+    * end of the image's levels/layers", and they are the idiomatic way to say
+    * "all of them" -- several toolkits use nothing else.
+    *
+    * Taken literally they are 0xffffffff, so the range check further down
+    * rejected every such view with VK_ERROR_FORMAT_NOT_SUPPORTED:
+    *
+    *     ta5[view] type=1 fmt=44 ... levels=4294967295 baseMip=0
+    *
+    * which is what stopped GTK Inspector under GSK_RENDERER=vulkan: nine of
+    * its image views came back FORMAT_NOT_SUPPORTED and it then segfaulted.
+    * vkcube and vkmark pass explicit counts, which is why they never hit it.
+    */
    layers = pCreateInfo->subresourceRange.layerCount;
+   if (layers == VK_REMAINING_ARRAY_LAYERS)
+      layers = image->array_layers -
+               pCreateInfo->subresourceRange.baseArrayLayer;
+
+   level_count = pCreateInfo->subresourceRange.levelCount;
+   if (level_count == VK_REMAINING_MIP_LEVELS)
+      level_count = image->mip_levels -
+                    pCreateInfo->subresourceRange.baseMipLevel;
 
    /*
     * The view type has to agree with the image, and the mismatches are the
@@ -155,9 +178,8 @@ ta5_CreateImageView(VkDevice _device, const VkImageViewCreateInfo *pCreateInfo,
       return vk_error(&device->instance->vk, VK_ERROR_FORMAT_NOT_SUPPORTED);
    }
 
-   if (pCreateInfo->subresourceRange.baseMipLevel +
-          pCreateInfo->subresourceRange.levelCount >
-      image->mip_levels ||
+   if (pCreateInfo->subresourceRange.baseMipLevel + level_count >
+          image->mip_levels ||
        pCreateInfo->subresourceRange.baseArrayLayer + layers >
           image->array_layers)
       return vk_error(&device->instance->vk, VK_ERROR_FORMAT_NOT_SUPPORTED);
@@ -174,7 +196,7 @@ ta5_CreateImageView(VkDevice _device, const VkImageViewCreateInfo *pCreateInfo,
    view->format = pCreateInfo->format;
    view->aspect = pCreateInfo->subresourceRange.aspectMask;
    view->base_mip_level = pCreateInfo->subresourceRange.baseMipLevel;
-   view->level_count = pCreateInfo->subresourceRange.levelCount;
+   view->level_count = level_count;
    view->base_array_layer = pCreateInfo->subresourceRange.baseArrayLayer;
    view->layer_count = layers;
    view->comp[0] = pCreateInfo->components.r;

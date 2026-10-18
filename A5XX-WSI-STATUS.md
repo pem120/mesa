@@ -1296,3 +1296,60 @@ The D32 depth failure of section 16 still does not reproduce on the committed
 driver, with or without a second GPU client running, and cover-probe was first
 introduced against a modified build so there is no committed-driver baseline for
 it.  That remains undiagnosed.
+
+
+## 18. VK_REMAINING_MIP_LEVELS was rejected outright
+
+Found by running GTK Inspector (`GSK_RENDERER=vulkan kgx`) on the device.
+
+### 18.1 Not a regression
+
+Checked before changing anything, by building the driver both with and without
+section 17's format change and running kgx against each:
+
+    prefmt (6f75a24, 43896589193cc187)  exit=139  FORMAT_NOT_SUPPORTED x9
+    fmtfix (c6b4092, b9e422115e6f9d04)  exit=139  FORMAT_NOT_SUPPORTED x9
+
+Identical, so section 17 did not cause it.  (The first attempt at this A/B was
+worthless -- the second cp was a self-copy, so both runs used the same library.
+Redone with distinct filenames.)
+
+### 18.2 The cause
+
+TA5_TRACE_VIEW showed what kgx asks for:
+
+    ta5[view] type=1 fmt=44 ... baseMip=0 levels=4294967295 ...
+
+4294967295 is VK_REMAINING_MIP_LEVELS, which means "from baseMipLevel to the
+last level" and is the idiomatic way to say "all of them" -- GTK uses nothing
+else.  ta5_CreateImageView took levelCount literally:
+
+    if (baseMipLevel + levelCount > image->mip_levels)   /* 0 + 4294967295 > 1 */
+       return VK_ERROR_FORMAT_NOT_SUPPORTED;
+
+so every such view was rejected.  vkcube and vkmark pass explicit counts, which
+is why they never hit it, and why it survived so long.
+
+Both VK_REMAINING_MIP_LEVELS and VK_REMAINING_ARRAY_LAYERS are now resolved
+against the image before the range check and before the viewType checks, which
+also makes the 3D/CUBE/2D_ARRAY layer-count checks meaningful.
+
+### 18.3 Effect
+
+kgx's nine FORMAT_NOT_SUPPORTED errors go to zero.  It still segfaults, now
+later and for a different reason -- see 18.4.
+
+### 18.4 Still broken: vertex input range
+
+    MESA: error: shader: MESA_SHADER_VERTEX
+    MESA: error: inputs_read: 15-23
+    MESA: error: inputs: 7
+    MESA: error: failed assert: idx < ctx->ninputs
+
+The shader reads input slots 15-23 while the pipeline declares 7, and the
+lowering asserts.  Not diagnosed; not the same bug as the format rejection.
+
+### 18.5 No regression
+
+vkmark all seven scenes, Score 171, zero GPU faults.  cover-probe 0 wrong at
+720x1524 with depth.  phoc and phosh alive.
