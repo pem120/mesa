@@ -81,9 +81,13 @@ const struct vk_instance_extension_table ta5_instance_extensions_supported = {
       .KHR_get_physical_device_properties2 = true,
       .KHR_get_surface_capabilities2 = true,
       .KHR_surface = true,
-#ifdef TA5_HAVE_WAYLAND
+      /* Unconditional now.  It used to be guarded by TA5_HAVE_WAYLAND, which
+       * was defined only when the driver linked wayland itself; libvulkan_wsi
+       * links it and provides the entry points, so the guard no longer tracks
+       * whether the extension works.  With it still in place the loader found
+       * no VK_KHR_wayland_surface and refused the platform outright:
+       *     "failed to find the VK_KHR_wayland_surface instance extension" */
       .KHR_wayland_surface = true,
-#endif
       /* vkmark's headless window system asks for this by name; without it
        * vkCreateInstance fails with VK_ERROR_EXTENSION_NOT_PRESENT before
        * any scene runs. */
