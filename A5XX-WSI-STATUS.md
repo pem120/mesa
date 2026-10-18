@@ -1148,3 +1148,70 @@ establish it, as this section demonstrates three times over.
 
 Verification after the diagnostic was added: all seven scenes, Score 168, faults
 0, phoc and phosh alive.
+
+
+## 16. The dropped pixels are real, and section 15 was wrong
+
+Section 15 concluded the "12-pixel stripes" were texture content.  That is
+wrong.  The vertex scene -- a textureless Suzanne model -- shows the same
+artifact, and it is screen-space.
+
+### 16.1 Exact geometry
+
+Pure-black pixels inside the bright model, column by column:
+
+    column 448 (control): 178 177 176 175 174 173 172 171 170 169 168 167 ...
+    column 452 (artifact): 177 176 175 174 172 171 170 169 [0 0 0 0] 163 162 ...
+    column 456 (artifact): 176 175 174 173 172 171 170 169 [0 0 0 0] 162 161 ...
+
+Darks at rows 408-411, 424-427, 440-443, 456-459: **four rows, period 16,
+starting at y = 8 (mod 16)**.  In x the run is **twelve columns wide, starting
+at x = 4 (mod 16)**.
+
+Tiling the frame into 16x16 cells makes it unambiguous: every affected cell
+contains **exactly 48 black pixels**, and 48 = 12 x 4.  The map of affected
+cells (value = black pixels in that cell) is strikingly regular -- columns 17,
+19, 24, 26, 28, 30, 34, 38, 40 and 42 carry 48 in long vertical runs:
+
+     j  ...                                                     i
+    28   .   .   .   .   .   .   .   .   .   .   .   .   .   .   .   .   .   .   .   .   .   .   .   .   .   .   .   .  48  48   .
+    30   .   .   .   .   .   .   .   .   .   .   .   .   .   .   .   .   .   .   .   .   .   .   .   .   .   .   .  48  48   .
+
+so the artifact is a 16-grid phenomenon with a fixed sub-pattern, not content.
+
+### 16.2 What is ruled out
+
+**Textures and sampling.**  The vertex scene samples nothing.  Section 15's
+texture-descriptor analysis (15.1) stands on its own and remains correct; it is
+only the conclusion drawn from the texture scene's appearance that was wrong.
+
+**The clear path.**  The clear scene writes **one single colour to every
+pixel**:
+
+    distinct colours in window = 1
+    [255, 0, 41]  1094400 px (100.00%)
+    pure-black pixels: 0 of 1094400
+
+**The presentation path.**  The clear scene reaches the screen through the same
+swapchain, the same dma-buf import and the same compositor as the vertex scene,
+and it is pixel-perfect.  The native path added in section 14 is therefore
+exonerated.
+
+So the artifact requires **draw calls**: the clear path writes all pixels, and
+fragment rendering loses a fixed 12x4 sub-pattern of every 16x16 tile.
+
+### 16.3 Why section 15 got it wrong
+
+The texture scene's plank features and the artifact have similar widths, and
+the image-based filters picked the features.  The discriminating measurement was
+never run: **the same artifact in a scene with no textures at all**.  That was
+available the whole time and was not tried.
+
+### 16.4 What is not yet established
+
+The cause.  A 16x16 tile is a5xx's bin granularity, and a fixed 12x4 hole
+inside it is consistent with a bin-store or tile-write stride problem, but that
+is inference, not measurement.  The controlled test is a full-coverage quad whose
+render target is read back and compared pixel for pixel; that distinguishes
+coverage loss in the rasterizer from a bad colour write, and it is the same
+test section 12.4's coverage shortfall needs.
