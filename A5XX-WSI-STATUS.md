@@ -560,3 +560,52 @@ satisfy for wsi_common. Prime suspects, in order:
 
 Item 3 is directly observable: log the formats/modifiers phoc advertises over
 `wl_dmabuf` and compare against what the swapchain picks.
+
+### 10.8 MEASURED: the compositor cannot import dma-bufs at all (2026-10-18)
+
+Two probes, built for aarch64-musl and run on the device, both read-only and
+both independent of the Vulkan driver.
+
+**1. What phoc advertises over wl_dmabuf** (`/home/ishu/a5xx-test-tmp/wl-dmabuf-probe`):
+
+```
+bound zwp_linux_dmabuf_v1 version 5
+totals: 0 formats, 0 modifiers
+```
+
+The global exists at version 5 and then advertises **nothing**. There is no
+format/modifier list for a client to match against.
+
+**2. Where that list comes from** (`/home/ishu/a5xx-test-tmp/egl-dmabuf-probe`):
+
+```
+EGL 1.5
+EGL_EXTENSIONS: ... EGL_EXT_image_dma_buf_import
+                 EGL_EXT_image_dma_buf_import_modifiers ...
+eglQueryDmaBufFormatsEXT -> ok=1 num=0
+```
+
+phoc derives its wl_dmabuf list from its renderer's
+`eglQueryDmaBufFormatsEXT()`. That returns **0 formats**, which is why
+phoc advertises 0. The extension is present; the format list behind it is empty.
+
+**Consequence.** phoc cannot import a dma-buf produced by *any* client, not
+just this driver. `EGL_BAD_ALLOC "createImageFromDmaBufs failed"` is not
+specific to vulkan-a5xx. No amount of
+`VK_EXT_image_drm_format_modifier` work in this tree can fix it, because
+there is nothing on the compositor side to negotiate with.
+
+This does not touch `src/gallium` (which is out of scope for this port). The
+real fix -- making the GL/GBM stack advertise importable formats for this GPU
+-- lives in the system Mesa's EGL/gallium, not in vulkan-a5xx.
+
+**Where this leaves vulkan-a5xx.** The driver side is now correct:
+`vkcube --wsi wayland --c 30` exits 0, and headless vkmark clear exits 0 at
+~4000 fps with zero gpu faults. What remains is a display-side limitation.
+
+**Next experiment, and it is a design decision, not a bug fix:**
+`wsi_device->sw = true` selects WSI_WL_BUFFER_SHM_MEMCPY, where the rendered
+image is copied into a wl_shm buffer that any compositor can import. Our
+swapchain images are already linear host memory, so that copy is close to
+free. It would give a genuinely working Vulkan surface on this desktop, at
+the cost of a CPU copy per frame and the loss of zero-copy presentation.
