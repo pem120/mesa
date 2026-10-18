@@ -1215,3 +1215,84 @@ is inference, not measurement.  The controlled test is a full-coverage quad whos
 render target is read back and compared pixel for pixel; that distinguishes
 coverage loss in the rasterizer from a bad colour write, and it is the same
 test section 12.4's coverage shortfall needs.
+
+
+## 17. The swapchain format was 64-bit float; the renderbuffer is not
+
+### 17.1 How it was found
+
+waypipe (wlroots' Wayland proxy, 0.11.2, built with dmabuf support) was used to
+run vkmark with phoc out of the path entirely: waypipe's server acts as the
+compositor, so it is waypipe that has to import our buffers and phoc never sees
+them.  Invoked as the man page documents for local use -- options before the
+mode, and the *same* socket path on both ends:
+
+    waypipe --socket /tmp/wp.sock client &
+    waypipe --socket /tmp/wp.sock server /usr/bin/vkmark ...
+
+The cube scene came back as magenta and black with half the window dead, while
+the same scene under phoc looked correct.
+
+### 17.2 The cause
+
+    ta5[prep]: fb 960x1050, img 960x1050 fmt 97, row_pitch 7680
+
+97 is VK_FORMAT_R16G16B16A16_SFLOAT -- eight bytes per texel -- and 7680/960 is
+8, so the allocation was self-consistent.  The problem is that the renderbuffer
+is not.  ta5_render_pass_begin() programs the colour attachment unconditionally:
+
+    A5XX_RB_MRT_BUF_INFO_COLOR_FORMAT(RB5_R8G8B8A8_UNORM)
+
+with only COLOR_SWAP and the sRGB bit varying.  So for any format that is not
+8_8_8_8 the RB writes four bytes per texel into a buffer that has some other
+stride, and a consumer reading the declared format reads interleaved garbage.
+That is the magenta-with-no-green signature: half the bytes are real 8-bit
+channels and half are padding.
+
+wsi_common picks the swapchain format from what the compositor advertises
+intersected with what the driver supports (wsi_wl_surface_get_formats), so
+because R16G16B16A16_SFLOAT was in our format table with COLOR_FILTERED it was
+selectable, and it was selected.
+
+### 17.3 The fix
+
+Colour attachment support is much narrower than "is a colour format": the RB can
+only write 8_8_8_8.  Every other entry in the format table now goes through
+NO_COLOR_ATTACHMENT(), which strips COLOR_ATTACHMENT and COLOR_ATTACHMENT_BLEND
+while leaving sampled and transfer features alone.  Twenty entries were
+corrected; the seven 8_8_8_8 formats are untouched.
+
+Negotiated format afterwards:
+
+    ta5[prep]: fb 720x1524, img 720x1524 fmt 43, row_pitch 3072
+
+43 is VK_FORMAT_R8G8B8A8_SRGB and 3072/720 is 4 -- what the RB actually writes.
+
+### 17.4 Verification
+
+The same vkmark cube scene through waypipe: magenta-and-black garbage before,
+a correctly shaded perspective gradient cube on a clean background after.
+
+On the device, all seven scenes: Score 173, zero GPU faults, phoc and phosh
+alive.  cover-probe unchanged: 0 wrong pixels at 512x512 and 720x1524 with
+depth, and 720x1524 colour only.
+
+### 17.5 Superseded
+
+**"phoc advertises no usable dma-buf formats"** is refuted again, this time from
+the wire.  Captured through waypipe:
+
+    wl_registry.global("wl_drm", 2)
+    wl_registry.global("zwp_linux_dmabuf_v1", 5)
+    wl_registry.global("zwlr_export_dmabuf_manager_v1", 1)
+    tranche_formats([0,0, 1,0, 2,0, ... 56,0, ...])   <- modifier 0 = LINEAR
+
+phoc offers linux-dmabuf v5 with a feedback object and LINEAR modifiers across
+a wide format range.  The crash in section 14 was never a missing format.
+
+### 17.6 Still open
+
+The D32 depth failure of section 16 still does not reproduce on the committed
+driver, with or without a second GPU client running, and cover-probe was first
+introduced against a modified build so there is no committed-driver baseline for
+it.  That remains undiagnosed.
