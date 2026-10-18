@@ -2,10 +2,16 @@
 
 Status updated: 2026-10-18. Branch: `a5xx-vulkan`.
 
-## 1. Current findings (supersede the historical notes below)
+## 1. Status and reading order
 
-The driver is **not validated as working**. The older sections retain investigation
-history, including several conclusions that subsequent evidence contradicted.
+The driver is **not validated as working**. **kgx with GSK Vulkan is the current
+priority; do not run vkmark until its rendering is confirmed against a GL
+reference.** **GPU tests are stopped: the 18:01 kgx Vulkan test caused a GPU
+lockup and loss of the phoc/phosh session (§19.5). Do not retry or attempt session
+recovery without user approval.** Section 19 records the latest crash diagnosis. The table below is an
+older snapshot, not a current summary: section 14 supersedes its wl_shm status,
+and section 19 corrects the kgx and depth-probe conclusions. Historical claims of
+"fixed", "clean", or "no regression" apply only to the tests actually recorded.
 
 | Area | Current evidence / limitation |
 |---|---|
@@ -1353,3 +1359,253 @@ lowering asserts.  Not diagnosed; not the same bug as the format rejection.
 
 vkmark all seven scenes, Score 171, zero GPU faults.  cover-probe 0 wrong at
 720x1524 with depth.  phoc and phosh alive.
+
+## 19. kgx: GDB identifies the NULL dispatch (2026-10-18)
+
+### 19.1 Corrections to the intervening investigation
+
+- A return address in GTK and PC=0 do **not** exonerate the driver. A missing
+  driver dispatch entry can produce exactly that stack, without driver frames.
+- There is no evidence that GTK requires Vulkan >1.1 for this path. Timeline
+  semaphores and the Vulkan ceiling did not explain the crash. The ceiling stays
+  at 1.1; no speculative extensions were enabled.
+- `new window (-1x-1)` is not evidence of an invalid swapchain extent. Image
+  creation was observed at 2x2 and 1080x2186. The later crash is in rendering,
+  not proven to be immediately after device creation or during surface setup.
+- `VK_IMAGE_TILING_OPTIMAL` permits an implementation-defined layout. Choosing
+  a linear physical layout is not by itself a defect. Do not reject OPTIMAL
+  images merely because this driver uses linear memory internally.
+- Image create flag `0x400` is `VK_IMAGE_CREATE_ALIAS_BIT`, not a DRM-modifier
+  flag. The prior interpretation of the image trace was wrong.
+- Successful syscalls in strace do not rule out a driver bug. `si_addr=NULL`
+  alone does not distinguish a NULL function call from a NULL data access.
+  The later GDB PC/call-site inspection establishes the former here.
+- The earlier `ta5_MapMemory` explanation overstated its checks: it dereferenced
+  `memory->bo` before any NULL-object check. That observation did not identify
+  this crash, and strace did not establish that GTK received a NULL mapping.
+- The "clean D32" cover-probe runs used compare-op 3 (LESS_OR_EQUAL), whereas
+  the earlier failing/default runs used 1 (LESS). They were not an unchanged
+  reproduction. The dashed-hole depth defect is still open.
+- The approved shared IR3 patch is a diagnostic experiment, not a proven fix
+  for logger recursion or for this new crash. Silent driver logs are not a
+  correctness test.
+
+### 19.2 Earlier shader blockers
+
+GTK's seven shader input variables occupy nine slots: `%in_outline` spans three.
+Commit `335a002` uses `ir3_glsl_type_size(var->type, false)` for driver input/output
+locations and removes the `idx < ctx->ninputs` assertion. Generic NIR locations 15-23 were not
+missing SPIR-V variables and did not require renumbering the application's
+vertex attributes.
+
+The next error was an unlowered `vulkan_resource_index`. Layout instrumentation
+showed set 3, binding 0, descriptor type **8 (UNIFORM_BUFFER_DYNAMIC)**, stages
+`0x11`, matching the vertex stage. The buffer enumeration accepted only ordinary
+UBO/SSBO types and skipped the dynamic UBO. Including the dynamic variants
+removes that shader lookup error; it does not by itself implement dynamic
+buffer offsets at draw time.
+
+### 19.3 Measured NULL call
+
+Library `e24cb5678a2f664cdbb83e2790e3f532b7b5e24247d775ad93ff4448d8dfc72d`
+includes those shader changes and the temporary image trace. Two fresh GDB
+sessions show:
+
+```
+PC = 0
+libgtk-4.so.1 + 0x5e2514: bl vkCmdClearAttachments@plt
+return address: libgtk-4.so.1 + 0x5e2518
+```
+
+The second session inspects the arguments:
+
+```
+aspectMask=COLOR, colorAttachment=0
+clearValue=(0.180392161, 0.180392161, 0.196078435, 1)
+rect=(0,0)+(1080,92), baseArrayLayer=0, layerCount=1
+framebuffer=1080x2186, renderArea=(0,0)+(1080,2186)
+command stream already contains 480 dwords
+```
+
+There is no `ta5_CmdClearAttachments` definition in the driver. Static symbol
+inspection also finds no common implementation. This is a missing **core Vulkan
+1.0** command, not evidence of a GTK bug. The experiments stop on SIGSEGV and
+then deliver it; debugger status 255 is stored separately from the inferior's
+logged signal termination (not misreported as application exit 255).
+
+Evidence on the device, with matching copies under
+`/tmp/opencode/kgx-gdb-20261018/` on the host:
+
+- `/home/ishu/a5xx-test-tmp/kgx-gdb-20261018-173215/`
+- `/home/ishu/a5xx-test-tmp/kgx-gdb-20261018-173417/`
+
+Both preserve full application/debugger output, library hash, before/after kernel
+logs, compositor journals and PIDs. Kernel logs are unchanged; phoc=4360 and
+phosh=4466 remain unchanged. No vkmark run was performed.
+
+### 19.4 Next address-formation defects, measured before submission
+
+A first implementation of colour `CmdClearAttachments` (`clear-v1`, SHA256
+`45405bac3eeda6497ea4e16721e579ddfae2f02ca1d1525953ff4cc722ad5d10`) lets kgx
+record past that call and reach `ta5_QueueSubmit`. GDB deliberately stops before
+submitting any rendering work: this is not a rendering pass.
+
+`kgx-gdb-20261018-173924/gdb.stdout` records twelve buffer bindings into one memory
+allocation at nonzero offsets (786432 through 1032192), and set-3 dynamic UBO
+bindings with offsets 0 and 256. The driver discarded both memory-binding and
+dynamic descriptor offsets. The required address is:
+
+```
+BO address + buffer memory-binding offset + descriptor offset + dynamic offset
+```
+
+These are concrete additional blockers, not inferred from a black image. Fixes
+and pixel/replay validation are still in progress. The default device ICD has
+not been overwritten by `clear-v1`; experimental libraries and ICD manifests use
+distinct names.
+
+### 19.5 Experimental clear/address build causes GPU lockup and session loss
+
+**STOP: the 18:01:23 kgx Vulkan run crashed the compositor session. No further
+GPU tests or recovery actions are authorized by the earlier test approvals.**
+The user reported the phoc crash; subsequent actions were limited to reading
+and preserving existing evidence. No compositor was killed/restarted by the
+agent, no runtime sockets were removed, and no vkmark test was run.
+
+The uncommitted `clear-v4` experiment contains buffer memory-binding offset
+handling, dynamic buffer offset tracking and a colour-only `CmdClearAttachments`
+implementation. Its SHA256 is
+`c56d7ac88ffe055a8cff8565a281e7774aa7d95cf4ae2fa47456c5453eb6d8da`.
+It is **unsafe to retry in the live session**, and is not a kgx fix.
+
+Preceding clear-only tests (not evidence of kgx safety):
+
+- `clear-v1` fast-clear rectangles missed 4218 pixels on each of two replays at
+  257x193; the 64 KiB guard remained intact.
+- `clear-v3` exact partial rectangle writes exceeded the driver's fixed 64 KiB
+  main-stream limit at 257x193, causing submission rejection reported as
+  `VK_ERROR_DEVICE_LOST`; the kernel log did not change. At 65x49, both replays
+  matched all pixels exactly.
+- `clear-v4` stages partial rectangle writes in bounded indirect buffers. Two
+  replays matched every visible pixel and the guard at 257x193 RGBA UNORM,
+  257x193 BGRA sRGB with loadOp/clear ordering, and 1080x2186 BGRA UNORM. No
+  recording-time writes occurred. The same-build `TA5_SKIP_CLEAR=1` control
+  missed all 49601 pixels on both replays, as expected.
+- These tests contained **no draws or textures** and did not validate
+  draw/clear ordering, dynamic UBO addresses, or compositor coexistence for kgx.
+  They did not resolve the earlier D32 defect.
+
+The actual kgx run is preserved on the device at:
+
+```
+/home/ishu/a5xx-test-tmp/kgx-check-20261018-180123-kgx-vulkan-v4/
+```
+
+with a full host copy beneath `/tmp/opencode/kgx-gdb-20261018/`. It records:
+
+```
+kernel: hangcheck detected gpu lockup rb 2!
+kernel: offending task: kgx (kgx -- /bin/sh .../terminal-page.sh)
+phoc[4360]: GPU reset (innocent)
+phoc[4360]: Re-creating renderer after GPU reset
+phosh[4466]: Error reading events from display: Connection reset by peer
+kgx: VK_ERROR_SURFACE_LOST_KHR; Wayland connection reset
+kgx exit status: 1
+```
+
+Before the run, phoc=4360 and phosh=4466. Immediately afterward only a new
+phoc=12477 was listed. A later read-only snapshot at 18:02:34 found phoc=14317,
+phosh=14401 and the user-owned `/run/user/10000/wayland-0` socket. The agent did
+not initiate that recovery. The logs identify kgx as the offending GPU task;
+the precise faulty command or address is still unknown. Do not blame phoc for
+the reset or generalize the clean clear-probe logs to this workload.
+
+GL reference screenshots were captured separately, but the display rotated
+between them, and the image reader could not display images to the model.
+The GL test reached its deadline and terminated with status 143, not a normal
+exit. No visual GL/Vulkan rendering comparison has been established.
+
+The default ICD/library were not replaced: the original library hash remains
+`e24cb5678a2f664cdbb83e2790e3f532b7b5e24247d775ad93ff4448d8dfc72d`.
+The failing experiment is a separately named library selected only for tests.
+
+### 19.6 Defects found and fixed after the lockup
+
+Each was reproduced by a device test that failed before the change and passed
+after it. None of these alone makes GSK render correctly.
+
+| Defect | Evidence |
+|---|---|
+| `vkCmdClearAttachments` had no implementation, so GTK's dispatch slot was NULL and the call jumped to address 0 | GDB `PC=0`, GTK frame `bl vkCmdClearAttachments@plt` (§19.3) |
+| Fast clears miss non-tile-aligned rectangle edges: 4,218 wrong pixels per replay | `clear-v1` probe, 257x193 |
+| Bounded partial clears could exceed the 64 KiB main stream and be rejected as `VK_ERROR_DEVICE_LOST` | `clear-v3`, `VkResult -4` |
+| Buffer memory-binding offsets discarded, so every address used the BO base | `address-probe`: degenerate geometry/transparent-black UBOs |
+| Dynamic buffer offsets discarded | set-3 binding 0, offsets 0 then 256 |
+| Vertex and fragment shaders were always resident in the 64-unit instruction store; GTK's 39+89 units overran it and `64 - 89` wrapped to offset 103 | `SP_FS_CONFIG.SHADEROBJOFFSET=103` in the crash decode |
+| `vkGetImageSubresourceLayout` reported the memory-binding offset inside the image-relative offset, so GTK added it twice and `memcpy` wrote past a 1 MiB mapping | core `memcpy+280`, `si_addr` past end; `image-binding-layout-probe` reported offset `0 -> 983040` |
+| Per-instance vertex fetch never set the fetch-unit instanced bit | `instancing-probe`: 1,024 wrong pixels, then 0 |
+| Alpha blending was never programmed: `RB_MRT_BLEND_CONTROL(i) = 0` regardless of pipeline state | `blend-probe`: 7,040 wrong pixels, then 0 |
+| `vkCmdCopyBufferToImage`/`vkCmdCopyImageToBuffer` used the padded image pitch when `bufferRowLength` was 0 | `copy-pitch-probe`: row padding mismatch, then 0 |
+
+### 19.7 Still not correct rendering
+
+`kgx` under `GSK_RENDERER=vulkan`, forwarded through waypipe, no longer hangs
+the GPU, crashes, or loses the session, and its first submissions carry real
+draws with correct viewports and vertex fetches. It still does not render
+correctly.
+
+A capture of kgx's own framebuffer taken immediately after the kernel fence
+reports completion contains only two flat colours: a background and one
+header band of exactly 931x46 pixels. Every sampled row is uniform. No text,
+coloured words, or coloured blocks appear, so content is missing **before**
+presentation; the copy and display paths are not the cause. Viewports are
+correct (`fb=931x1006`, `xscale=465.5`, `yscale=503`), and the per-instance
+fetch bug is fixed, so the failure is not the earlier dynamic-offset or
+instancing class.
+
+Not established: which stage drops the fragments. The uniform-row pattern is
+consistent with rasterisation or state reuse that has not yet been isolated.
+
+### 19.9 Textured draws pass; two earlier "glyph" conclusions were probe bugs
+
+A texture-sampling audit compared the whole descriptor path against the GL
+backend and found every field correct for a single-level LINEAR 2D colour
+texture: `FMT=48` is `TFMT5_8_8_8_8_UNORM` (the `fmt=44` in an image trace is
+the *Vulkan* enum `B8G8R8A8_UNORM`, not an a5xx format), `TILE_MODE=0`,
+identity swizzle, `PITCHALIGN=0`/`PITCH=4096`, `ARRAY_PITCH=1024`, `DEPTH=1`,
+and unit numbering that matches `ta5_lower_tex_units()`.
+
+A sampling probe then passed in all four filter/address combinations
+(nearest/linear x clamp/repeat), over two replays, with an intact guard.
+
+An atlas-shaped probe (glyph quads, premultiplied blend, 0..0.25 sub-rect UVs)
+initially reported a complete failure. **That was the probe's bug, twice over:**
+its vertex data was laid out as all positions followed by all UVs while the
+binding declared an interleaved stride, and its single-attribute "pass" was a
+false positive because an unwritten register read as zero and happened to
+sample the glyph corner. After interleaving the data correctly, both
+one-attribute and two-attribute variants pass, with and without blending.
+
+So: **sampling, two vertex attributes, and blending are all ruled out as the
+cause.** The claims in this section that text is missing because of texture
+sampling or vertex-attribute count were mine and were wrong; no such driver
+defect was found. What remains unexplained is why kgx's own draws produce only
+the header band.
+
+Real, verified driver defects from the same audit, none yet shown to affect
+kgx: a bare `SAMPLER` descriptor is read through `data.image.sampler` instead
+of `data.sampler`, so it loads as four zero dwords (REPEAT addressing, LOD
+clamp 0); `mipmapMode == LINEAR` sets `MIPFILTER_LINEAR_FAR` where GL sets
+`MIPFILTER_LINEAR_NEAR`; `B8G8R8A8_UNORM` is sampled without the R/B swap;
+`CLAMP_TO_BORDER` silently degrades to `CLAMP_TO_EDGE`; descriptor-array
+elements alias element 0 for textures; and `TA5_SKIP_TEX` only guards the
+count-only `ta5_emit_textures()` call, not the authoritative one, so any earlier
+texture bisect using it is void.
+
+### 19.8 Still-unvalidated driver scope
+
+Not verified for kgx, and not part of any "working" claim: texture sampling
+beyond the atlas-sized descriptor observed, multi-target rendering, MSAA,
+depth/stencil beyond the single-format cases in §16, and WSI scaling. The
+GTK/GSK framebuffer-dimension divergence of §19.1 and the earlier D32
+dashed-hole defect remain open.
