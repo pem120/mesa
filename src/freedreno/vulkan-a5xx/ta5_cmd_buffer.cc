@@ -1879,12 +1879,113 @@ ta5_emit_textures(struct ta5_cmd_buffer *cmd, enum a4xx_state_block sb,
        * cube's face count and a 3D image's depth.  Without it the hardware
        * fetches a single layer, which is not an error, just the wrong pixels.
        */
-      if (getenv("TA5_TRACE_TEX"))
+      if (getenv("TA5_TRACE_TEX")) {
          fprintf(stderr,
                  "ta5[tex] desc: %08x %08x %08x %08x %08x addr=%llx bo=%p\n",
                  words[0], words[1], words[2], words[3], words[5],
                  (unsigned long long)address,
                  (void *)view->image->bound_memory->bo);
+
+         /*
+          * Decode the descriptor with the generated accessors.
+          *
+          * Hand-decoding these fields is how a correct descriptor gets
+          * called broken: the first version of this trace read HEIGHT at bit
+          * 16 (it is bit 15), read FMT out of bits 0-7 (it is bits 22-27), and
+          * multiplied PITCH by 128 on the belief that the field counts 128-byte
+          * units.  It does not -- fd6 passes the row pitch in *bytes*
+          * (fd6_view.cc:297) and the <<7 in the generated macro is only the
+          * field's bit position.  Every field here comes from the macro that
+          * the rest of the driver programs it with, so a disagreement between
+          * the printed descriptor and the printed image is a real one.
+          *
+          * What it exists to catch is the descriptor disagreeing with the
+          * memory: row_pitch, layer_pitch, and the level count.
+          */
+         {
+            const struct ta5_image_level *tl =
+               &view->image->levels[MIN2(view->base_mip_level,
+                                          view->image->mip_levels - 1)];
+            /*
+             * The generated macros in this tree are setters, so extract with
+             * the __MASK/__SHIFT constants the header does export.  Reading
+             * the numbers straight out of the header is the point: hand
+             * arithmetic is what produced a wrong HEIGHT and a wrong FMT in an
+             * earlier version of this trace.
+             */
+#define TA5_FLD(w, name) (((w) >> (name##__SHIFT)) & ((name##__MASK) >> (name##__SHIFT)))
+            uint32_t desc_mips = TA5_FLD(words[0], A5XX_TEX_CONST_0_MIPLVLS);
+            uint32_t desc_pitch = TA5_FLD(words[2], A5XX_TEX_CONST_2_PITCH);
+            uint32_t desc_array = TA5_FLD(words[3], A5XX_TEX_CONST_3_ARRAY_PITCH);
+
+            fprintf(stderr,
+                    "ta5[tex] --- descriptor vs image ---\n"
+                    "ta5[tex] dword0=%08x  FMT=%u SWIZ=%u,%u,%u,%u "
+                    "MIPLVLS=%u(%u levels) SAMPLES=%u TILE_MODE=%u\n"
+                    "ta5[tex] dword1=%08x  WIDTH=%u HEIGHT=%u\n"
+                    "ta5[tex] dword2=%08x  PITCHALIGN=%u PITCH=%u(bytes) "
+                    "TYPE=%u\n"
+                    "ta5[tex] dword3=%08x  ARRAY_PITCH=%u(%u bytes) "
+                    "MIN_LAYERSZ=%u(%u bytes)\n"
+                    "ta5[tex] image: %ux%u mip_levels=%u layers=%u\n"
+                    "ta5[tex]   view: base_mip=%u base_layer=%u "
+                    "layer_count=%u\n"
+                    "ta5[tex]   level0: row_pitch=%llu layer_pitch=%llu "
+                    "level_size=%llu\n"
+                    "ta5[tex] CHECK pitch  %s (%u vs %llu)\n"
+                    "ta5[tex] CHECK mips   %s (%u vs %u)\n"
+                    "ta5[tex] CHECK array  %s (%u vs %llu)\n",
+                    words[0],
+                    TA5_FLD(words[0], A5XX_TEX_CONST_0_FMT),
+                    TA5_FLD(words[0], A5XX_TEX_CONST_0_SWIZ_X),
+                    TA5_FLD(words[0], A5XX_TEX_CONST_0_SWIZ_Y),
+                    TA5_FLD(words[0], A5XX_TEX_CONST_0_SWIZ_Z),
+                    TA5_FLD(words[0], A5XX_TEX_CONST_0_SWIZ_W),
+                    desc_mips, desc_mips ? desc_mips : 1,
+                    TA5_FLD(words[0], A5XX_TEX_CONST_0_SAMPLES),
+                    TA5_FLD(words[0], A5XX_TEX_CONST_0_TILE_MODE),
+                    words[1],
+                    TA5_FLD(words[1], A5XX_TEX_CONST_1_WIDTH),
+                    TA5_FLD(words[1], A5XX_TEX_CONST_1_HEIGHT),
+                    words[2],
+                    TA5_FLD(words[2], A5XX_TEX_CONST_2_PITCHALIGN),
+                    desc_pitch,
+                    TA5_FLD(words[2], A5XX_TEX_CONST_2_TYPE),
+                    words[3],
+                    desc_array, desc_array * 4096u,
+                    TA5_FLD(words[3], A5XX_TEX_CONST_3_MIN_LAYERSZ),
+                    TA5_FLD(words[3], A5XX_TEX_CONST_3_MIN_LAYERSZ) * 4096u,
+                    tl->width, tl->height,
+                    view->image->mip_levels, view->image->array_layers,
+                    view->base_mip_level, view->base_array_layer,
+                    view->layer_count,
+                    (unsigned long long)tl->row_pitch,
+                    (unsigned long long)tl->layer_pitch,
+                    (unsigned long long)tl->level_size,
+                    desc_pitch == (uint32_t)tl->row_pitch
+                       ? "MATCH" : "MISMATCH",
+                    desc_pitch, (unsigned long long)tl->row_pitch,
+                    (desc_mips ? desc_mips : 1) == view->image->mip_levels
+                       ? "MATCH" : "MISMATCH",
+                    desc_mips ? desc_mips : 1,
+                    view->image->mip_levels,
+                    (unsigned long long)desc_array * 4096ull ==
+                       tl->layer_pitch ? "MATCH" : "MISMATCH",
+                    desc_array, (unsigned long long)tl->layer_pitch);
+
+            for (uint32_t i = 0; i < view->image->mip_levels; i++) {
+               const struct ta5_image_level *l = &view->image->levels[i];
+
+               fprintf(stderr,
+                       "ta5[tex]   level[%u] %ux%u depth=%u layers=%u "
+                       "row_pitch=%llu layer_pitch=%llu level_size=%llu\n",
+                       i, l->width, l->height, l->depth, l->layers,
+                       (unsigned long long)l->row_pitch,
+                       (unsigned long long)l->layer_pitch,
+                       (unsigned long long)l->level_size);
+            }
+         }
+      }
 
       ta5_cs_reloc(cmd, view->image->bound_memory->bo, address, words[5]);
 

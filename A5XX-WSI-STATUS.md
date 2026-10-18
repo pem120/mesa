@@ -1066,3 +1066,85 @@ The coverage shortfall in section 12.4 (a quad covering 12636 of 65536 pixels
 where ~53824 is expected), the sporadic iova=0 faults of section 13.1, the
 copy-command pitch and binding-offset gaps, the dropped depth attachment
 offsets, attachment 0 assumed RGBA8, and queue lifecycle.
+
+
+## 15. Chasing the "stripes" in the texture scene: three refuted theories
+
+The texture scene was reported as showing regularly spaced dropped pixels.  It
+does show regular structure, but three separate explanations were asserted and
+then refuted by measurement.
+
+### 15.1 The texture descriptor is correct
+
+TA5_TRACE_TEX was extended to decode every field of the texel descriptor
+through the generated __MASK/__SHIFT constants and print the image's own layout
+next to it.  For vkmark's texture:
+
+    dword0=0c006884  FMT=48 SWIZ=0,1,2,3 MIPLVLS=0(1 levels) TILE_MODE=0
+    dword1=01000200  WIDTH=512 HEIGHT=512
+    dword2=20040000  PITCHALIGN=0 PITCH=2048(bytes) TYPE=1
+    dword3=00000100  ARRAY_PITCH=256(1048576 bytes) MIN_LAYERSZ=0
+    image: 512x512 mip_levels=1 layers=1
+    level0: row_pitch=2048 layer_pitch=1048576 level_size=1048576
+    CHECK pitch  MATCH   CHECK mips MATCH   CHECK array MATCH
+
+### 15.2 Two of the "theories" were the diagnostic's own bugs
+
+**"PITCH is in 128-byte units, so it is 128x too large."**  It is not.  The
+field holds bytes: fd6, which is known-good and in this tree, passes the row
+pitch straight into A6XX_TEX_MEMOBJ_2_PITCH (fd6_view.cc:297), and the <<7 in the
+generated macro is only the field's bit position.  The first version of the
+trace multiplied by 128 and invented a mismatch that does not exist.
+
+**"HEIGHT is 256, not 512."**  HEIGHT is bits 15-28, not 16-27; the first trace
+read it a bit low.  FMT is bits 22-27, not bits 0-7.  Both were hand-decoding
+errors.  The generated macros in this tree are setters with no __NAME getters,
+so the trace extracts fields via the __MASK/__SHIFT constants instead of
+arithmetic.
+
+### 15.3 The ARRAY_PITCH theory is refuted
+
+The standing theory -- that TEX_CONST_3_ARRAY_PITCH and MIN_LAYERSZ count 4 KiB
+units, that feeding them bytes wraps a face stride, and that this is why the
+texture scene is wrong -- is not supported.  ARRAY_PITCH decodes to 256, which
+is 1048576 bytes, and the image's layer_pitch is 1048576.  They agree.  The
+comment in ta5_texel.cc about the 4 KiB units is correct as far as it goes, but
+the encoder already passes the right values.
+
+### 15.4 The "12-pixel stripes on a 16-pixel grid" are texture content
+
+Measured on a 720x1524 capture, dark runs were consistently 12px wide with
+starts at 4 (mod 16), which looks like a tiler artifact.  It is not: comparing
+the same image at three heights, the dark runs are at unrelated x positions.
+
+    y=396: 348  548  620  648  668
+    y=696:   4   52  106  129  337  452  577  644
+    y=996:  60  116  180  308  486  583  642
+
+A screen-space artifact would repeat at the same x down the image.  These move
+with the content, so they are the plank texture's own features -- the bolt
+holes along the seams, which the zoomed crop confirms.
+
+A second confirmation: capturing the scene at 540x1140 and 720x1524 cannot be
+used to test scale, because vkmark's quad rotates continuously, so the two
+captures are at different animation phases.  That comparison was attempted
+before noticing this.
+
+### 15.5 What is actually established
+
+**No rendering artifact has been demonstrated for the texture scene.**  The
+scene renders a clean, tilted, correctly textured plank quad; all seven scenes
+run at Score 168 with zero faults; the texture descriptor agrees with its image
+on every field checked.
+
+The image-based analysis that produced the stripes claim was measuring texture
+content, and the theory that followed from it -- 12-wide bands on the tiler's
+16-pixel grid -- is refuted by the vertical-alignment test above.
+
+The genuinely open defect is still section 12.4's coverage shortfall, which
+needs a controlled probe: a known texture, a known expected result, and a GPU
+readback of the render target.  Screenshots of an animating scene cannot
+establish it, as this section demonstrates three times over.
+
+Verification after the diagnostic was added: all seven scenes, Score 168, faults
+0, phoc and phosh alive.
