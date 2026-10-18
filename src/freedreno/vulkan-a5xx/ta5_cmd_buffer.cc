@@ -5262,34 +5262,54 @@ ta5_record_draw(struct ta5_cmd_buffer *cmd, uint32_t vertexCount,
    if (ta5_emit_depth_state(draw, pipe) != VK_SUCCESS)
       return;
 
-   ta5_pkt4(draw, REG_A5XX_GRAS_CL_VPORT_XOFFSET_0, 6);
-   ta5_cs_push(draw, A5XX_GRAS_CL_VPORT_XOFFSET_0(draw->bound_framebuffer->width
-                                                  / 2.0f));
-   ta5_cs_push(draw, A5XX_GRAS_CL_VPORT_XSCALE_0(draw->bound_framebuffer->width
-                                                / 2.0f));
-   ta5_cs_push(draw, A5XX_GRAS_CL_VPORT_YOFFSET_0(draw->bound_framebuffer->height
-                                                  / 2.0f));
-   ta5_cs_push(draw, A5XX_GRAS_CL_VPORT_YSCALE_0(draw->bound_framebuffer->height
-                                                 / 2.0f));
    /*
-    * Vulkan NDC z is 0..1, not -1..1.
+    * Six words, and all six or none.
     *
-    * The 0.5/0.5 here was GL's depth-range mapping: NDC -1..1 to window 0..1
-    * via z*0.5+0.5.  With a Vulkan NDC that mapping turns a fragment at 0.25
-    * into 0.625 (measured: depth[0,0] read back 0.625 after drawing at 0.25,
-    * and 0.875 after 0.75).  The test still passed -- both the clear and the
-    * fragment went through the same wrong transform -- but the buffer held a
-    * value no Vulkan operation would have written.
+    * The packet header declares 6 dwords, so a partial push shifts every
+    * register the CP reads afterwards: the two Z words sat behind
+    * TA5_SKIP_VPORT while X and Y were pushed unconditionally, so setting that
+    * switch emitted 4 words into a 6-word packet and desynchronised the stream.
+    * The flag is now honoured by skipping the whole packet, which is what
+    * "drop the viewport scale/offset" means.
     *
-    * For Vulkan the window mapping is z*scale+offset with scale =
-    * maxDepth-minDepth and offset = minDepth, taken from the dynamic viewport
-    * when the application set one.  The default viewport is 0..1, so the
-    * default here is scale 1, offset 0: the identity.
+    * XOFFSET is width/2 *plus the viewport's own x*, because Vulkan's transform
+    * is x_window = x_ndc * (width/2) + xoffset + width/2 -- the half-width
+    * comes from the target, the rest from VkViewport.  Reading xoffset at all
+    * is new: it was ignored, so a viewport that did not start at 0 or 1 landed
+    * in the wrong place.
     */
-   {
-      float zmin = draw->viewport_set ? draw->viewport.minDepth : 0.0f;
-      float zmax = draw->viewport_set ? draw->viewport.maxDepth : 1.0f;
-      if (!getenv("TA5_SKIP_VPORT")) {
+   if (!getenv("TA5_SKIP_VPORT")) {
+      const float fb_w = (float)draw->bound_framebuffer->width;
+      const float fb_h = (float)draw->bound_framebuffer->height;
+      const float vp_x = draw->viewport_set ? draw->viewport.x : 0.0f;
+      const float vp_y = draw->viewport_set ? draw->viewport.y : 0.0f;
+      const float vp_w = draw->viewport_set ? draw->viewport.width : fb_w;
+      const float vp_h = draw->viewport_set ? draw->viewport.height : fb_h;
+
+      if (getenv("TA5_TRACE_VPORT"))
+         fprintf(stderr,
+                 "ta5[vport] fb=%ux%u vp_set=%d vp=%.3g,%.3g %.3gx%.3g "
+                 "-> xoff=%.3f xscale=%.3f yoff=%.3f yscale=%.3f\n",
+                 draw->bound_framebuffer->width,
+                 draw->bound_framebuffer->height, draw->viewport_set,
+                 vp_x, vp_y, vp_w, vp_h, vp_x + fb_w / 2.0f, vp_w / 2.0f,
+                 vp_y + fb_h / 2.0f, vp_h / 2.0f);
+
+      ta5_pkt4(draw, REG_A5XX_GRAS_CL_VPORT_XOFFSET_0, 6);
+      ta5_cs_push(draw, A5XX_GRAS_CL_VPORT_XOFFSET_0(vp_x + fb_w / 2.0f));
+      ta5_cs_push(draw, A5XX_GRAS_CL_VPORT_XSCALE_0(vp_w / 2.0f));
+      ta5_cs_push(draw, A5XX_GRAS_CL_VPORT_YOFFSET_0(vp_y + fb_h / 2.0f));
+      ta5_cs_push(draw, A5XX_GRAS_CL_VPORT_YSCALE_0(vp_h / 2.0f));
+
+      /*
+       * Vulkan NDC z is 0..1, not -1..1.  The 0.5/0.5 mapping GL uses is wrong
+       * for a Vulkan NDC; the window mapping here is z*scale+offset with
+       * scale = maxDepth-minDepth, so the default viewport gives the identity.
+       */
+      {
+         float zmin = draw->viewport_set ? draw->viewport.minDepth : 0.0f;
+         float zmax = draw->viewport_set ? draw->viewport.maxDepth : 1.0f;
+
          ta5_cs_push(draw, A5XX_GRAS_CL_VPORT_ZOFFSET_0(zmin));
          ta5_cs_push(draw, A5XX_GRAS_CL_VPORT_ZSCALE_0(zmax - zmin));
       }
