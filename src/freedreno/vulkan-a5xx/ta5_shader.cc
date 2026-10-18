@@ -229,17 +229,24 @@ ta5_assign_driver_locations(nir_shader *nir)
 
    /* gl_Position has to stay first: IR3 relies on driver_location 0 being the
     * position output. */
-   unsigned out_n = 0;
+   unsigned out_n = 1;
    nir_foreach_shader_out_variable(var, nir) {
       if (var->data.location == VARYING_SLOT_POS)
          continue;
-      var->data.driver_location = ++out_n;
+      var->data.driver_location = out_n;
+      out_n += ir3_glsl_type_size(var->type, false);
    }
-   nir->num_outputs = out_n + 1;
+   nir->num_outputs = out_n;
 
+   /* Match ir3_nir_lower_io(): matrices and arrays occupy multiple slots.
+    * GTK's seven input variables occupy nine slots; counting variables alone
+    * made the expanded load_input indices exceed nir->num_inputs.
+    */
    unsigned in_n = 0;
-   nir_foreach_shader_in_variable(var, nir)
-      var->data.driver_location = in_n++;
+   nir_foreach_shader_in_variable(var, nir) {
+      var->data.driver_location = in_n;
+      in_n += ir3_glsl_type_size(var->type, false);
+   }
    nir->num_inputs = in_n;
 }
 
