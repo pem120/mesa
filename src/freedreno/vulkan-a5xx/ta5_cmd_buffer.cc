@@ -90,6 +90,18 @@ ta5_DestroyCommandPool(VkDevice _device, VkCommandPool _commandPool,
                        const VkAllocationCallbacks *pAllocator)
 {
    struct ta5_cmd_pool *pool = ta5_cmd_pool_from_handle(_commandPool);
+   /* vkDestroyCommandPool(VK_NULL_HANDLE) is a no-op.
+    *
+    * libvulkan_wsi tears a swapchain down by calling the destroy entry points
+    * unconditionally, including on handles that were never created -- see
+    * wsi_destroy_image(), which passes image->blit.image and
+    * image->blit.buffer straight through (wsi_common.c:1067-1070).  The spec
+    * requires every destroy and free entry point to accept a null handle
+    * and do nothing, and without the guard teardown faults on a null image.
+    */
+   if (_commandPool == NULL)
+      return;
+
 
    if (pAllocator == NULL)
       pAllocator = vk_default_allocator();

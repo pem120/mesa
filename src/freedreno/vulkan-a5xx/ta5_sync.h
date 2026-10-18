@@ -55,7 +55,7 @@
  *
  * The runtime's struct vk_fence is embedded rather than copied field by field,
  * and it has to be: libvulkan_wsi hands our VkFence handle straight back to
- * vk_fence_reset_temporary(), which reads fence->temporary (vk_fence.c:169)
+ * vk_fence_reset_temporary(), which reads fence->temporary (vk_fence.c:170)
  * and destroys it if non-NULL.
  *
  * With a private layout that read landed on our `device` pointer, which is
@@ -65,14 +65,28 @@
  * the first frame inside ta5_GetDeviceQueue, having jumped through a pointer
  * that happened to resolve into this driver.
  *
- * `permanent` is where our fence's sync lives; `temporary` stays NULL, which is
- * what tells the runtime this fence has no imported state.
+ * There is deliberately nothing of our own in this struct.  Both edges of the
+ * runtime's layout leave no room:
+ *
+ *  - VK_DEFINE_NONDISP_HANDLE_CASTS asserts that the object base sits at
+ *    offset 0, so nothing can precede it.
+ *  - vk_fence::permanent must be the final member (vk_fence.h:52) because the
+ *    sync implementation appends private state after it: vk_drm_syncobj is a
+ *    struct vk_sync plus a trailing syncobj (vk_drm_syncobj.h:34), and
+ *    vk_sync_init writes sync_type->size bytes rather than
+ *    sizeof(struct vk_sync) (vk_sync.c:99).  Fields placed after the embedded
+ *    vk_fence were therefore being overwritten by fence creation -- which is
+ *    how `device` and `signaled` were clobbered, after which
+ *    ta5_GetFenceStatus() dereferenced fence->device through the mangled value.
+ *
+ * ta5_CreateFence allocates offsetof(struct ta5_fence, base.permanent) +
+ * sync_type.size, matching vk_fence_create() (vk_fence.c:126), so that
+ * variable-size tail has room.  Any driver state a fence needs has to live
+ * elsewhere -- the device is reachable through the runtime's device pointer.
  */
 struct ta5_fence
 {
    struct vk_fence base;
-   struct ta5_device *device;
-   bool signaled; /**< fences start signaled when created with that flag */
 };
 
 VK_DEFINE_NONDISP_HANDLE_CASTS(ta5_fence, base.base, VkFence,
@@ -95,21 +109,13 @@ struct ta5_event
 
 VK_DEFINE_NONDISP_HANDLE_CASTS(ta5_event, base, VkEvent, VK_OBJECT_TYPE_EVENT)
 
-/**
- * Binary semaphore.
- *
- * Counted on the host for now.  When command buffers gain the ability to
- * signal and wait on a semaphore in PM4, the counter moves to GPU-visible
- * memory; the interface does not change.
+/*
+ * Semaphores have no struct here on purpose.  They used to be a private
+ * {vk_object_base, device, counter} object, but wsi_signal_semaphore_for_image()
+ * casts the handle to the runtime's struct vk_semaphore and writes through its
+ * temporary payload -- which in the private layout was our `device` and
+ * `counter` fields.  The same class of bug as ta5_fence, one object along.
+ * ta5_CreateSemaphore and friends now forward to vk_common_*.
  */
-struct ta5_semaphore
-{
-   struct vk_object_base base;
-   struct ta5_device *device;
-   uint64_t counter;
-};
-
-VK_DEFINE_NONDISP_HANDLE_CASTS(ta5_semaphore, base, VkSemaphore,
-                               VK_OBJECT_TYPE_SEMAPHORE)
 
 #endif /* TA5_SYNC_H */

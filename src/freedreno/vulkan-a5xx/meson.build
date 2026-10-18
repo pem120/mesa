@@ -24,6 +24,7 @@ libta5_files = files(
   'ta5_formats.cc',
   'ta5_memory.cc',
   'ta5_sync.cc',
+  'ta5_query.cc',
   'ta5_cmd_buffer.cc',
   'ta5_descriptor.cc',
   'ta5_shader.cc',

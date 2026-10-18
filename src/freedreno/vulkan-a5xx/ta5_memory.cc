@@ -128,6 +128,15 @@ ta5_FreeMemory(VkDevice _device, VkDeviceMemory _memory,
 {
    struct ta5_memory *memory = ta5_memory_from_handle(_memory);
 
+   /*
+    * vkFreeMemory(VK_NULL_HANDLE) is a no-op, and libvulkan_wsi relies on
+    * that: wsi_destroy_image() passes image->blit.memory straight through
+    * without checking it (wsi_common.c:1069), and it is null whenever no blit
+    * buffer was allocated.
+    */
+   if (_memory == NULL)
+      return;
+
    if (pAllocator == NULL)
       pAllocator = vk_default_allocator();
 
@@ -567,6 +576,18 @@ ta5_DestroyImage(VkDevice _device, VkImage _image,
 {
    struct ta5_device *device = (struct ta5_device *)_device;
    struct ta5_image *image = ta5_image_from_handle(_image);
+   /* vkDestroyImage(VK_NULL_HANDLE) is a no-op.
+    *
+    * libvulkan_wsi tears a swapchain down by calling the destroy entry points
+    * unconditionally, including on handles that were never created -- see
+    * wsi_destroy_image(), which passes image->blit.image and
+    * image->blit.buffer straight through (wsi_common.c:1067-1070).  The spec
+    * requires every destroy and free entry point to accept a null handle
+    * and do nothing, and without the guard teardown faults on a null image.
+    */
+   if (_image == NULL)
+      return;
+
 
    if (pAllocator == NULL)
       pAllocator = vk_default_allocator();
@@ -753,6 +774,18 @@ ta5_DestroyBuffer(VkDevice _device, VkBuffer _buffer,
 {
    struct ta5_device *device = (struct ta5_device *)_device;
    struct ta5_buffer *buffer = ta5_buffer_from_handle(_buffer);
+   /* vkDestroyBuffer(VK_NULL_HANDLE) is a no-op.
+    *
+    * libvulkan_wsi tears a swapchain down by calling the destroy entry points
+    * unconditionally, including on handles that were never created -- see
+    * wsi_destroy_image(), which passes image->blit.image and
+    * image->blit.buffer straight through (wsi_common.c:1067-1070).  The spec
+    * requires every destroy and free entry point to accept a null handle
+    * and do nothing, and without the guard teardown faults on a null image.
+    */
+   if (_buffer == NULL)
+      return;
+
 
    if (pAllocator == NULL)
       pAllocator = vk_default_allocator();

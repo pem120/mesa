@@ -123,20 +123,55 @@ ta5_wsi_init(struct ta5_physical_device *pdevice)
       return result;
 
    /*
-    * supports_modifiers is the flag that makes wsi_common_wayland.c look at the
-    * compositor's advertised modifiers at all (wsi_common_wayland.c:3910).
-    * With it false, num_drm_modifiers stays 0 and present sends the buffer
-    * with no modifier -- which is the state the old hand-rolled path was in,
-    * and which phoc cannot import.
+    * supports_modifiers stays false, and this is the single change that makes
+    * Wayland swapchain creation work at all.
     *
-    * It is honest here: ta5_CreateImage lays every image out linearly, so the
-    * only modifier this driver can actually produce is DRM_FORMAT_MOD_LINEAR.
-    * Whether phoc advertises LINEAR for ARGB8888 is an open question, and if
-    * it does not, no amount of flag-setting fixes it -- that needs GPU memory
-    * with a tiled modifier.  TA5_TRACE_WL_MODIFIERS logs what the compositor
-    * advertises so this can be answered with a measurement rather than a guess.
+    * Setting it true promises VK_EXT_image_drm_format_modifier: it makes
+    * wsi_common_wayland.c read the compositor's wl_dmabuf format/modifier list
+    * (wsi_common_wayland.c:3910) and set num_modifier_lists = 1.  That in turn
+    * makes wsi_drm_configure_image() query modifiers from the driver:
+    *
+    *     GetPhysicalDeviceFormatProperties2() with a
+    *     VkDrmFormatModifierPropertiesListEXT, then one
+    *     GetPhysicalDeviceImageFormatProperties2() per modifier.
+    *
+    * We implement none of that.  ta5_GetPhysicalDeviceFormatProperties2
+    * (ta5_formats.cc:248) fills in only linear/optimal/buffer features and
+    * leaves drmFormatModifierCount at zero, and
+    * ta5_GetPhysicalDeviceImageFormatProperties2 rejects anything that is not
+    * VK_IMAGE_TILING_LINEAR or _OPTIMAL outright (ta5_formats.cc:344).
+    *
+    * The result was measured, not guessed.  GDB at wsi_common_drm.c:611,
+    * breaking on the assertion just after the query:
+    *
+    *     drmFormatModifierCount = 0
+    *     params = { num_modifier_lists = 1, ... }
+    *
+    * With no modifiers in the list, no modifier survives the filter, so
+    * wsi_configure_native_image() falls through to its only failure path:
+    *
+    *     assert(!"Failed to find a supported modifier!  This should never
+    *             happen because LINEAR should always be available");
+    *     goto fail_oom;
+    *
+    * which returns VK_ERROR_OUT_OF_HOST_MEMORY.  That error code is
+    * misleading -- nothing ran out of memory, the device had 41G free -- and it
+    * is what vkCreateSwapchainKHR reported, after which vkcube queried images
+    * on the null swapchain handle and segfaulted.
+    *
+    * False sends wsi_common down the legacy path instead, which sets
+    * info->wsi.scanout = true and exports the dma-buf with no explicit
+    * modifier.  That is the honest answer for a driver with linear-only
+    * images, and it matches the old hand-written path.
+    *
+    * Turning this on for real means implementing
+    * vkGetImageDrmFormatModifierPropertiesEXT, honouring
+    * VkImageDrmFormatModifierListCreateInfoEXT in image creation, and
+    * answering tiling == VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT -- i.e.
+    * advertising DRM_FORMAT_MOD_LINEAR from the query above so that phoc's
+    * own modifier list has something to match.  Not done here.
     */
-   pdevice->wsi_device.supports_modifiers = true;
+   pdevice->wsi_device.supports_modifiers = false;
    pdevice->wsi_device.can_present_on_device = ta5_wsi_can_present_on_device;
 
    pdevice->vk.wsi_device = &pdevice->wsi_device;

@@ -44,6 +44,8 @@
 #include "vk_alloc.h"
 #include "vk_device.h"
 #include "vk_sync.h"
+#include "vk_semaphore.h"
+#include "vk_fence.h"
 #include "vk_common_entrypoints.h"
 
 #include "ta5_instance.h"
@@ -121,11 +123,14 @@ ta5_GetDeviceQueue2(VkDevice _device, const VkDeviceQueueInfo2 *pQueueInfo,
  */
 static VkResult
 ta5_queue_submit_batch(struct ta5_queue *queue, const VkCommandBuffer *cmds,
-                       uint32_t cmd_count, VkFence fence)
+                       uint32_t cmd_count, int *out_fence_fd)
 {
    struct ta5_device *device = queue->device;
    int fence_fd;
    uint32_t *stream;
+
+   if (out_fence_fd)
+      *out_fence_fd = -1;
    uint32_t total_words = 0, n = 0;
 
    for (uint32_t i = 0; i < cmd_count; i++) {
@@ -147,12 +152,9 @@ ta5_queue_submit_batch(struct ta5_queue *queue, const VkCommandBuffer *cmds,
     * skip the GPU entirely.
     */
    if (total_words == 0) {
-      if (fence != VK_NULL_HANDLE) {
-         struct ta5_fence *ta5_fence = ta5_fence_from_handle(fence);
-         VkResult result = vk_sync_signal(&device->vk, &ta5_fence->base.permanent, 1);
-         if (result != VK_SUCCESS)
-            return result;
-      }
+      /* Nothing goes to the GPU, so *out_fence_fd stays -1 and the caller
+       * signals this batch's payloads straight away: there is no work in
+       * flight to wait for. */
       return VK_SUCCESS;
    }
 
@@ -304,37 +306,277 @@ ta5_queue_submit_batch(struct ta5_queue *queue, const VkCommandBuffer *cmds,
 
    /*
     * Keep a copy of the kernel fence so vkQueueWaitIdle has something to
-    * wait on.  The original fd is consumed by the import below.
+    * wait on, and hand the original to the caller.
     */
    if (queue->idle_fence_fd >= 0)
       close(queue->idle_fence_fd);
    queue->idle_fence_fd = dup(fence_fd);
 
    /*
-    * Import the kernel fence into the Vulkan fence so vkWaitForFences works.
+    * The Vulkan fence is no longer fed from the kernel here.  It used to be,
+    * via vk_sync_import_sync_file(), because a sync file is not a syncobj fd
+    * and the opaque-fd path fails it with EINVAL.  But importing it signalled
+    * the fence as soon as the submit ioctl returned rather than when the work
+    * finished, which is the ordering the spec asks for and the reason an
+    * application could read an image the GPU was still writing.
     *
-    * MSM_SUBMIT_FENCE_FD_OUT hands back a dma-buf *sync file*, not a DRM
-    * syncobj fd, so this has to be vk_sync_import_sync_file().  The opaque-fd
-    * path runs DRM_IOCTL_SYNCOBJ_FD_TO_HANDLE, which fails with EINVAL on a
-    * sync file -- and that is how it showed up: vkQueueSubmit returning
-    * VK_ERROR_DEVICE_LOST *after* the submit ioctl had already succeeded, on a
-    * submission the GPU had finished.
+    * The caller now polls this fd and raises every payload -- the fence and
+    * the batch's signal semaphores -- only once the GPU is done.  See
+    * ta5_queue_submit_one().
     */
-   if (fence != VK_NULL_HANDLE) {
-      struct ta5_fence *ta5_fence = ta5_fence_from_handle(fence);
-      VkResult result =
-         vk_sync_import_sync_file(&device->vk, &ta5_fence->base.permanent, fence_fd);
-      TA5_DBG("fence import: fd %d -> %d (errno %d: %s)", fence_fd, result,
-             errno, strerror(errno));
-      if (result != VK_SUCCESS) {
-         TA5_DBG("fence import failed -> %d", result);
-         close(fence_fd);
-         return vk_error(&device->instance->vk, result);
+   if (out_fence_fd) {
+      *out_fence_fd = fence_fd;
+   } else {
+      close(fence_fd);
+   }
+
+   return VK_SUCCESS;
+}
+
+/**
+ * Wait for a kernel sync-file fd to report completion.
+ *
+ * MSM_SUBMIT_FENCE_FD_OUT returns a sync file, which becomes readable once the
+ * work it guards has finished.  poll() is therefore enough and avoids importing
+ * a sync object we would immediately drop.
+ *
+ * Returns the poll revents so a hung GPU (which on this part shows up as a
+ * continuous fault loop rather than a lost context) is distinguishable from
+ * normal completion.
+ */
+static int
+ta5_poll_sync_fd(int fd)
+{
+   struct pollfd pfd = {
+      .fd = fd,
+      .events = POLLIN,
+   };
+
+   for (;;) {
+      int ret = poll(&pfd, 1, -1);
+      if (ret < 0 && errno == EINTR)
+         continue;
+      if (ret < 0)
+         return -errno;
+      if (ret == 0)
+         continue; /* timed out, but timeout was infinite */
+
+      return pfd.revents;
+   }
+}
+
+/**
+ * Block on the semaphores this batch waits for.
+ *
+ * The waits are satisfied on the host rather than encoded into the command
+ * stream, because nothing in PM4 implements them yet.  Waiting on the active
+ * sync is what makes WSI work at all: wsi's present path hands the driver a
+ * binary semaphore and blocks on it, and since ta5_QueueSubmit() used to
+ * ignore pSignalSemaphores entirely, that semaphore was never signalled and
+ * both headless and Wayland presented nothing and then hung.
+ *
+ * vk_semaphore_reset_temporary() restores the previous permanent payload after
+ * an imported one has been waited on, and the restored payload is reset so the
+ * semaphore is unsignalled for its next use -- the binary-semaphore part of the
+ * contract that vk_queue.c:300-325 arranges when it builds a real submit.
+ */
+static VkResult
+ta5_queue_wait_semaphores(struct ta5_device *device, uint32_t count,
+                          const VkSemaphore *semaphores,
+                          const VkPipelineStageFlags2 *stage_masks,
+                          const uint64_t *values)
+{
+   if (count == 0)
+      return VK_SUCCESS;
+
+   struct vk_sync_wait *waits =
+      (struct vk_sync_wait *)calloc(count, sizeof(*waits));
+   if (!waits)
+      return vk_error(&device->instance->vk, VK_ERROR_OUT_OF_HOST_MEMORY);
+
+   VkResult result = VK_SUCCESS;
+
+   for (uint32_t i = 0; i < count; i++) {
+      struct vk_semaphore *sem = vk_semaphore_from_handle(semaphores[i]);
+
+      waits[i] = (struct vk_sync_wait) {
+         .sync = vk_semaphore_get_active_sync(sem),
+         .stage_mask = stage_masks ? stage_masks[i]
+                                   : (VkPipelineStageFlags2)~0ull,
+         .wait_value = sem->type == VK_SEMAPHORE_TYPE_TIMELINE
+                          ? (values ? values[i] : 0)
+                          : 0,
+      };
+   }
+
+   if (getenv("TA5_TRACE_SEM")) {
+      for (uint32_t i = 0; i < count; i++) {
+         struct vk_semaphore *sem = vk_semaphore_from_handle(semaphores[i]);
+         fprintf(stderr,
+                 "ta5[sem]: wait %p type=%s temp=%p want=%llu\n",
+                 (void *)sem,
+                 sem->type == VK_SEMAPHORE_TYPE_TIMELINE ? "timeline" : "binary",
+                 (void *)sem->temporary,
+                 (unsigned long long)waits[i].wait_value);
       }
    }
 
-   close(fence_fd);
-   return VK_SUCCESS;
+   result = vk_sync_wait_many(&device->vk, count, waits, VK_SYNC_WAIT_COMPLETE,
+                              UINT64_MAX);
+   if (getenv("TA5_TRACE_SEM"))
+      fprintf(stderr, "ta5[sem]: wait_many -> %d\n", result);
+
+   /*
+    * Consume what was waited on, but only once the wait actually succeeded --
+    * resetting a semaphore whose wait timed out would silently un-signal it
+    * and turn a recoverable poll into a permanent hang.
+    */
+   if (result == VK_SUCCESS) {
+      for (uint32_t i = 0; i < count; i++) {
+         struct vk_semaphore *sem = vk_semaphore_from_handle(semaphores[i]);
+
+         vk_semaphore_reset_temporary(&device->vk, sem);
+         if (sem->type == VK_SEMAPHORE_TYPE_BINARY) {
+            VkResult r = vk_sync_reset(&device->vk, &sem->permanent);
+            if (r != VK_SUCCESS)
+               result = r;
+         }
+      }
+   }
+
+   free(waits);
+   return result;
+}
+
+/**
+ * Signal the semaphores and the fence once the GPU has actually finished.
+ *
+ * Signalling before completion would let an application read a swapchain image
+ * that the GPU is still writing.  The kernel fence is what tells us when that
+ * has stopped, so it is waited on here and only then are the payloads raised.
+ * This serialises submissions -- there is no overlap -- which costs throughput
+ * but is the only ordering this driver can currently guarantee.
+ */
+static VkResult
+ta5_queue_signal_syncs(struct ta5_device *device, uint32_t count,
+                       const VkSemaphore *semaphores, const uint64_t *values,
+                       VkFence fence)
+{
+   VkResult result = VK_SUCCESS;
+
+   for (uint32_t i = 0; i < count; i++) {
+      struct vk_semaphore *sem = vk_semaphore_from_handle(semaphores[i]);
+      struct vk_sync *sync = vk_semaphore_get_active_sync(sem);
+      uint64_t value = sem->type == VK_SEMAPHORE_TYPE_TIMELINE
+                          ? (values ? values[i] : 0)
+                          : 0;
+      /*
+       * Whether we are raising an imported payload or the semaphore's own one
+       * decides what happens next, and getting it backwards loses the signal.
+       */
+      bool had_temporary = (sem->temporary != NULL);
+
+      if (getenv("TA5_TRACE_SEM"))
+         fprintf(stderr, "ta5[sem]: signal %p type=%s temp=%p value=%llu\n",
+                 (void *)sem,
+                 sem->type == VK_SEMAPHORE_TYPE_TIMELINE ? "timeline" : "binary",
+                 (void *)sem->temporary, (unsigned long long)(value ? value : 1));
+      VkResult r = vk_sync_signal(&device->vk, sync, value ? value : 1);
+      if (r != VK_SUCCESS && result == VK_SUCCESS)
+         result = r;
+
+      /*
+       * An imported (temporary) payload is single-use: once it has been raised
+       * it is dropped and the semaphore is left unsignalled, which is what
+       * vk_queue.c does for a signalled import.
+       *
+       * But when there was no temporary, the signal landed on the permanent
+       * payload and that payload has to STAY raised until some consumer waits
+       * on it.  Resetting it here un-signalled the semaphore in the same breath
+       * that signalled it, and the wait on the next frame then blocked
+       * forever on a semaphore nobody would ever raise again:
+       *
+       *     ta5[sem]: signal 0xffff8fad35d0 type=binary temp=0 value=1
+       *     ta5[sem]: wait   0xffff8fad35d0 type=binary temp=0   <- hangs
+       */
+      if (had_temporary) {
+         vk_semaphore_reset_temporary(&device->vk, sem);
+         if (sem->type == VK_SEMAPHORE_TYPE_BINARY) {
+            VkResult r = vk_sync_reset(&device->vk, &sem->permanent);
+            if (r != VK_SUCCESS && result == VK_SUCCESS)
+               result = r;
+         }
+      }
+   }
+
+   if (fence != VK_NULL_HANDLE) {
+      struct vk_fence *vfence = vk_fence_from_handle(fence);
+
+      /* Signal the active payload, matching what a WSI acquire imports. */
+      struct vk_sync *sync = vk_fence_get_active_sync(vfence);
+      VkResult r = vk_sync_signal(&device->vk, sync, 1);
+      if (r != VK_SUCCESS && result == VK_SUCCESS)
+         result = r;
+
+      vk_fence_reset_temporary(&device->vk, vfence);
+   }
+
+   return result;
+}
+
+/**
+ * Run one batch: wait its dependencies, submit, wait for the GPU, then signal.
+ */
+static VkResult
+ta5_queue_submit_one(struct ta5_queue *queue, const VkCommandBuffer *cmds,
+                     uint32_t cmd_count, uint32_t wait_count,
+                     const VkSemaphore *wait_sems,
+                     const VkPipelineStageFlags2 *wait_stages,
+                     const uint64_t *wait_values, uint32_t signal_count,
+                     const VkSemaphore *signal_sems, const uint64_t *signal_values,
+                     VkFence fence)
+{
+   struct ta5_device *device = queue->device;
+   VkResult result;
+
+   result = ta5_queue_wait_semaphores(device, wait_count, wait_sems,
+                                      wait_stages, wait_values);
+   if (result != VK_SUCCESS)
+      return result;
+
+   /*
+    * The batch runs, and its signal payloads are raised only after the kernel
+    * says it is done, so the fence cannot be signalled for work still in
+    * flight.  ta5_queue_submit_batch() keeps ownership of the returned kernel
+    * fence through *out_fence_fd for that reason.
+    */
+   int fence_fd = -1;
+   result = ta5_queue_submit_batch(queue, cmds, cmd_count, &fence_fd);
+   if (result != VK_SUCCESS)
+      return result;
+
+   /* An empty batch has no kernel fence and is already complete. */
+   if (fence_fd >= 0) {
+      int revents = ta5_poll_sync_fd(fence_fd);
+
+      if (revents < 0) {
+         close(fence_fd);
+         return vk_error(&device->instance->vk, VK_ERROR_DEVICE_LOST);
+      }
+      if (revents & (POLLERR | POLLHUP | POLLNVAL)) {
+         /*
+          * The GPU is faulting rather than the context being lost, so the
+          * submission will never complete.  Reporting success here would hang
+          * the application on the signal below.
+          */
+         close(fence_fd);
+         return vk_error(&device->instance->vk, VK_ERROR_DEVICE_LOST);
+      }
+      close(fence_fd);
+   }
+
+   return ta5_queue_signal_syncs(device, signal_count, signal_sems,
+                                 signal_values, fence);
 }
 
 VKAPI_ATTR VkResult VKAPI_CALL
@@ -343,14 +585,38 @@ ta5_QueueSubmit(VkQueue _queue, uint32_t submitCount,
 {
    struct ta5_queue *queue = ta5_queue_from_handle(_queue);
 
+   /* A submit with no batches still has to signal its fence, or an
+    * application that queues nothing and waits deadlocks. */
+   if (submitCount == 0)
+      return ta5_queue_signal_syncs(queue->device, 0, NULL, NULL, fence);
+
    for (uint32_t i = 0; i < submitCount; i++) {
-      VkResult result = ta5_queue_submit_batch(queue,
-                                               pSubmits[i].pCommandBuffers,
-                                               pSubmits[i].commandBufferCount,
-                                               /* only the last batch signals
-                                                * the caller's fence */
-                                               (i == submitCount - 1) ? fence
-                                                                    : VK_NULL_HANDLE);
+      const VkSubmitInfo *info = &pSubmits[i];
+      bool last = (i == submitCount - 1);
+
+      /*
+       * VkSubmitInfo carries 32-bit stage masks; the sync wait list wants
+       * VkPipelineStageFlags2.  The bits have to be shifted because the two
+       * enumerations do not share values -- the sync-bit that means
+       * "everything" only exists in the 64-bit form.
+       */
+      VkPipelineStageFlags2 *wait_stages = NULL;
+      if (info->waitSemaphoreCount) {
+         wait_stages = (VkPipelineStageFlags2 *)calloc(info->waitSemaphoreCount,
+                                                       sizeof(*wait_stages));
+         if (!wait_stages)
+            return vk_error(&queue->device->instance->vk,
+                            VK_ERROR_OUT_OF_HOST_MEMORY);
+         for (uint32_t j = 0; j < info->waitSemaphoreCount; j++)
+            wait_stages[j] = (VkPipelineStageFlags2)info->pWaitDstStageMask[j];
+      }
+
+      VkResult result = ta5_queue_submit_one(
+         queue, info->pCommandBuffers, info->commandBufferCount,
+         info->waitSemaphoreCount, info->pWaitSemaphores, wait_stages, NULL,
+         last ? info->signalSemaphoreCount : 0, info->pSignalSemaphores, NULL,
+         last ? fence : VK_NULL_HANDLE);
+      free(wait_stages);
       if (result != VK_SUCCESS)
          return result;
    }
@@ -364,7 +630,13 @@ ta5_QueueSubmit2(VkQueue _queue, uint32_t submitCount,
 {
    struct ta5_queue *queue = ta5_queue_from_handle(_queue);
 
+   if (submitCount == 0)
+      return ta5_queue_signal_syncs(queue->device, 0, NULL, NULL, fence);
+
    for (uint32_t i = 0; i < submitCount; i++) {
+      const VkSubmitInfo2 *info = &pSubmits[i];
+      bool last = (i == submitCount - 1);
+
       /*
        * VkSubmitInfo2 is not layout-compatible with VkSubmitInfo: casting one
        * to the other made commandBufferCount read a truncated semaphore
@@ -372,9 +644,8 @@ ta5_QueueSubmit2(VkQueue _queue, uint32_t submitCount,
        * which then got walked as an array of VkCommandBuffer handles.  Read
        * the handles out of the per-batch VkCommandBufferInfo instead.
        */
-      const VkCommandBufferSubmitInfo *cb_info =
-         pSubmits[i].pCommandBufferInfos;
-      uint32_t cb_count = pSubmits[i].commandBufferInfoCount;
+      const VkCommandBufferSubmitInfo *cb_info = info->pCommandBufferInfos;
+      uint32_t cb_count = info->commandBufferInfoCount;
       VkCommandBuffer *cmds = NULL;
 
       if (cb_count) {
@@ -386,9 +657,75 @@ ta5_QueueSubmit2(VkQueue _queue, uint32_t submitCount,
             cmds[j] = cb_info[j].commandBuffer;
       }
 
-      VkResult result = ta5_queue_submit_batch(
-         queue, cmds, cb_count,
-         (i == submitCount - 1) ? fence : VK_NULL_HANDLE);
+      /* Semaphore values live in the per-semaphore info arrays. */
+      uint64_t *wait_values = NULL, *signal_values = NULL;
+
+      if (info->waitSemaphoreInfoCount) {
+         wait_values = (uint64_t *)calloc(info->waitSemaphoreInfoCount,
+                                          sizeof(*wait_values));
+         if (!wait_values) {
+            free(cmds);
+            return vk_error(&queue->device->instance->vk,
+                            VK_ERROR_OUT_OF_HOST_MEMORY);
+         }
+         for (uint32_t j = 0; j < info->waitSemaphoreInfoCount; j++)
+            wait_values[j] = info->pWaitSemaphoreInfos[j].value;
+      }
+      if (info->signalSemaphoreInfoCount) {
+         signal_values = (uint64_t *)calloc(info->signalSemaphoreInfoCount,
+                                            sizeof(*signal_values));
+         if (!signal_values) {
+            free(wait_values);
+            free(cmds);
+            return vk_error(&queue->device->instance->vk,
+                            VK_ERROR_OUT_OF_HOST_MEMORY);
+         }
+         for (uint32_t j = 0; j < info->signalSemaphoreInfoCount; j++)
+            signal_values[j] = info->pSignalSemaphoreInfos[j].value;
+      }
+
+      uint32_t wait_count = info->waitSemaphoreInfoCount;
+      uint32_t signal_count =
+         last ? info->signalSemaphoreInfoCount : 0;
+
+      /* Collect the semaphore handles from the info arrays. */
+      VkSemaphore *wait_sems = NULL, *signal_sems = NULL;
+      VkPipelineStageFlags2 *wait_stages = NULL;
+
+      if (wait_count) {
+         wait_sems = (VkSemaphore *)calloc(wait_count, sizeof(*wait_sems));
+         wait_stages = (VkPipelineStageFlags2 *)calloc(
+            wait_count, sizeof(*wait_stages));
+         if (!wait_sems || !wait_stages) {
+            free(wait_sems); free(wait_stages); free(wait_values);
+            free(signal_values); free(cmds);
+            return vk_error(&queue->device->instance->vk,
+                            VK_ERROR_OUT_OF_HOST_MEMORY);
+         }
+         for (uint32_t j = 0; j < wait_count; j++) {
+            wait_sems[j] = info->pWaitSemaphoreInfos[j].semaphore;
+            wait_stages[j] = info->pWaitSemaphoreInfos[j].stageMask;
+         }
+      }
+      if (signal_count) {
+         signal_sems = (VkSemaphore *)calloc(signal_count,
+                                             sizeof(*signal_sems));
+         if (!signal_sems) {
+            free(wait_sems); free(wait_stages); free(wait_values);
+            free(signal_values); free(cmds);
+            return vk_error(&queue->device->instance->vk,
+                            VK_ERROR_OUT_OF_HOST_MEMORY);
+         }
+         for (uint32_t j = 0; j < signal_count; j++)
+            signal_sems[j] = info->pSignalSemaphoreInfos[j].semaphore;
+      }
+
+      VkResult result = ta5_queue_submit_one(
+         queue, cmds, cb_count, wait_count, wait_sems, wait_stages, wait_values,
+         signal_count, signal_sems, signal_values, last ? fence : VK_NULL_HANDLE);
+
+      free(wait_sems); free(wait_stages); free(wait_values);
+      free(signal_sems); free(signal_values);
       free(cmds);
       if (result != VK_SUCCESS)
          return result;
