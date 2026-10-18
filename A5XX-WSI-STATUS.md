@@ -15,7 +15,9 @@ history, including several conclusions that subsequent evidence contradicted.
 | Depth clear | **Fixed.** D32 clears now pass a guard-region test on every extent measured, on repeated submission. |
 | Image layout | **Fixed.** Row pitch aligned to 64 texels and the last mip padded to a 32-row envelope, matching Gallium. No out-of-bounds writes measured. |
 | Deferred replay | **Fixed.** Clear and image-to-buffer queues persist across submissions instead of draining on first use. |
-| Cube artifacts | **Open.** A dotted diagonal across the cube faces survives the depth fix. It follows a straight line in texture space rather than a triangle edge, so the vertex/raster stage is implicated, not depth. |
+| Cube artifacts | **Open.** A dotted diagonal across the cube faces survives the depth fix. The texture-descriptor theory for it was **disproved** (section 12.5); the cause is unknown. |
+| Vertex fetch | **Fixed.** `VTXCNT` was 0 for draws without vertex buffers, so they silently rasterised nothing (`ee0f89c`). |
+| Viewport | **Fixed** for packet length and `VkViewport` offsets (`91842e5`). This did *not* change pixel coverage. |
 | Synchronization/lifecycle | Queue submission is synchronous and incomplete; lazy queue creation, command-pool lifecycle, query placeholders and semaphore semantics remain open. |
 | KMS | Unvalidated after removing the private WSI; `master_fd=-1` and the software-device workaround need review. |
 
@@ -786,3 +788,105 @@ rather than clearing the log).
 vkcube on the Wayland display still shows a dotted diagonal across the cube
 faces. It runs in a straight line in texture space, so it is a vertex/raster
 artefact rather than the depth defect above. Not yet diagnosed.
+
+
+## 12. Draw path: what was found, and what was wrong about how
+
+### 12.1 Method note, first, because it applies to everything above
+
+A guard region after an allocation catches out-of-bounds writes that produce no
+fault. Pixel classification (clear colour vs shader colour vs black) catches
+draws that silently produce nothing. And a *positive control* -- a switch that
+must change the result, run to prove the harness responds -- makes any matrix of
+"no change" results interpretable. All three are cheap; none were used for the
+first few hours of this investigation, and the results were repeatedly wrong
+because of it.
+
+### 12.2 VTXCNT: draws without vertex buffers rasterised nothing (`ee0f89c`)
+
+`VFD_CONTROL_0.VTXCNT` was set to `fetch_cnt`, the number of vertex-buffer
+*fetch slots*. A draw binding no vertex buffer has zero of those, so it
+programmed `VTXCNT = 0`: the fetch unit processed no vertices, every attribute
+read as zero, and all vertices landed on `(0,0,0,1)`. A zero-area triangle,
+which rasterises no fragments and raises no fault.
+
+The comment directly above already specified the correct behaviour -- "without
+them it is the draw's vertex count, which is what fd5_draw() writes
+(`p4->vtxcnt = p->count`)" -- and the code did something else.
+
+```
+before:  ta5[vfd]: VTXCNT=0 (fetch slots=0, draw verts=6)
+         pixels: clear_only=65536 shader_only=0 both=0 black=0
+after:   ta5[vfd]: VTXCNT=6 (fetch slots=0, draw verts=6)
+```
+
+### 12.3 Viewport packet (`91842e5`)
+
+Two real defects, neither of which explains the pixel shortfall below:
+
+- `TA5_SKIP_VPORT` emitted 4 words into a packet whose header declares 6, so
+  the switch desynchronised the command stream. Any bisect that set it on such a
+  build was measuring corruption, not the switch.
+- `VkViewport`'s x/y/width/height were ignored; `XOFFSET` was hardcoded to
+  `width/2`.
+
+`TA5_TRACE_VPORT` now reports the programmed values, so they need not be
+inferred from pixel counts as they were here.
+
+### 12.4 OPEN: a quad covers 12636 of 65536 pixels
+
+A `-0.9..0.9` NDC quad on a 256x256 target should cover ~53824 pixels. It
+covers **12636**, consistent with a ~112x112 box. Measured:
+
+```
+ta5[vport] fb=256x256 vp_set=0 -> xoff=128.000 xscale=128.000
+pixels: clear_only=12636
+```
+
+The viewport is correct, so the halving happens downstream of it. The window
+scissor is also correct (full target). Not yet localised. Candidates not yet
+examined: `PC_PRIMITIVE_CNTL_STRIDE_IN_VPC`, the VPC stride, or the clip/
+perspective stage. Do not re-test the viewport: it is measured correct.
+
+### 12.5 Theories tested and refuted
+
+Recorded so they are not retried:
+
+| Theory | Result |
+|---|---|
+| Texture descriptor `ARRAY_PITCH` wrong, causing the cube diagonal | **Refuted.** The runs behind it never rendered a single pixel (`lit=0` from a black clear), so every register decoded from them described a frame that was never drawn. |
+| Vertex-id system-value lowering broken | **Refuted.** `ta5_shader.cc` does call `nir_lower_system_values`, and with a plain `gl_VertexIndex` shader the trace shows `REGID4VTX=0` (a real register) and `vs inputs: 1`. The sentinel `252` was `regid(63,0)` from a *probe shader* that indexed a local const array, not a driver defect. |
+| `VK_ERROR_OUT_OF_POOL_MEMORY` / `-1000012000` are malformed return values | **Wrong.** Both are ordinary Vulkan result codes. They were misidentified as garbage without being looked up. |
+| Fragment/draw path broken generally | **Refuted.** vkcube renders geometry; draws with vertex buffers work. Only fetchless draws were affected (section 12.2). |
+
+### 12.6 Process notes
+
+The measurements in this investigation were generally sound and reproducible.
+The *interpretation* repeatedly outran them, and these claims all had to be
+withdrawn after the next measurement:
+
+- "ARRAY_PITCH is 2x too large, that is the diagonal's cause" -- decoded from a
+  compressed five-word trace print, against a frame that had not rendered.
+- "found the real bug" for `VTXCNT` -- true as a bug, but it was not the cause
+  of the symptom being investigated, and saying otherwise invited a false
+  conclusion that it was.
+- "a second failure in sysval lowering" -- asserted after finding the driver
+  already did the lowering in question.
+- Two `VkResult` values called "garbage" that were standard codes.
+
+The recurring error was stating a cause before a measurement that could have
+refuted it had been taken. A bisect matrix with no positive control reads as
+"the code path is not reached"; it only means the matrix does not cover the
+failing path.
+
+### 12.7 Still open
+
+- The 12636-of-65536 coverage shortfall (section 12.4).
+- The cube's dotted diagonal artifact (section 12.5 refutes the texture theory).
+- Deferred image->buffer copies: per-region mip, destination pitch from
+  `bufferRowLength`, source z offset, and the destination buffer's binding
+  offset are all still handled incorrectly.
+- Depth attachment addresses drop `image->offset` and the level offset.
+- Attachment 0 is unconditionally bound as RGBA8 colour.
+- Queue lifecycle: queues created lazily, no matching `vk_queue_finish`.
+- KMS presentation, unvalidated since the private WSI was removed.
