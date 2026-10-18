@@ -36,6 +36,7 @@
 #include "vk_object.h"
 #include "vk_device.h"
 #include "vk_sync.h"
+#include "vk_fence.h"
 
 #include "ta5_instance.h"
 
@@ -49,15 +50,33 @@
  * submission but would break the moment a real fence FD comes back from
  * MSM_GEM_NEW.
  */
+/**
+ * A fence.
+ *
+ * The runtime's struct vk_fence is embedded rather than copied field by field,
+ * and it has to be: libvulkan_wsi hands our VkFence handle straight back to
+ * vk_fence_reset_temporary(), which reads fence->temporary (vk_fence.c:169)
+ * and destroys it if non-NULL.
+ *
+ * With a private layout that read landed on our `device` pointer, which is
+ * always non-NULL.  wsi_common therefore believed every fence carried
+ * temporary state, treated the *device* pointer as a struct vk_sync *, and
+ * called through its garbage `type->finish`.  Headless vkmark segfaulted on
+ * the first frame inside ta5_GetDeviceQueue, having jumped through a pointer
+ * that happened to resolve into this driver.
+ *
+ * `permanent` is where our fence's sync lives; `temporary` stays NULL, which is
+ * what tells the runtime this fence has no imported state.
+ */
 struct ta5_fence
 {
-   struct vk_object_base base;
+   struct vk_fence base;
    struct ta5_device *device;
-   struct vk_sync *sync;
    bool signaled; /**< fences start signaled when created with that flag */
 };
 
-VK_DEFINE_NONDISP_HANDLE_CASTS(ta5_fence, base, VkFence, VK_OBJECT_TYPE_FENCE)
+VK_DEFINE_NONDISP_HANDLE_CASTS(ta5_fence, base.base, VkFence,
+                               VK_OBJECT_TYPE_FENCE)
 
 /**
  * Host event.

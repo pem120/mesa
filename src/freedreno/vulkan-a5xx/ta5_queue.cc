@@ -149,7 +149,7 @@ ta5_queue_submit_batch(struct ta5_queue *queue, const VkCommandBuffer *cmds,
    if (total_words == 0) {
       if (fence != VK_NULL_HANDLE) {
          struct ta5_fence *ta5_fence = ta5_fence_from_handle(fence);
-         VkResult result = vk_sync_signal(&device->vk, ta5_fence->sync, 1);
+         VkResult result = vk_sync_signal(&device->vk, &ta5_fence->base.permanent, 1);
          if (result != VK_SUCCESS)
             return result;
       }
@@ -323,7 +323,7 @@ ta5_queue_submit_batch(struct ta5_queue *queue, const VkCommandBuffer *cmds,
    if (fence != VK_NULL_HANDLE) {
       struct ta5_fence *ta5_fence = ta5_fence_from_handle(fence);
       VkResult result =
-         vk_sync_import_sync_file(&device->vk, ta5_fence->sync, fence_fd);
+         vk_sync_import_sync_file(&device->vk, &ta5_fence->base.permanent, fence_fd);
       TA5_DBG("fence import: fd %d -> %d (errno %d: %s)", fence_fd, result,
              errno, strerror(errno));
       if (result != VK_SUCCESS) {

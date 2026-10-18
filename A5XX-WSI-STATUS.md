@@ -442,50 +442,73 @@ An entry that resolves to NULL is skipped by `..._from_entrypoints`, so a
 missing merge shows up as a NULL dispatch slot or a loader stub, not a build
 error.
 
-### 10.4 OPEN: headless segfaults on the first frame
+### 10.4 FIXED: our VkFence was not a struct vk_fence
 
-After the three merges:
+**Real bug, found by reading the layout against what wsi_common expects.**
 
-```
-[clear] duration=1: Segmentation fault (core dumped)
-```
+`wsi_signal_fence_for_image()` (wsi_common.c:2246) does:
 
-Backtrace (line info unreliable — no debug info in the build):
-
-```
-#0  ta5_GetDeviceQueue (_device=0xfffff76d3220, queueFamilyIndex=4151128608,
-                        queueIndex=0, pQueue=0x0)
-#1  vk_sync_finish     (vk_sync.c:110)
-#2  vk_sync_destroy    (vk_sync.c:142)
-#3  vk_fence_reset_temporary (vk_fence.c:173)
-#4  wsi_signal_fence_for_image (wsi_common.c:2257)
-#5  wsi_common_acquire_next_image2 (wsi_common.c:2304)
-#6  wsi_AcquireNextImageKHR (wsi_common.c:2212)
-#7  SwapchainWindowSystem::next_vulkan_image()  [vkmark/headless.so]
+```c
+VK_FROM_HANDLE(vk_fence, fence, _fence);
+vk_fence_reset_temporary(device, fence);
 ```
 
-**Observations, not a diagnosis:**
-* `queueFamilyIndex = 4151128608 = 0xF76D2E40` — that contains a *pointer
-  fragment*, and `_device = 0xfffff76d3220`. The arguments look shifted.
-* `pQueue = 0x0`.
-* `_device` differs between frames #6 (`0xfffff76cfde0`) and #5
-  (`0xfffff76d3220`).
-* `vk_sync_finish` calling `vkGetDeviceQueue` is not something it should do, so
-  at least some frames are misattributed.
+which reads `fence->temporary` (vk_fence.c:169). Our `struct ta5_fence` began
+with `vk_object_base base;` then `ta5_device *device` — so that read landed on
+the **device pointer**, which is always non-NULL. wsi_common therefore believed
+every fence carried temporary state, treated the *device* pointer as a
+`struct vk_sync *`, and called through its garbage `type->finish`.
 
-**Open hypotheses, none tested:**
-1. Argument/ABI mismatch on the loader↔ICD boundary — `VkIcdSurfaceBase` is a
-   loader-ABI struct and wsi_common reads `surface->platform` to index
-   `wsi->wsi[]`. The on-device `/lib/libvulkan.so.1` may be a different version
-   from this tree.
-2. A genuine bad call in the acquire path.
-3. Red herring from unreliable unwinding — needs a debug-info build to rule out.
+That is why the crash surfaced inside `ta5_GetDeviceQueue` with
+`queueFamilyIndex=0xF76D2E40` (a pointer fragment): it had jumped through a
+bogus function pointer that happened to land in this driver.
 
-**Next step:** rebuild with debug info (`buildtype=debugoptimized` keeps
-symbols; add `-g` to ta5_flags) so the backtrace is trustworthy before
-theorising further. Do not chase this without that.
+Fix: embed the runtime struct rather than copying fields.
 
-### 10.5 Test matrix as of 2026-10-18 morning
+```c
+struct ta5_fence {
+   struct vk_fence base;
+   struct ta5_device *device;
+   bool signaled;
+};
+VK_DEFINE_NONDISP_HANDLE_CASTS(ta5_fence, base.base, VkFence, VK_OBJECT_TYPE_FENCE)
+```
+
+The sync moved to `base.permanent`, so `vk_sync_create` (which allocates) became
+`vk_sync_init` (which fills in place) and `vk_sync_destroy` became
+`vk_sync_finish`. `ta5_DestroyFence` now also calls `vk_fence_reset_temporary`
+first, matching `vk_fence_destroy`, because wsi_common attaches a dma-buf wait
+sync to the fence.
+
+Evidence it worked: the backtrace moved from a garbage jump into
+`ta5_GetDeviceQueue` to well-defined frames, and acquire now completes.
+
+### 10.5 OPEN: present returns ErrorInvalidExternalHandle, teardown crashes
+
+Progress: the scene now renders and reaches present.
+
+```
+[clear] duration=1: Failed with exception: vk::Queue::presentKHR:
+                        ErrorInvalidExternalHandle
+```
+
+then, during vkmark teardown:
+
+```
+#0  0x0000000000000000 in ?? ()
+#1  wsi_destroy_image (chain=..., image=...) at wsi_common.c:1053
+#2  wsi_headless_swapchain_destroy  at wsi_common_headless.c:466
+```
+
+Frame #0 is another **NULL dispatch slot**, this time on a device-level call
+from `wsi_destroy_image`. Not yet identified which entry point.
+
+**Open questions:**
+1. Which entry point is NULL at wsi_common.c:1053?
+2. Why does `wsi_QueuePresentKHR` return `ErrorInvalidExternalHandle`?
+3. Both may share a root cause -- a dispatch table that is incomplete somewhere.
+
+### 10.6 Test matrix as of 2026-10-18
 
 ---
 

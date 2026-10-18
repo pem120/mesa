@@ -44,6 +44,7 @@
 #include "ta5_instance.h"
 #include "ta5_device.h"
 #include "ta5_sync.h"
+#include "vk_fence.h"
 #include "ta5_entrypoints.h"
 
 /* ------------------------------------------------------------------ */
@@ -77,7 +78,7 @@ ta5_CreateFence(VkDevice _device, const VkFenceCreateInfo *pCreateInfo,
    if (!fence)
       return vk_error(&device->instance->vk, VK_ERROR_OUT_OF_HOST_MEMORY);
 
-   vk_object_base_init(&device->vk, &fence->base, VK_OBJECT_TYPE_FENCE);
+   vk_object_base_init(&device->vk, &fence->base.base, VK_OBJECT_TYPE_FENCE);
    fence->device = device;
 
    /*
@@ -86,8 +87,10 @@ ta5_CreateFence(VkDevice _device, const VkFenceCreateInfo *pCreateInfo,
     * for that.  A created-with-signaled fence starts at value 1, otherwise
     * at 0.
     */
-   result = vk_sync_create(&device->vk, &device->sync_type,
-                           (enum vk_sync_flags)0, 0, &fence->sync);
+   /* vk_sync_init, not vk_sync_create: vk_fence::permanent is embedded by
+    * value, and vk_sync_create allocates a struct vk_sync instead. */
+   result = vk_sync_init(&device->vk, &fence->base.permanent,
+                         &device->sync_type, (enum vk_sync_flags)0, 0);
    if (result != VK_SUCCESS) {
       vk_free(pAllocator, fence);
       return vk_error(&device->instance->vk, result);
@@ -97,9 +100,9 @@ ta5_CreateFence(VkDevice _device, const VkFenceCreateInfo *pCreateInfo,
 
    /* A binary sync always starts unsignalled; raise it if asked. */
    if (pCreateInfo->flags & VK_FENCE_CREATE_SIGNALED_BIT) {
-      result = vk_sync_signal(&device->vk, fence->sync, 1);
+      result = vk_sync_signal(&device->vk, &fence->base.permanent, 1);
       if (result != VK_SUCCESS) {
-         vk_sync_destroy(&device->vk, fence->sync);
+         vk_sync_finish(&device->vk, &fence->base.permanent);
          vk_free(pAllocator, fence);
          return vk_error(&device->instance->vk, result);
       }
@@ -119,7 +122,15 @@ ta5_DestroyFence(VkDevice _device, VkFence _fence,
    if (pAllocator == NULL)
       pAllocator = vk_default_allocator();
 
-   vk_sync_destroy(&fence->device->vk, fence->sync);
+   /*
+    * Reset the temporary sync before finishing the permanent one, exactly as
+    * vk_fence_destroy() does (vk_fence.c:181).  libvulkan_wsi attaches one in
+    * wsi_signal_fence_for_image() -- a dma-buf wait -- and it has to be
+    * released or the sync object outlives the fence.  _device is used rather
+    * than fence->device because it is the handle the caller actually passed.
+    */
+   vk_fence_reset_temporary((struct vk_device *)_device, &fence->base);
+   vk_sync_finish((struct vk_device *)_device, &fence->base.permanent);
    vk_free(pAllocator, fence);
 }
 
@@ -130,7 +141,7 @@ ta5_ResetFences(VkDevice _device, uint32_t fenceCount, const VkFence *pFences)
 
    for (uint32_t i = 0; i < fenceCount; i++) {
       struct ta5_fence *fence = ta5_fence_from_handle(pFences[i]);
-      VkResult result = vk_sync_reset(&device->vk, fence->sync);
+      VkResult result = vk_sync_reset(&device->vk, &fence->base.permanent);
 
       if (result != VK_SUCCESS)
          return vk_error(&device->instance->vk, result);
@@ -152,7 +163,7 @@ ta5_GetFenceStatus(VkDevice _device, VkFence _fence)
     * valid for timelines.  Poll instead, with an already-expired timeout so
     * this never blocks.
     */
-   result = vk_sync_wait(&fence->device->vk, fence->sync, 0,
+   result = vk_sync_wait(&fence->device->vk, &fence->base.permanent, 0,
                          VK_SYNC_WAIT_COMPLETE, os_time_get_absolute_timeout(0));
    if (result != VK_SUCCESS && result != VK_TIMEOUT)
       return result;
@@ -182,7 +193,7 @@ ta5_WaitForFences(VkDevice _device, uint32_t fenceCount, const VkFence *pFences,
        * usual "poll with a zero timeout" loop into a hang.
        */
       result = vk_sync_wait(
-         &device->vk, fence->sync, 0, VK_SYNC_WAIT_COMPLETE,
+         &device->vk, &fence->base.permanent, 0, VK_SYNC_WAIT_COMPLETE,
          os_time_get_absolute_timeout(timeout));
       if (result == VK_SUCCESS)
          fence->signaled = true;
