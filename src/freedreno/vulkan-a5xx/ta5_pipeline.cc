@@ -378,6 +378,45 @@ ta5_CreateGraphicsPipelines(VkDevice _device, VkPipelineCache pipelineCache,
       ta5_fill_render_pass_state(&rp_state, pipe->render_pass);
 
       /*
+       * pMultisampleState is optional, and a pipeline without one means
+       * "whatever the render pass's attachments say" rather than 1x.
+       *
+       * The runtime cannot resolve that here, because
+       * vk_multisample_sample_locations_state_init() has no NULL guard on
+       * ms_info:
+       *
+       *    vk_graphics_pipeline_state_fill()              vk_graphics_state.c:1882
+       *    vk_multisample_sample_locations_state_init()   vk_graphics_state.c:805
+       *        ms->sample_locations =
+       *           vk_standard_sample_locations_state(ms_info->rasterizationSamples);
+       *
+       * ms_info is NULL for such a pipeline, so that line dereferences NULL.
+       * vk_multisample_state_init() one call earlier *does* guard against NULL;
+       * only this second entry point does not, which is why the crash lands in
+       * a function named for sample locations rather than near multisampling.
+       *
+       * Measured: a pipeline created with pMultisampleState == NULL died
+       * SIGSEGV/SEGV_MAPERR, top frame vk_multisample_sample_locations_state_init,
+       * caller ta5_CreateGraphicsPipelines.  That pipeline is entirely
+       * application-legal; the usual fullscreen-quad samples omit it.
+       *
+       * Resolve it here, where the render pass is known.  This driver only
+       * builds 1x pipelines -- it programs MSAA_ONE unconditionally and sizes
+       * images ignoring samples -- so single-sampled is the only answer it can
+       * honour, and it matches every attachment it can currently create.
+       */
+      VkPipelineMultisampleStateCreateInfo default_ms = {
+         .sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO,
+         .rasterizationSamples = VK_SAMPLE_COUNT_1_BIT,
+      };
+      VkGraphicsPipelineCreateInfo with_ms = *ci;
+
+      if (!ci->pMultisampleState) {
+         with_ms.pMultisampleState = &default_ms;
+         ci = &with_ms;
+      }
+
+      /*
        * mv_state is not optional, even though a single-view render pass needs
        * no multiview state.  vk_multiview_state_init() has no equivalent of
        * the driver_rp guard that vk_render_pass_state_init() has, so with
