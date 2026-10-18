@@ -51,6 +51,7 @@
 #include "ta5_instance.h"
 #include "ta5_device.h"
 #include "ta5_wsi.h"
+#include "wsi_common.h"
 #include "ta5_entrypoints.h"
 
 #define TA5_DBG(fmt, ...)                                                  \
@@ -239,6 +240,26 @@ ta5_CreateInstance(const VkInstanceCreateInfo *pCreateInfo,
 
    vk_instance_dispatch_table_from_entrypoints(
       &dispatch_table, &ta5_instance_entrypoints, true);
+
+   /*
+    * Add the WSI instance entrypoints on top, without overwriting.
+    *
+    * Surface creation is an *instance* entry point, so the physical-device
+    * merge in ta5_physical_device_init() cannot reach it.  Without this,
+    * vkCreateHeadlessSurfaceEXT and vkCreateWaylandSurfaceKHR resolve to NULL,
+    * and the loader answers with a stub surface that no ICD backs -- which is
+    * not an error at creation time.  It surfaces later as
+    *
+    *     Error: vk::PhysicalDevice::getSurfaceCapabilitiesKHR:
+    *            ErrorExtensionNotPresent
+    *
+    * because the stub is not a wsi surface.  Confirmed with gdb: none of
+    * wsi_CreateHeadlessSurfaceEXT, wsi_GetPhysicalDeviceSurfaceCapabilitiesKHR
+    * or wsi_GetPhysicalDeviceSurfaceCapabilities2KHR was ever entered.
+    * Turnip does the same at tu_device.cc:1989.
+    */
+   vk_instance_dispatch_table_from_entrypoints(
+      &dispatch_table, &wsi_instance_entrypoints, false);
 
    result = vk_instance_init(&instance->vk,
                              &ta5_instance_extensions_supported,

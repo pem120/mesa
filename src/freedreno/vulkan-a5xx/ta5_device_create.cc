@@ -53,6 +53,7 @@
 #include "ta5_queue.h"
 #include "ta5_submit.h"
 #include "ta5_entrypoints.h"
+#include "wsi_common.h"
 
 #define TA5_DBG(fmt, ...)                                                  \
    do {                                                                    \
@@ -114,6 +115,26 @@ ta5_CreateDevice(VkPhysicalDevice physicalDevice,
    TA5_TRACE("CreateDevice: building dispatch table");
    vk_device_dispatch_table_from_entrypoints(&dispatch_table,
                                              &ta5_device_entrypoints, true);
+
+   /*
+    * Add the WSI device entrypoints on top, without overwriting.
+    *
+    * The swapchain half of the API is a *device* entry point, so neither the
+    * instance merge (ta5_instance.cc) nor the physical-device merge
+    * (ta5_driver.cc) can reach it.  vk_device_init() does merge
+    * vk_common_device_entrypoints, but those are weak aliases that do not link
+    * statically: in the built .so, both vk_common_CreateSwapchainKHR and
+    * vk_common_AcquireNextImageKHR stay undefined while wsi_CreateSwapchainKHR
+    * is defined right beside them.  The slot therefore stays NULL and the
+    * loader reports
+    *
+    *     vkCreateSwapchainKHR: Driver's function pointer was NULL,
+    *     returning VK_SUCCESS
+    *
+    * Turnip adds this at tu_device.cc:2874; so does every other Mesa driver.
+    */
+   vk_device_dispatch_table_from_entrypoints(&dispatch_table,
+                                             &wsi_device_entrypoints, false);
    TA5_TRACE("CreateDevice: calling vk_device_init");
 
    result = vk_device_init(&device->vk, &pdevice->vk, &dispatch_table,
