@@ -1867,6 +1867,15 @@ ta5_emit_textures(struct ta5_cmd_buffer *cmd, enum a4xx_state_block sb,
 
          for (uint32_t w = 0; w < 4; w++)
             ta5_cs_push(cmd, samp ? samp->desc[w] : 0);
+
+         /* The sampler is the one piece of the sampling path with no trace of
+          * its own, and the descriptor and the unit the shader indexes can both
+          * be right while these four words keep the sample returning zero.
+          */
+         if (getenv("TA5_TRACE_TEX"))
+            fprintf(stderr, "ta5[samp] sb=%u unit=%u desc: %08x %08x %08x %08x\n",
+                    sb, i, samp ? samp->desc[0] : 0, samp ? samp->desc[1] : 0,
+                    samp ? samp->desc[2] : 0, samp ? samp->desc[3] : 0);
       }
    }
 
@@ -4484,6 +4493,9 @@ ta5_CmdPipelineBarrier(VkCommandBuffer _cmd, VkPipelineStageFlags srcStageMask,
    if (cmd->state != MESA_VK_COMMAND_BUFFER_STATE_RECORDING)
       return;
 
+   if (getenv("TA5_BARRIER_ALWAYS"))
+      goto wait;
+
    /*
     * VK_PIPELINE_STAGE_NONE on either side means no dependency is being
     * expressed and no work is required, which is the common case for the
@@ -4492,6 +4504,8 @@ ta5_CmdPipelineBarrier(VkCommandBuffer _cmd, VkPipelineStageFlags srcStageMask,
    if (srcStageMask == VK_PIPELINE_STAGE_NONE ||
        dstStageMask == VK_PIPELINE_STAGE_NONE)
       return;
+
+wait:
 
    ret = ta5_cmd_buffer_alloc_cs(cmd, cmd->cs_count + 8);
    if (ret != VK_SUCCESS)
@@ -5435,6 +5449,14 @@ ta5_record_draw(struct ta5_cmd_buffer *cmd, uint32_t vertexCount,
     * through the VFD's synth path rather than from memory.
     */
    unsigned fetch_cnt = 0;
+
+   /*
+    * TA5_TEX_INVALIDATE orders a texture read against earlier host or transfer
+    * writes to the same image.  There is no cache-invalidate register on a5xx,
+    * so the wait is all this driver has; it is a probe, not a feature.
+    */
+   if (getenv("TA5_TEX_INVALIDATE"))
+      ta5_wfi(draw);
 
    if (getenv("TA5_TRACE_VFD"))
       fprintf(stderr,

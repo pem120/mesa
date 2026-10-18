@@ -64,6 +64,9 @@ struct ta5_memory
    struct list_head bound_buffers; /**< list of ta5_buffer */
    bool is_linear;                 /**< linear tiling */
 
+   /** Link into device->memories; diagnostic only, see ta5_dump_images(). */
+   struct list_head device_link;
+
    /**
     * Backing GEM object.
     *

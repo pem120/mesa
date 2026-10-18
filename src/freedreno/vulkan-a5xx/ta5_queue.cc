@@ -626,6 +626,98 @@ ta5_dump_framebuffer(struct ta5_cmd_buffer *cmd)
 }
 
 /**
+ * Report how much of every live image's level 0 is non-zero.
+ *
+ * This exists to answer one question that pixel readback of a framebuffer
+ * cannot: when textured draws produce nothing, is the texture empty or is the
+ * sample reading it wrong?  A glyph atlas that the application never managed to
+ * fill and a glyph atlas that is full of glyphs both render as "no text", and
+ * they need opposite fixes.  Scanning the memory answers it directly.
+ *
+ * Levels other than 0 are skipped: on this hardware they are padded and
+ * unused, and a padded level reads as non-zero padding rather than content.
+ *
+ * Diagnostic only, enabled by TA5_DUMP_IMAGES, bounded to a few reports so a
+ * long-running application does not drown its own log.
+ */
+static void
+ta5_dump_images(struct ta5_cmd_buffer *cmd)
+{
+   if (!getenv("TA5_DUMP_IMAGES"))
+      return;
+   static unsigned reported;
+   if (reported >= 40)
+      return;
+   reported++;
+
+   struct ta5_device *device = cmd->device;
+   fprintf(stderr, "ta5[img]: ---- scan %u ----\n", reported);
+   list_for_each_entry (struct ta5_memory, memory, &device->memories,
+                        device_link) {
+      if (!memory->bo)
+         continue;
+      list_for_each_entry (struct ta5_image, image, &memory->bound_images,
+                           memory_binding) {
+         const struct ta5_image_level *level = &image->levels[0];
+         if (!level->width || !level->height || !level->row_pitch)
+            continue;
+         const uint64_t span = level->row_pitch * level->height;
+         if (image->offset + span > memory->bo->size)
+            continue;
+         const uint8_t *base = (const uint8_t *)ta5_bo_map(memory->bo);
+         if (!base)
+            continue;
+         const uint8_t *map = base + image->offset;
+         uint64_t nonzero = 0, first = UINT64_MAX;
+         for (uint64_t i = 0; i < span; i++) {
+            if (map[i]) {
+               nonzero++;
+               if (first == UINT64_MAX)
+                  first = i;
+            }
+         }
+         fprintf(stderr,
+                 "ta5[img]: %ux%u fmt%u layers=%u mips=%u usage=%#x pitch=%llu "
+                 "nonzero=%llu/%llu first=%lld\n",
+                 level->width, level->height, (unsigned)image->format,
+                 image->array_layers, image->mip_levels,
+                 (unsigned)image->usage, (unsigned long long)level->row_pitch,
+                 (unsigned long long)nonzero, (unsigned long long)span,
+                 first == UINT64_MAX ? -1LL : (long long)first);
+
+         /*
+          * Non-zero coverage is not the same as coverage: a glyph texel with
+          * colour set and alpha zero is invisible, so an atlas full of those
+          * looks populated to the counter above and still renders nothing.
+          * Writing the level out answers what the bytes actually are.
+          */
+         if (getenv("TA5_DUMP_ATLAS") && reported <= 4 &&
+             (image->usage & VK_IMAGE_USAGE_SAMPLED_BIT)) {
+            static unsigned dumped;
+            if (dumped < 4) {
+               char path[4096];
+               int length = snprintf(path, sizeof(path),
+                                     "/home/ishu/a5xx-test-tmp/atlas-%ux%u-fmt%u.raw",
+                                     level->width, level->height,
+                                     (unsigned)image->format);
+               if (length > 0 && (size_t)length < sizeof(path)) {
+                  FILE *file = fopen(path, "wb");
+                  if (file) {
+                     for (uint32_t y = 0; y < level->height; y++)
+                        fwrite(map + y * level->row_pitch, 1,
+                               (size_t)level->row_pitch, file);
+                     fclose(file);
+                     fprintf(stderr, "ta5[img]: wrote %s\n", path);
+                     dumped++;
+                  }
+               }
+            }
+         }
+      }
+   }
+}
+
+/**
  * Run one batch: wait its dependencies, submit, wait for the GPU, then signal.
  */
 static VkResult
@@ -698,6 +790,7 @@ ta5_queue_submit_one(struct ta5_queue *queue, const VkCommandBuffer *cmds,
       struct ta5_cmd_buffer *cmd = ta5_cmd_buffer_from_handle(cmds[i]);
       ta5_cmd_buffer_run_deferred_i2b(cmd);
       ta5_dump_framebuffer(cmd);
+      ta5_dump_images(cmd);
    }
 
    return ta5_queue_signal_syncs(device, signal_count, signal_sems,

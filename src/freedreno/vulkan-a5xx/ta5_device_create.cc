@@ -107,6 +107,7 @@ ta5_CreateDevice(VkPhysicalDevice physicalDevice,
       return vk_error(&pdevice->instance->vk, VK_ERROR_OUT_OF_DEVICE_MEMORY);
 
    list_inithead(&device->queues);
+   list_inithead(&device->memories);
 
    /*
     * a5xx is a single generation, so unlike Turnip there is no per-chip

@@ -88,6 +88,7 @@ ta5_AllocateMemory(VkDevice _device, const VkMemoryAllocateInfo *pAllocateInfo,
    memory->memory_type_index = pAllocateInfo->memoryTypeIndex;
    list_inithead(&memory->bound_images);
    list_inithead(&memory->bound_buffers);
+   list_addtail(&memory->device_link, &device->memories);
 
    /*
     * Uncached sysmem, by default.
@@ -137,6 +138,8 @@ ta5_FreeMemory(VkDevice _device, VkDeviceMemory _memory,
     */
    if (_memory == NULL)
       return;
+
+   list_del(&memory->device_link);
 
    if (pAllocator == NULL)
       pAllocator = vk_default_allocator();

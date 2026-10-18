@@ -122,6 +122,15 @@ struct ta5_device
    struct list_head queues;
 
    /**
+    * Live device-memory allocations.
+    *
+    * Nothing needs to walk this to make the driver work; it exists so
+    * TA5_DUMP_IMAGES can report the contents of every image the application
+    * created.  See ta5_dump_images().
+    */
+   struct list_head memories;
+
+   /**
     * IR3 compiler, generation-gated: a5xx (gen 5) selects IR3's a4xx back
     * end, the same one the GL backend uses.  It emits CP_LOAD_STATE4, which
     * is the only state-load family this hardware has -- Turnip only speaks
