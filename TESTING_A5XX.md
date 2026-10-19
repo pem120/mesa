@@ -114,7 +114,7 @@ cannot be cross-compiled for musl by zig (zig emits static binaries without
 ## Diagnostic environment variables
 
 Every `TA5_*` knob is a no-op unless set. With one exception noted below,
- they change no rendering behaviour; they exist to obtain evidence.
+they change no rendering behaviour; they exist to obtain evidence.
 
 Start from the shipped combination and vary one at a time:
 
