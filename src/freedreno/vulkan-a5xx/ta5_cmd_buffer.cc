@@ -4004,6 +4004,24 @@ ta5_CmdBeginRenderPass(VkCommandBuffer _cmd,
    cmd->render_area = pRenderPassBegin->renderArea;
 
    /*
+    * Pass structure, for working out which target a draw landed on.  The
+    * per-draw scissor trace says "931x1006, rows 46..1005" but not which
+    * pass it belonged to, so a draw that moves between passes is
+    * indistinguishable from one that stays put.
+    */
+   if (getenv("TA5_TRACE_PASS")) {
+      const struct ta5_framebuffer *fb = cmd->bound_framebuffer;
+      fprintf(stderr,
+              "ta5[pass]: begin fb=%ux%u area=%ux%u+%u+%u atts=%u clear=%u\n",
+              fb ? fb->width : 0, fb ? fb->height : 0,
+              pRenderPassBegin->renderArea.extent.width,
+              pRenderPassBegin->renderArea.extent.height,
+              pRenderPassBegin->renderArea.offset.x,
+              pRenderPassBegin->renderArea.offset.y,
+              pass->attachment_count, clear_count);
+   }
+
+   /*
     * pClearValues is NULL whenever no attachment asks to be cleared, so it is
     * indexed only under `clear`, not under `clear_count`: clearValueCount is
     * then 0 and every loadOp below is LOAD or DONT_CARE, so the loop never
@@ -4297,6 +4315,9 @@ ta5_CmdEndRenderPass(VkCommandBuffer _cmd)
 
    if (cmd->state != MESA_VK_COMMAND_BUFFER_STATE_RECORDING)
       return;
+
+   if (getenv("TA5_TRACE_PASS"))
+      fprintf(stderr, "ta5[pass]: end   cs=%u\n", cmd->cs_count);
 
    /*
     * Grow before emitting.  ta5_cs_push() writes unconditionally, and the
@@ -5276,16 +5297,39 @@ ta5_record_draw(struct ta5_cmd_buffer *cmd, uint32_t vertexCount,
    cmd->draw_first_instance = firstInstance;
    cmd->draw_index_size = index_size;
 
+   const bool trace_draw = getenv("TA5_TRACE_DRAW") != NULL;
+
+   /*
+    * Every one of these returns drops the draw on the floor, and the
+    * record_result test is sticky: it stays non-SUCCESS for the rest of the
+    * command buffer, so a single failure discards every later draw without
+    * saying so.  Trace which reason applies, because "the draws vanished" is
+    * otherwise indistinguishable from "the draws produced no fragments".
+    */
+   if (trace_draw)
+      fprintf(stderr,
+              "ta5[draw]: call vtx=%u inst=%u first_v=%u first_i=%u idx=%u "
+              "state=%d result=%d pipe=%p\n",
+              vertexCount, instanceCount, firstVertex, firstInstance, index_size,
+              (int)cmd->state, (int)cmd->record_result,
+              (const void *)pipe);
+
    if (cmd->state != MESA_VK_COMMAND_BUFFER_STATE_RECORDING ||
-       cmd->record_result != VK_SUCCESS || pipe == NULL)
+       cmd->record_result != VK_SUCCESS || pipe == NULL) {
+      if (trace_draw)
+         fprintf(stderr, "ta5[draw]: DROPPED at entry\n");
       return;
+   }
 
    if (getenv("TA5_SKIP_DRAW"))
       return;
 
    ret = ta5_cmd_buffer_alloc_cs(cmd, cmd->cs_count + (use_ib ? 4096 : 8192));
-   if (ret != VK_SUCCESS)
+   if (ret != VK_SUCCESS) {
+      if (trace_draw)
+         fprintf(stderr, "ta5[draw]: DROPPED alloc_cs failed (%d)\n", (int)ret);
       return;
+   }
 
    /*
     * TA5_CLEAR_IN_DRAW emits a second clear here, at the top of the draw
@@ -6024,6 +6068,8 @@ no_drawpkt:
 
 draw_error:
    cmd->record_result = ret;
+   if (trace_draw)
+      fprintf(stderr, "ta5[draw]: FAILED mid-draw result=%d\n", (int)ret);
    if (use_ib) {
       vk_free(&cmd->device->vk.alloc, draw->relocs);
       vk_free(&cmd->device->vk.alloc, draw->reloc_bos);

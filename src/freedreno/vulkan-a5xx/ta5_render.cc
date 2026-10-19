@@ -392,6 +392,20 @@ ta5_CreateFramebuffer(VkDevice _device,
 
       const struct ta5_image_level *level =
          &view->image->levels[view->base_mip_level];
+      /*
+       * vk_errorf()'s text is suppressed unless the instance asked for error
+       * logging, and GSK only reports the bare VkResult, so a rejected
+       * framebuffer is otherwise indistinguishable from any other
+       * initialisation failure.  Say what was asked for and what the
+       * attachment actually provides.
+       */
+      if (getenv("TA5_TRACE_FB"))
+         fprintf(stderr,
+                 "ta5[fb]: create %ux%ux%u att=%u mip=%u image=%ux%u "
+                 "imgtype=%d fmt=%u\n",
+                 fb->width, fb->height, pCreateInfo->layers, i,
+                 view->base_mip_level, level->width, level->height,
+                 (int)view->image->image_type, (unsigned)view->format);
       if (fb->width > level->width || fb->height > level->height ||
           pCreateInfo->layers > view->layer_count) {
          VkResult result = vk_errorf(&device->instance->vk,

@@ -154,8 +154,6 @@ ta5_FreeMemory(VkDevice _device, VkDeviceMemory _memory,
     * stay usable (their memory is this process's own allocation either way),
     * and their Destroy* sees bound_memory == NULL and skips the list_del.
     */
-   struct ta5_device *device = (struct ta5_device *)_device;
-
    while (!list_is_empty(&memory->bound_buffers)) {
       struct ta5_buffer *buffer = list_first_entry(&memory->bound_buffers,
                                                    struct ta5_buffer,
@@ -661,6 +659,23 @@ ta5_CreateImage(VkDevice _device, const VkImageCreateInfo *pCreateInfo,
     */
    if (image->mip_levels > TA5_MAX_IMAGE_MIP_LEVELS)
       return vk_error(&device->instance->vk, VK_ERROR_FORMAT_NOT_SUPPORTED);
+
+   /*
+    * The extent the application asked for, before anything downstream has an
+    * opinion.  A framebuffer built over an image narrower than the
+    * application believes it created is the shape of a silent clamp, and the
+    * only way to tell one from an application bug is to see both numbers.
+    */
+   if (getenv("TA5_TRACE_IMG"))
+      fprintf(stderr,
+              "ta5[img]: create %ux%ux%u fmt%u type=%d tiling=%d usage=%#x "
+              "mips=%u layers=%u max2d=%u\n",
+              pCreateInfo->extent.width, pCreateInfo->extent.height,
+              pCreateInfo->extent.depth, (unsigned)pCreateInfo->format,
+              (int)pCreateInfo->imageType, (int)pCreateInfo->tiling,
+              (unsigned)pCreateInfo->usage, pCreateInfo->mipLevels,
+              pCreateInfo->arrayLayers,
+              pdev->properties.maxImageDimension2D);
 
    if (!ta5_image_layout_levels(image, image->levels))
       return vk_error(&device->instance->vk, VK_ERROR_FORMAT_NOT_SUPPORTED);
