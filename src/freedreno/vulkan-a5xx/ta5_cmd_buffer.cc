@@ -3982,6 +3982,22 @@ ta5_CmdBeginRenderPass(VkCommandBuffer _cmd,
    if (getenv("TA5_DUMP_FB"))
       cmd->trace_framebuffer = cmd->bound_framebuffer;
 
+   /*
+    * Using the handle from a failed vkCreateFramebuffer is an application
+    * error, but a crash is not an acceptable answer: GTK reports the failure
+    * and carries on, and it then took a null framebuffer straight into the
+    * sysmem prep below, which dereferences it.  Fail the command buffer
+    * instead -- record_result is sticky, so the draws inside the pass are
+    * dropped by the check at the top of ta5_record_draw() rather than faulting
+    * one at a time, and the reason is visible under TA5_TRACE_DRAW.
+    */
+   if (!cmd->bound_framebuffer) {
+      cmd->record_result = vk_error(&cmd->device->instance->vk,
+                                    VK_ERROR_INITIALIZATION_FAILED);
+      cmd->bound_render_pass = NULL;
+      return;
+   }
+
    /* The scissor is clipped to the render area, so the area has to be known
     * before any draw is recorded.  Stored rather than emitted: it only affects
     * the scissor the draw computes. */
