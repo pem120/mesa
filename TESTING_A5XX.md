@@ -111,3 +111,78 @@ The DRM values are overridable via `FAKE_GPU_ID` and `FAKE_CHIP_ID`.
 loader. It is useful when the loader is not the thing under test, but it
 cannot be cross-compiled for musl by zig (zig emits static binaries without
 `dlopen` support), so it is a host-only tool.
+## Diagnostic environment variables
+
+Every `TA5_*` knob is a no-op unless set. With one exception noted below,
+ they change no rendering behaviour; they exist to obtain evidence.
+
+Start from the shipped combination and vary one at a time:
+
+    VK_ICD_FILENAMES=<path to a5xx-<name>.json>
+    MESA_SHADER_CACHE_DISABLE=true
+    XDG_RUNTIME_DIR=/run/user/10000
+    WAYLAND_DISPLAY=wayland-0
+
+Most useful for the kgx investigation:
+
+| Knob | Answers |
+|---|---|
+| `TA5_CAPTURE_FB=1` | writes `fb-*.raw` captures of the render-pass attachment |
+| `TA5_DUMP_IMAGES=1` | non-zero coverage of every live image's level 0 |
+| `TA5_DUMP_ATLAS=1` | writes a sampled image out so its bytes can be looked at, not counted |
+| `TA5_TRACE_FB=1` | `vkCreateFramebuffer` request versus what its attachment provides |
+| `TA5_TRACE_IMG=1` | `vkCreateImage` extent and the device's own `maxImageDimension2D` |
+| `TA5_TRACE_PASS=1` | render pass begin/end with framebuffer size and render area |
+| `TA5_TRACE_DRAW=1` | every draw call, and which of the three ways it is discarded |
+| `TA5_TRACE_BLEND=1` | component mask, blend control, MRT control per draw |
+| `TA5_NO_BLEND=1` | forces blending off; see the premultiplied-alpha trap below |
+| `TA5_SKIP_DRAW=1` | skips every draw; anything still visible came from a clear |
+| `TA5_CLEAR_IN_DRAW=1` | magenta clear at the top of the draw path |
+| `TA5_DISASM=1` (`TA5_TRACE_DISASM`) | IR3 disassembly of each shader variant |
+
+### The `getenv` truthiness trap
+
+A knob is enabled by `getenv` returning non-NULL. **The string `"0"` is
+non-NULL, so a variable set to `0` is enabled.** Shells that pass
+`VAR=0` through to the process rather than unsetting it will silently
+enable that probe. Anything that forwards knobs into a harness should
+unset them when unset, not pass `"0"`:
+
+    for knob in $(env | sed -n 's/^\(TA5_[A-Z_][A-Z0-9_]*\)=.*/\1/p'); do
+        eval "value=\${$knob:-0}"
+        [ "$value" = 0 ] && unset "$knob" || export "$knob=$value"
+    done
+
+This produced a false reading once: a run that appeared to show a fully
+magenta frame was really `TA5_CLEAR_IN_DRAW=0` being honoured as *on*.
+
+### Premultiplied blending hides a zero sample
+
+GTK blends text with `dst = src + dst * (1 - src.a)`. A fragment shader
+that outputs `(0,0,0,0)` leaves the destination **unchanged**, so a
+broken texture sample is invisible and indistinguishable from an empty
+scissor in a framebuffer capture.
+
+`TA5_NO_BLEND=1` forces blending off, so the same zero is written and the
+pixels turn black. `black=0` after that probe is what establishes that no
+fragment was produced at all, rather than one that was discarded.
+
+## Reading the captures
+
+`fb-*.raw` are `width x height` BGRA for formats 44/50 and BGRA/UNORM
+otherwise, tightly packed with no row padding. Convert with:
+
+    python3 -c "from PIL import Image; Image.frombytes('RGB',(931,1006),open('fb.raw','rb').read(),'raw','BGRX').save('out.png')"
+
+Check `rows_with_variation`, not just non-background pixel count. A frame
+can be 7% non-background and still be a handful of flat bands with no
+rasterised content, which is exactly what kgx produces.
+
+## Probes
+
+`tex-probe`, `atlas-probe` and `blend-probe` live in the deployment
+directory. `atlas-probe` is the only one that currently rasterises a
+textured quad correctly. `tex-probe` fails exactly the way kgx does --
+`clear_only=65536` of 65536 means the entire target is the clear colour,
+so its `pattern_mismatch` percentage is not a partial success -- and being
+small and compositor-free it is the better place to iterate.

@@ -1,6 +1,55 @@
 # Adreno 506 Vulkan driver — Wayland WSI port and GPU-fault investigation
 
-Status updated: 2026-10-18. Branch: `a5xx-vulkan`.
+Status updated: 2026-10-19. Branch: `a5xx-vulkan`.
+
+## 0. Current state (2026-10-19)
+
+**kgx with GSK Vulkan still does not render correctly, and the failure is
+narrower than "broken rendering": no draw in kgx has ever rasterised a
+single pixel.** Every observed pixel comes from a clear. This was
+established by measurement, not inference (§21.1):
+
+    TA5_SKIP_DRAW=1   # skip every draw
+    fb-001-931x1006  (29,29,32): 893760  +  (46,46,50): 42826
+
+The 46-row band survives with all draws skipped, so it is a clear, and it
+is only the `AdwHeaderBar`'s background node -- kgx's header bar also has
+a title and buttons, which never appear.
+
+**Ruled out for kgx, each by measurement (§21.2):** the fragment and
+colour-pipe stage (component mask `0xf`, premultiplied-alpha blend, and a
+`TA5_NO_BLEND` probe producing zero black pixels); the viewport transform;
+the scissor; `RB_CCU_CNTL` in three variants; direct versus indirect
+draws; texel descriptors; the sampler descriptor; the glyph atlas, which
+contains correct antialiased glyphs; and varying linkage.
+
+**The leading open question (§21.3):** with `GSK_DEBUG=shaders`, GTK
+creates exactly four Vulkan pipelines -- `gskgpucolor`, `gskgpuborder`,
+`gskgpuboxshadow`, `gskgpucolorize` -- and **no texture pipeline, ever**.
+The texture shader exists in GTK 4.24.1 and text is routed through
+`gsk_gpu_node_processor_add_glyph_node()`, neither of which is gated on a
+device capability. So textured nodes are not reaching the node processor
+on this driver, which explains the missing text, the missing separator
+gradient and the header-only output in one step.
+
+**Next step:** dump what we report for properties, limits and features
+(`TA5_TRACE_CAPS`) and compare against
+`gsk/gpu/vulkan/gsk_gpu_vulkan_device.c`. It is the last untraced
+boundary, and it is a small piece of work inside the driver.
+
+**Also fixed since §19, both real and verified (§20, §21):**
+
+| Fix | Commit |
+|---|---|
+| `maxImageDimension{1,2}D` was 4096, the gen-3 value, which made GTK build a 5700x2465 framebuffer over a 4096-wide image | `d26a268` |
+| `ta5_CmdBeginRenderPass` dereferenced a null framebuffer after a rejected `vkCreateFramebuffer` | `2c071cb` |
+
+**Still open, unrelated to kgx:** the D32 dashed-hole depth defect
+(§16), the cube-face diagonal artifact (§12.5), and `tex-probe`, which
+fails the same way kgx does and is the better minimal repro.
+
+**Read §20 and §21 before anything else.** §1 below is a historical
+snapshot and is stale in several rows.
 
 ## 1. Status and reading order
 
