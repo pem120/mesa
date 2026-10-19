@@ -304,8 +304,33 @@ ta5_get_properties(struct ta5_physical_device *pdevice,
    props->maxDescriptorSetInputAttachments = 4;
 
    /* -- images / buffers -- */
-   props->maxImageDimension1D = 4096;
-   props->maxImageDimension2D = 4096;
+   /*
+    * Image dimensions.
+    *
+    * These were 4096, which is the value freedreno uses for gen 3 and older:
+    * freedreno_state.c:421 reads `gen >= 4 ? 16384 : 4096`.  An a5xx part is
+    * gen 5 (fd_dev_gen() returns the chip major, so a5xx is 5), which makes
+    * 4096 four times smaller than what the same silicon is told elsewhere in
+    * this tree.  The registers can express the larger value too: A5XX_TEX_CONST_1
+    * holds WIDTH and HEIGHT in 15-bit fields, mask 0x00007fff, so a dimension
+    * tops out at 32767, and the descriptor's PITCH is 16-byte units in 14 bits,
+    * which covers a 16384-texel RGBA8 row of 65536 bytes.
+    *
+    * The limit is not cosmetic.  GTK sizes the image it allocates from
+    * maxImageDimension2D, but sizes the render pass and the framebuffer from
+    * the unclipped surface, so advertising 4096 while a surface scale of 2.5
+    * asked for 5700x2465 made it allocate a 4096x2465 image and then build a
+    * 5700x2465 framebuffer over it.  vkCreateFramebuffer rejects a framebuffer
+    * wider than its attachment, gtk reports the failure and carries on with a
+    * null framebuffer, and the pass draws nothing at all.
+    *
+    * Cube stays at 4096: a cubemap face is additionally bounded by
+    * maxImageDimension2D, and tex-probe shows the cube path is not correct yet,
+    * so claiming the larger size there would advertise more than is delivered.
+    * 3D images are rejected outright and their limit is unused.
+    */
+   props->maxImageDimension1D = 16384;
+   props->maxImageDimension2D = 16384;
    props->maxImageDimension3D = 256;
    props->maxImageDimensionCube = 4096;
    props->maxImageArrayLayers = 256;
