@@ -1609,3 +1609,58 @@ beyond the atlas-sized descriptor observed, multi-target rendering, MSAA,
 depth/stencil beyond the single-format cases in §16, and WSI scaling. The
 GTK/GSK framebuffer-dimension divergence of §19.1 and the earlier D32
 dashed-hole defect remain open.
+
+## 20. Root cause of the missing kgx content: the image-dimension limit
+
+The framebuffer-dimension divergence of §19.1 is traced, and it was the cause.
+
+`TA5_TRACE_IMG` and `TA5_TRACE_FB` together showed, in one run:
+
+    ta5[fb]: create 5700x2465 att=0 mip=0 image=4096x2465 imgtype=1 fmt=44
+
+GTK asks for a 5700x2465 framebuffer over an image the driver had made only
+4096 wide, which `vkCreateFramebuffer` rejects. The sequence from there:
+
+1. The window surface is rendered at a scale of 2.5, so the render area is
+   5700x2465 (2.5x the 2280x986 window).
+2. GTK sizes the image it allocates from `maxImageDimension2D`, and the
+   driver reported 4096, so it allocated 4096x2465. It then sized the render
+   pass and the framebuffer from the unclipped surface, so those stayed
+   5700x2465. The two numbers disagree inside the application, and only
+   because of what the driver advertised.
+3. `vkCreateFramebuffer` rejects a framebuffer larger than its attachment.
+   GTK logs `VK_ERROR_INITIALIZATION_FAILED` and carries on with a null
+   framebuffer handle.
+4. `ta5_CmdBeginRenderPass` dereferenced it. kgx died with SIGSEGV, PC=0.
+
+`maxImageDimension1D`/`2D` were 4096, which is freedreno's gen-3 value;
+freedreno_state.c:421 reads `gen >= 4 ? 16384 : 4096` and an a5xx part is
+gen 5. Fixed to 16384 (`d26a268`), which the registers can express:
+`A5XX_TEX_CONST_1` holds WIDTH/HEIGHT in 15-bit fields (mask 0x00007fff).
+
+Measured on the window framebuffer, against a GL reference at the same size:
+
+| | non-background px | rows with any variation | bands |
+|---|---|---|---|
+| before | 42,826 (4.57%) | 0 | rows 0..45 |
+| after | 72,618 (7.75%) | 0 | rows 0..45, rows 974..1005 |
+
+The header band (rows 0..45, `46,46,50`) now matches the GL reference exactly,
+and a second band appears that never rendered before. The 46-row header band
+is constant across every framebuffer size observed, which is what identified it
+as a fixed-height solid-colour node in the first place.
+
+kgx is still not rendering correctly. Text, the row 46..50 separator gradient
+and per-row variation are all still absent, so the remaining failure is a
+second, independent defect that the limit fix uncovered rather than caused.
+`atlas-probe` continues to pass, so textured quads remain correct in general.
+
+Two things to carry forward:
+
+- The waypipe harness forwards only the environment variables named
+  explicitly in `forward-observe.sh`. A new `TA5_*` knob is silently ignored
+  by every `forward-observe.sh` run until it is added to that list, which
+  looks exactly like a code path that never runs. Direct on-device runs do not
+  have this problem and are the faster way to test a new knob.
+- `tex-probe` fails on the cube path (`clear_only=65536` of 65536) and is a
+  separate defect; it is not the kgx failure.
