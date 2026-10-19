@@ -1664,3 +1664,110 @@ Two things to carry forward:
   have this problem and are the faster way to test a new knob.
 - `tex-probe` fails on the cube path (`clear_only=65536` of 65536) and is a
   separate defect; it is not the kgx failure.
+
+## 21. What the later investigation changed
+
+### 21.1 The header band is a clear, not a draw
+
+`TA5_SKIP_DRAW=1`, which skips every draw, still produces it:
+
+    fb-001-931x1006  (29,29,32): 893760  +  (46,46,50): 42826
+
+So no draw in kgx has ever rasterised a single pixel. The 46-row band is
+written by a clear, and it is not the GTK header bar: `kgx-window.ui` puts
+an `AdwHeaderBar` with an `AdwWindowTitle` and toggle buttons in each page,
+so a perfectly flat rectangle can only be that bar's background node.
+kgx 51.0 has no custom `snapshot()` implementations, so nothing bypasses
+the normal GSK node pipeline.
+
+### 21.2 The fragment stage is exonerated, by measurement
+
+- Component enable mask is `0xf`, not zero.
+- `blend_control = 0x07010701` decodes to `src=ONE`,
+  `op=DST_PLUS_SRC`, `dst=ONE_MINUS_SRC_ALPHA`: premultiplied alpha, which
+  is what GTK asks for.
+- `TA5_NO_BLEND=1` forces blending off. Under premultiplied blending a
+  shader output of zero leaves the destination *unchanged*, so a failed
+  sample is invisible and indistinguishable from an empty scissor. With
+  blending off the same zero is written and the pixels would turn black.
+  `black=0` in every frame, so no fragment is produced at all below row 45.
+
+That is the useful general lesson: with premultiplied blending, "the shader
+emitted nothing" and "nothing rasterised" look identical in a capture.
+
+Also measured and ruled out: viewport transform (`xoff = width/2`,
+`xscale = width/2`, correct), scissor, `RB_CCU_CNTL` in all three
+variants tried, direct versus indirect draws, texel descriptors, sampler
+descriptor, atlas contents, and varying linkage.
+
+### 21.3 GTK never creates a texture pipeline on this driver
+
+`GSK_DEBUG=shaders` over a full kgx run creates exactly four Vulkan
+pipelines: `gskgpucolor`, `gskgpuborder`, `gskgpuboxshadow`,
+`gskgpucolorize`. No texture pipeline, ever. In GTK 4.24.1 that shader
+exists (`gsk/gpu/shaders/gskgputexture.glsl`), text is routed through
+`gsk_gpu_node_processor_add_glyph_node()`, and neither has a device
+capability gate. So text and texture nodes are not reaching the node
+processor on the Vulkan path, which accounts for the missing text, the
+missing separator gradient, and the header-bar-only output in one
+explanation.
+
+### 21.4 Corrected earlier conclusions
+
+- `color_write_enables` is *not* an unpopulated field. It is filled by
+  `vk_graphics_pipeline_state_fill()` from the application's pipeline
+  create info. The comment at `ta5_driver.cc:191` claiming
+  `VkPipelineColorBlendStateCreateInfo` "is never retained" is stale and
+  misleading.
+- `tex-probe` does not partially work. `clear_only=65536` of 65536 means
+  the whole target is the clear colour; its "12.48% pattern_mismatch" was
+  never a partial success. It fails the same way kgx does, which makes it
+  a far better minimal repro than kgx.
+- Turnip's test position does exist. §19.6 said there were no Turnip
+  tests; `src/freedreno/ci/` holds 62 files of per-chip CTS
+  expectations and `deqp-*.toml` runner configs. What is true is narrower
+  and still useful: there is no a5xx Vulkan configuration or expectation
+  set, because Turnip is a6xx+, so there is no a506 baseline.
+
+### 21.5 Two traps that produced wrong readings
+
+- The waypipe harness forwards only the environment variables named
+  explicitly in `forward-observe.sh`, and `kgx-observe.sh` only unset a
+  knob set to `0` for five hard-coded names. Every other forwarded knob
+  arrived as the string `"0"`, which is a non-NULL pointer and therefore
+  truthy in `getenv`, so it was *enabled*. This made `TA5_CLEAR_IN_DRAW=0`
+  still clear the frame, which briefly looked like a result. The unset
+  loop is now generic over all `TA5_*`. Re-run the affected comparisons.
+- `getenv` truthiness applies to every knob, including new ones. A probe
+  defaults to "on" wherever a shell passes `"0"` through rather than
+  unsetting it.
+
+### 21.6 RenderDoc
+
+Installed from Alpine's `apk` (1.40, aarch64) and then removed again; it
+is not left on the device and `kernel.yama.ptrace_scope` is back to 1.
+Headless capture never worked: `renderdoccmd capture` injects with ptrace
+and the handshake does not complete on musl even with
+`ptrace_scope=0`, and an in-app-API preload shim initialised RenderDoc and
+started a capture but never wrote a `.rdc`.
+
+It would not have answered the question anyway. RenderDoc sits above this
+driver: it intercepts the Vulkan API and replays through the same command
+stream, so a capture describes the API boundary we already trace, not the
+stream the hardware sees.
+
+`gtk4-rendernode-tool` (already installed) does give a one-node texture
+repro, and it does crash -- but the fault is in the tool, whose 13 MB
+binary statically links GTK, not in ta5. The cairo control for it is
+still unverified, so even "Vulkan-specific" is unconfirmed.
+
+### 21.7 Where this leaves the kgx fault
+
+The image-dimension limit (§20) was a real and now-fixed cause, but it is
+not the whole story: fixing it produced a further band and left the rest
+of the frame blank. The leading open question is why no textured node
+reaches the GTK GPU node processor on this driver. The one device surface
+still untraced is what we report for properties, limits and features;
+`TA5_TRACE_CAPS` dumping those and comparing them against
+`gsk/gpu/vulkan/gsk_gpu_vulkan_device.c` is the next step, and it is a
+small piece of work inside the driver.
