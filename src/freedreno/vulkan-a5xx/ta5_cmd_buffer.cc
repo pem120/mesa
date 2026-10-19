@@ -2577,7 +2577,7 @@ ta5_blend_op(VkBlendOp op)
    }
 }
 
-/**
+/*
  * The draw state fd5_emit_state() emits before a draw.
  *
  * a5xx needs all of this: without RB_FS_OUTPUT_CNTL/SP_FS_OUTPUT_CNTL the
@@ -2595,7 +2595,8 @@ ta5_emit_draw_state(struct ta5_cmd_buffer *cmd, unsigned vs_tex_count,
       pipe ? pipe->graphics_state.cb : NULL;
    const struct vk_color_blend_attachment_state *att =
       cb && cb->attachment_count ? &cb->attachments[0] : NULL;
-   const bool blend_enable = att && att->blend_enable;
+   const bool blend_enable =
+      att && att->blend_enable && !getenv("TA5_NO_BLEND");
    const uint32_t blend_mask = blend_enable ? 1 : 0;
    uint32_t write_mask = pipe ? 0 : 0xf;
    uint32_t blend_control = 0;
@@ -2657,6 +2658,30 @@ ta5_emit_draw_state(struct ta5_cmd_buffer *cmd, unsigned vs_tex_count,
       A5XX_RB_MRT_CONTROL_COMPONENT_ENABLE(write_mask) |
       (blend_enable ? A5XX_RB_MRT_CONTROL_BLEND | A5XX_RB_MRT_CONTROL_BLEND2 : 0) |
       (getenv("TA5_ROP_ENABLE") ? A5XX_RB_MRT_CONTROL_ROP_ENABLE : 0);
+
+   /*
+    * Everything the colour pipe decides with, in one line.
+    *
+    * COMPONENT_ENABLE=0 discards every fragment after the shader has run,
+    * and a blend equation or factor that is wrong does the same thing more
+    * quietly, so "the shader produced nothing" and "the colour pipe threw the
+    * result away" look identical in a framebuffer capture.
+    *
+    * TA5_NO_BLEND, which forces blending off for every draw, separates "no
+    * fragments" from "fragments the colour pipe discarded": under
+    * premultiplied blending a shader output of zero leaves the destination
+    * untouched, so a broken sample is invisible and looks exactly like an
+    * empty scissor.  With blending off the same zero is written, and the
+    * pixels turn black.
+    */
+   if (getenv("TA5_TRACE_BLEND"))
+      fprintf(stderr,
+              "ta5[blend]: enable=%u comp_enable=%#x blend_control=%08x "
+              "mrt=%08x mask=%u fs_tex=%u vs_tex=%u\n",
+              (unsigned)blend_enable,
+              (unsigned)A5XX_RB_MRT_CONTROL_COMPONENT_ENABLE(write_mask),
+              blend_control, mrt_control, blend_mask, fs_tex_count,
+              vs_tex_count);
 
    /* fd5_emit_render_cntl(blit = false, binning = false) */
    ta5_pkt4(cmd, REG_A5XX_RB_RENDER_CNTL, 1);
